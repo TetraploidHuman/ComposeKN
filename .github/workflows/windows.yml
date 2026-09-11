@@ -32,7 +32,7 @@ jobs:
       - name: Build windows demo (release)
         shell: pwsh
         run: |
-          gradle.bat :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon `
+          gradle.bat :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon --stacktrace `
             "-Porg.gradle.jvmargs=-Xmx6g"
 
       - name: Upload exe
