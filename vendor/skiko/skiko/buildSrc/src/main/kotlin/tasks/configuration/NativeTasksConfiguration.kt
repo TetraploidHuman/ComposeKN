@@ -155,20 +155,27 @@ fun SkikoProjectContext.compileNativeBridgesTask(
                 flags.set(linuxFlags)
             }
             OS.Windows -> {
-                val windowsFlags = mutableListOf(
-                    *buildType.clangFlags,
-                    "-fno-rtti",
-                    "-fno-exceptions",
-                    "-fvisibility=hidden",
-                    "-fvisibility-inlines-hidden",
-                    *skiaPreprocessorFlags(OS.Windows, buildType)
-                )
-                if (hostOs != OS.Windows && compilerForTarget(os, arch).startsWith("clang")) {
+                if (hostOs == OS.Windows) {
+                    // Windows host: clang-cl / MSVC-flavored flags.
+                    flags.set(mutableListOf(
+                        *buildType.winCompilerFlags,
+                        "/GR-",
+                        *skiaPreprocessorFlags(OS.Windows, buildType)
+                    ))
+                } else {
                     // Cross-compiling for mingw-w64 from a POSIX host.
-                    windowsFlags.add(0, "x86_64-w64-windows-gnu")
-                    windowsFlags.add(0, "-target")
+                    val windowsFlags = mutableListOf(
+                        "-target",
+                        if (arch == Arch.X64) "x86_64-w64-windows-gnu" else error("Unexpected arch $arch"),
+                        *buildType.clangFlags,
+                        "-fno-rtti",
+                        "-fno-exceptions",
+                        "-fvisibility=hidden",
+                        "-fvisibility-inlines-hidden",
+                        *skiaPreprocessorFlags(OS.Windows, buildType)
+                    )
+                    flags.set(windowsFlags)
                 }
-                flags.set(windowsFlags)
             }
             else -> throw GradleException("$os not yet supported")
         }
