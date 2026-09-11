@@ -459,3 +459,17 @@ window.beginMove()             // 开始拖拽移动
 |------|------|--------|------|
 | Linux (wayland) | ✓ | ✓ 运行且已测 8 方向 resize | ✓ |
 | Windows (mingw cross) | ✓ 全部 Kotlin | ✗ 需 Windows 宿主链 | 待 Windows 机器 |
+
+
+### GitHub CI 结果（2025-01-10 深夜）
+- 仓库已建：github.com/TetraploidHuman/ComposeKN（private）。`.github/workflows/windows.yml` 在 windows-latest runner 上构建。
+- CI 修掉的坑（务必记住）：
+  1. **仓库里的 gradle.properties 绝不能带本机代理设置**（172.20.128.142:7897 已移到 ~/.gradle/gradle.properties）。CI 上代理不可达导致插件解析静默失败。
+  2. build-logic/settings.gradle.kts 需要 pluginManagement { repositories { gradlePluginPortal/mavenCentral/google } }（included build 不继承主工程插件仓库）。
+  3. Windows 宿主上 skiko compileNativeBridges 用 clang-cl.exe —— 编译 flags 必须用 `buildType.winCompilerFlags`（/std:c++20 /GR-），GNU 的 -std=c++2a 会被 clang-cl 吞掉掉到 C++14（症状：500 个 `std::optional/string_view/byte not found in namespace std`）。
+  4. linkNativeBridges on Windows host 必须用 `llvm-lib.exe /out:`（lib.exe 变体），GNU 风格 `ar rcs` 不存在。
+- **CI 终点 = 已知 ABI 边界**：Kotlin/Native 的 mingwX64 目标无论宿主都走 konan 自带 msys2 工具链（GNU/Itanium ABI），而 JetBrains skia Windows 骸库全部是 MSVC ABI（`?drawRect@SkCanvas@@QEAAX...`）。K/N 没有 windows-msvc 目标。此墙非配置可逾。
+- 可行的出路（如需 Windows 原生 exe）：
+  a) 自建 windows-gnu 版 Skia（skia 构建系统原生不出 mingw 目标，工程量大，不推荐）；
+  b) Windows 用 Compose Desktop JVM 版（官方支持，skiko Windows natives 本就按 AWT 设计；本项目"脱离 JVM 的 native"路线在 Windows 上走不通，除非重写渲染后端）；
+  c) 接受现状：Windows 的全部窗口管理/输入/渲染代码已写完并在交叉编译中验证到 ABI 边界之前，供未来接触 mingw-skia 或 MSVC-K/N 后继续。
