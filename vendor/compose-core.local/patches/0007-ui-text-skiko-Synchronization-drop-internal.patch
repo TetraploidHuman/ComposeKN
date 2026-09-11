@@ -1,0 +1,37 @@
+--- a/ui-text/src/skikoMain/kotlin/androidx/compose/ui/text/platform/Synchronization.skiko.kt
++++ b/ui-text/src/skikoMain/kotlin/androidx/compose/ui/text/platform/Synchronization.skiko.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2024 The Android Open Source Project
++ * Copyright 2021 The Android Open Source Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -13,24 +13,21 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-@file:JvmName("SynchronizationKt")
+ 
+ package androidx.compose.ui.text.platform
+ 
+ import kotlin.contracts.ExperimentalContracts
+ import kotlin.contracts.InvocationKind
+ import kotlin.contracts.contract
+-import kotlin.jvm.JvmName
+ 
+-internal actual class SynchronizedObject : kotlinx.atomicfu.locks.SynchronizedObject()
++actual class SynchronizedObject : kotlinx.atomicfu.locks.SynchronizedObject()
+ 
+ @Suppress("NOTHING_TO_INLINE")
+-internal actual inline fun makeSynchronizedObject(ref: Any?) = SynchronizedObject()
++actual inline fun makeSynchronizedObject(ref: Any?) = SynchronizedObject()
+ 
+-@PublishedApi
+ @Suppress("BanInlineOptIn")
+ @OptIn(ExperimentalContracts::class)
+-internal actual inline fun <R> synchronized(lock: SynchronizedObject, block: () -> R): R {
++actual inline fun <R> synchronized(lock: SynchronizedObject, block: () -> R): R {
+     contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
+     return kotlinx.atomicfu.locks.synchronized(lock, block)
+ }

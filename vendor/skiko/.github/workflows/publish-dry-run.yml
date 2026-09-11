@@ -1,0 +1,197 @@
+name: Skiko Publish Dry Run
+
+on:
+  workflow_call: # Allow being called by other workflows
+
+jobs:
+  Android:
+    name: 'Android Publish Dry Run'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Publish Maven Local'
+        with:
+          image_name: linux-compat
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              -Pskiko.android.enabled=true \
+              :skiko:publishToMavenLocal
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Check Android Sample'
+        with:
+          image_name: linux-compat
+          working_directory: samples/SkiaAndroidSample
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              packageRelease
+
+  Web:
+    name: 'Web Publish Dry Run'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Publish Maven Local'
+        with:
+          image_name: linux-emscripten-amd64
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              -Pskiko.wasm.enabled=true \
+              :skiko:publishToMavenLocal
+
+  Linux:
+    name: 'Linux x64 Publish Dry Run'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Publish x64 Maven Local'
+        with:
+          image_name: linux-compat
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              -Pskiko.native.enabled=true \
+              -Pskiko.awt.enabled=true \
+              -Pskiko.arch=x64 \
+               :skiko:publishToMavenLocal
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Publish Native Maven Local'
+        with:
+          image_name: linux-amd64
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              -Pskiko.native.enabled=true \
+              -Pskiko.awt.enabled=false \
+              :skiko:publishLinuxArm64PublicationToMavenLocal \
+              :skiko:publishLinuxX64PublicationToMavenLocal
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Check AWT Sample'
+        with:
+          image_name: linux-compat
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              :SkiaAwtSample:installDist
+
+  LinuxArm:
+    name: 'Linux arm64 Publish Dry Run'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      # We run it on a separate runner because cross-compilation on x64 fails
+      - uses: ./.github/actions/docker-skiko-run
+        name:  'Publish AWT Runtime arm64 Maven Local'
+        with:
+          image_name: linux-compat
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              -Pskiko.awt.enabled=true \
+              -Pskiko.arch=arm64 \
+              :skiko:publishSkikoJvmRuntimeLinuxArm64PublicationToMavenLocal
+
+  macOS:
+    name: 'macOS Publish Dry Run'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: actions/setup-java@v4
+        name: 'Setup JDK 21'
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - shell: bash
+        name: 'Publish arm64 Maven Local'
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            -Pskiko.native.enabled=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=arm64 \
+            :skiko:publishToMavenLocal
+
+      # Build x64 separately (arm64 is built in publishToMavenLocal)
+      - shell: bash
+        name: 'Publish AWT Runtime x64 Maven Local'
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=x64 \
+            :skiko:publishSkikoJvmRuntimeMacosX64PublicationToMavenLocal
+
+      - shell: bash
+        name: 'Check AWT Sample'
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            :SkiaAwtSample:installDist
+
+  Windows:
+    name: 'Windows Publish Dry Run'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: microsoft/setup-msbuild@v1
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: actions/setup-java@v4
+        name: 'Setup JDK 21'
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - shell: bash
+        name: 'Publish x64 Maven Local'
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            -Pskiko.native.enabled=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=x64 \
+             :skiko:publishToMavenLocal
+
+      # Build Arm64 separately (x64 is built in publishToMavenLocal)
+      - shell: bash
+        name: 'Publish AWT Runtime arm64 Maven Local'
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=arm64 \
+            :skiko:publishSkikoJvmRuntimeWindowsArm64PublicationToMavenLocal
+
+      - shell: bash
+        name: 'Check AWT Sample'
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            :SkiaAwtSample:installDist

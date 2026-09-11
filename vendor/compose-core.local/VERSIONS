@@ -1,0 +1,15 @@
+# vendor/compose-core 上游基线（sync 脚本默认值）
+# repo: https://github.com/JetBrains/compose-multiplatform-core
+# 注意：源码基线不是 v1.11.1（1.11.1 是 Maven 依赖版本号，见下方 compose_deps）
+#
+# 当前基线（2026-09 由 P1 从 dev4339 推进到 rc01，端到端验证通过）：
+tag=v1.12.0-rc01+dev4619
+sha=d3b79affd32166578fe8e4e3d0eaaf7ea6519013   # annotated tag 对象
+commit=265534f94198e263cd2dfb8ebe8bd9100fadd949   # 实际 commit
+#
+# 原始基线（首次 vendoring 时三向 diff 确定，2026-07；可回退到此 tag）：
+#   tag=v1.12.0-beta01+dev4339  sha=6d473fc44bebde39cfcb83435fdea705bfa595e6  commit=fca104ce5d4d3bb1e88a04414ffa382894800797
+compose_deps=1.11.1
+kotlin=2.4.0
+coroutines=1.10.2
+lifecycle=2.9.6

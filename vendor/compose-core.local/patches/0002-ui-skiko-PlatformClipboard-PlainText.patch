@@ -1,0 +1,15 @@
+--- a/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/PlatformClipboard.skiko.kt
++++ b/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/PlatformClipboard.skiko.kt
+@@ -17,7 +17,11 @@
+ package androidx.compose.ui.platform
+ 
+ // TODO: https://youtrack.jetbrains.com/issue/CMP-1260
+-actual class ClipMetadata private constructor()
++actual class ClipMetadata private constructor() {
++    companion object {
++        internal val PlainText = ClipMetadata()
++    }
++}
+ 
+ @Suppress("DEPRECATION")
+ internal expect fun createPlatformClipboardManager(): ClipboardManager

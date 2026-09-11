@@ -1,0 +1,17 @@
+--- a/ui/src/nonJvmMain/kotlin/androidx/compose/ui/Actuals.nonJvm.kt
++++ b/ui/src/nonJvmMain/kotlin/androidx/compose/ui/Actuals.nonJvm.kt
+@@ -19,7 +19,7 @@
+ import androidx.compose.ui.node.ModifierNodeElement
+ import androidx.compose.ui.platform.InspectorInfo
+ import kotlin.coroutines.CoroutineContext
+-import kotlinx.coroutines.Dispatchers
++import org.jetbrains.skiko.SkikoDispatchers
+ 
+ internal actual fun classKeyForObject(a: Any): Any {
+     return a::class
+@@ -34,4 +34,4 @@
+ }
+ 
+ internal actual val PostDelayedDispatcher: CoroutineContext
+-    get() = Dispatchers.Main
++    get() = SkikoDispatchers.Main

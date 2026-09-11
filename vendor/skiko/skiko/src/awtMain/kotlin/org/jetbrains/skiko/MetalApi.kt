@@ -1,0 +1,58 @@
+package org.jetbrains.skiko
+
+/**
+ * Provides [MetalAdapter] that holds pointer to native [MTLDevice](https://developer.apple.com/documentation/metal/mtldevice)
+ * chosen using [adapterPriority]
+ *
+ * @see "src/awtMain/objectiveC/macos/MetalApi.mm"
+ */
+internal fun chooseMetalAdapter(adapterPriority: GpuPriority): MetalAdapter {
+    val adapter = chooseAdapter(adapterPriority.ordinal)
+
+    if (adapter == 0L) {
+        throw RenderException("MetalApi.chooseAdapter returned null")
+    }
+
+    val adapterName = getAdapterName(adapter)
+    val adapterMemorySize = getAdapterMemorySize(adapter)
+    val adapterMaxTextureSize = getAdapterMaxTextureSize(adapter)
+
+    return MetalAdapter(adapter, adapterName, adapterMemorySize, adapterMaxTextureSize)
+}
+
+/**
+ * @param ptr pointer for native [MTLDevice](https://developer.apple.com/documentation/metal/mtldevice)
+ * @param name the full name of the vendor device.
+ * @param memorySize approximation of how much memory this device can use with good performance.
+ * @param maxTextureSize maximum width and height supported for 2D textures.
+ */
+internal data class MetalAdapter(val ptr: Long, val name: String, val memorySize: Long, val maxTextureSize: Int)
+
+internal fun MetalAdapter.dispose() {
+    disposeAdapter(ptr)
+}
+
+/**
+ * [@autoreleasepool](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/MemoryMgmt/Articles/mmAutoreleasePools.html)
+ */
+@Suppress("SpellCheckingInspection")
+internal inline fun <R> autoreleasepool(block: () -> R): R {
+    val handle = openAutoreleasepool()
+    return try {
+        block()
+    } finally {
+        closeAutoreleasepool(handle)
+    }
+}
+
+private external fun chooseAdapter(adapterPriority: Int): Long
+private external fun disposeAdapter(adapter: Long)
+private external fun getAdapterName(adapter: Long): String
+private external fun getAdapterMemorySize(adapter: Long): Long
+private external fun getAdapterMaxTextureSize(adapter: Long): Int
+
+@Suppress("SpellCheckingInspection")
+private external fun openAutoreleasepool(): Long
+
+@Suppress("SpellCheckingInspection")
+private external fun closeAutoreleasepool(handle: Long)

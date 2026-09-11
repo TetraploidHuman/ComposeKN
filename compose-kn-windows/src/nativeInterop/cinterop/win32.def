@@ -1,0 +1,4 @@
+headers = windows.h winuser.h windef.h wingdi.h
+headerFilter = windows.h winuser.h windef.h wingdi.h
+compilerOpts.linux = -DUNICODE -D_UNICODE
+linkerOpts = -luser32 -lgdi32 -lkernel32 -ldwmapi -lole32 -loleaut32 -lcomctl32 -lcomdlg32 -lshell32

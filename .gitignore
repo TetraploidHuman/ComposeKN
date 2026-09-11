@@ -1,0 +1,16 @@
+# Gradle
+build/
+.gradle/
+**/build/
+**/.gradle/
+
+# Kotlin/Native toolchain downloads
+vendor/skiko/skiko/dependencies/
+
+# Compose core fetch cache
+.cache/
+
+# Miscellaneous
+*.log
+hs_err_pid*.log
+.idea/

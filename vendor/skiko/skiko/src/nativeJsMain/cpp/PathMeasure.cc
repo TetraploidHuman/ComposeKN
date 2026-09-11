@@ -1,0 +1,117 @@
+#include "SkPathBuilder.h"
+#include "SkPathMeasure.h"
+#include "common.h"
+
+static void deletePathMeasure(SkPathMeasure* instance) {
+    delete instance;
+}
+
+SKIKO_EXPORT KNativePointer org_jetbrains_skia_PathMeasure__1nGetFinalizer() {
+    return reinterpret_cast<KNativePointer>((&deletePathMeasure));
+}
+
+SKIKO_EXPORT KNativePointer org_jetbrains_skia_PathMeasure__1nMake
+  () {
+    return reinterpret_cast<KNativePointer>(new SkPathMeasure());
+}
+
+SKIKO_EXPORT KNativePointer org_jetbrains_skia_PathMeasure__1nMakePath
+  (KNativePointer pathPtr, KBoolean forceClosed, KFloat resScale) {
+    SkPath* path = reinterpret_cast<SkPath*>((pathPtr));
+    return reinterpret_cast<KNativePointer>(new SkPathMeasure(*path, forceClosed, resScale));
+}
+
+SKIKO_EXPORT void org_jetbrains_skia_PathMeasure__1nSetPath
+  (KNativePointer ptr, KNativePointer pathPtr, KBoolean forceClosed) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    SkPath* path = reinterpret_cast<SkPath*>((pathPtr));
+    instance->setPath(path, forceClosed);
+}
+
+SKIKO_EXPORT KFloat org_jetbrains_skia_PathMeasure__1nGetLength
+  (KNativePointer ptr) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    return instance->getLength();
+}
+
+
+SKIKO_EXPORT KBoolean org_jetbrains_skia_PathMeasure__1nGetPosition
+  (KNativePointer ptr, KFloat distance, KFloat* data) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    SkPoint position;
+    if (instance->getPosTan(distance, &position, nullptr)) {
+        data[0] = position.fX;
+        data[1] = position.fY;
+        return true;
+    }
+
+    return false;
+}
+
+SKIKO_EXPORT KBoolean org_jetbrains_skia_PathMeasure__1nGetTangent
+  (KNativePointer ptr, KFloat distance, KFloat* data) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    SkVector tangent;
+
+    if (instance->getPosTan(distance, nullptr, &tangent)) {
+        data[0] = tangent.fX;
+        data[1] = tangent.fY;
+        return true;
+    }
+
+    return false;
+}
+
+SKIKO_EXPORT KBoolean org_jetbrains_skia_PathMeasure__1nGetRSXform
+  (KNativePointer ptr, KFloat distance, KFloat* data) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    SkPoint position;
+    SkVector tangent;
+    if (instance->getPosTan(distance, &position, &tangent)) {
+        data[0] = tangent.fX;
+        data[1] = tangent.fY;
+        data[2] = position.fX;
+        data[3] = position.fY;
+        return true;
+    }
+
+    return false;
+}
+
+SKIKO_EXPORT KBoolean org_jetbrains_skia_PathMeasure__1nGetMatrix
+  (KNativePointer ptr, KFloat distance, KBoolean getPosition, KBoolean getTangent, KFloat* data) {
+  SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+  SkMatrix matrix;
+  int flags = 0;
+
+  if (getPosition)
+      flags |= SkPathMeasure::MatrixFlags::kGetPosition_MatrixFlag;
+  if (getTangent)
+      flags |= SkPathMeasure::MatrixFlags::kGetTangent_MatrixFlag;
+
+  if (instance->getMatrix(distance, &matrix, static_cast<SkPathMeasure::MatrixFlags>(flags))) {
+      matrix.get9(data);
+      return true;
+  }
+
+  return false;
+}
+
+SKIKO_EXPORT KBoolean org_jetbrains_skia_PathMeasure__1nGetSegment
+  (KNativePointer ptr, KFloat startD, KFloat endD, KNativePointer dstPtr, KBoolean startWithMoveTo) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    SkPathBuilder* dst = reinterpret_cast<SkPathBuilder*>((dstPtr));
+    return instance->getSegment(startD, endD, dst, startWithMoveTo);
+}
+
+SKIKO_EXPORT KBoolean org_jetbrains_skia_PathMeasure__1nIsClosed
+  (KNativePointer ptr) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    return instance->isClosed();
+}
+
+SKIKO_EXPORT KBoolean org_jetbrains_skia_PathMeasure__1nNextContour
+  (KNativePointer ptr) {
+    SkPathMeasure* instance = reinterpret_cast<SkPathMeasure*>((ptr));
+    return instance->nextContour();
+}

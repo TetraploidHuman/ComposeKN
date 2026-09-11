@@ -1,0 +1,128 @@
+package org.jetbrains.skia.impl
+
+import org.jetbrains.skiko.InternalSkikoApi
+import java.lang.ref.Reference
+
+actual abstract class Native actual constructor(ptr: NativePointer) {
+    internal actual var _ptr: NativePointer
+
+    actual companion object {
+        actual val NullPointer: NativePointer
+            get() = 0L
+    }
+
+    actual override fun toString(): String {
+        return javaClass.simpleName + "(_ptr=0x" + _ptr.toString(16) + ")"
+    }
+
+    override fun equals(other: Any?): Boolean {
+        return try {
+            if (this === other) return true
+            if (null == other) return false
+            if (!javaClass.isInstance(other)) return false
+            val nOther = other as Native
+            if (_ptr == nOther._ptr) true else nativeEquals(nOther)
+        } finally {
+            Reference.reachabilityFence(this)
+            Reference.reachabilityFence(other)
+        }
+    }
+
+    // FIXME two different pointers might point to equal objects
+    override fun hashCode(): Int {
+        return java.lang.Long.hashCode(_ptr)
+    }
+
+    internal actual open fun nativeEquals(other: Native?): Boolean {
+        return false
+    }
+
+    init {
+        if (ptr == NullPointer) throw RuntimeException("Can't wrap nullptr")
+        _ptr = ptr
+    }
+}
+
+internal actual fun reachabilityBarrier(obj: Any?) {
+    Reference.reachabilityFence(obj)
+}
+
+actual typealias NativePointer = Long
+
+@InternalSkikoApi
+actual typealias InteropPointer = java.lang.Object
+
+internal object theScope: InteropScope()
+internal actual inline fun <T> interopScope(block: InteropScope.() -> T): T {
+    return theScope.block()
+}
+
+@Suppress("RETURN_TYPE_MISMATCH") // Hack to pass nulls as InteropPointer
+@InternalSkikoApi
+actual open class InteropScope actual constructor() {
+    actual fun toInterop(string: String?): InteropPointer = string
+
+    actual fun toInterop(array: ByteArray?): InteropPointer = array
+    actual fun toInteropForResult(array: ByteArray?): InteropPointer = toInterop(array)
+    actual fun InteropPointer.fromInterop(result: ByteArray) {}
+
+    actual fun toInterop(array: ShortArray?): InteropPointer = array
+    actual fun toInteropForResult(array: ShortArray?): InteropPointer = toInterop(array)
+    actual fun InteropPointer.fromInterop(result: ShortArray) {}
+
+    actual fun toInterop(array: IntArray?): InteropPointer = array
+    actual fun toInteropForResult(array: IntArray?): InteropPointer = toInterop(array)
+    actual fun InteropPointer.fromInterop(result: IntArray) {}
+
+    actual fun toInterop(array: LongArray?): InteropPointer = array
+    actual fun InteropPointer.fromInterop(result: LongArray) {}
+
+    actual fun toInterop(array: FloatArray?): InteropPointer = array
+    actual fun toInteropForResult(array: FloatArray?): InteropPointer = toInterop(array)
+    actual fun InteropPointer.fromInterop(result: FloatArray) {}
+
+    actual fun toInterop(array: DoubleArray?): InteropPointer = array
+    actual fun toInteropForResult(array: DoubleArray?): InteropPointer = toInterop(array)
+    actual fun InteropPointer.fromInterop(result: DoubleArray) {}
+
+    actual fun toInterop(array: NativePointerArray?): InteropPointer = array?.backing
+    actual fun toInteropForResult(array: NativePointerArray?): InteropPointer = toInterop(array)
+    actual fun InteropPointer.fromInterop(result: NativePointerArray) {}
+
+    actual fun toInterop(stringArray: Array<String>?): InteropPointer = stringArray
+    actual fun InteropPointer.fromInteropNativePointerArray(): NativePointerArray =
+        NativePointerArray((this as LongArray).size, this)
+    actual inline fun <reified T> InteropPointer.fromInterop(decoder: ArrayInteropDecoder<T>): Array<T> =
+        this@fromInterop as Array<T>
+    actual fun toInteropForArraysOfPointers(interopPointers: Array<InteropPointer>): InteropPointer = interopPointers
+
+    actual fun callback(callback: (() -> Unit)?): InteropPointer = callback
+    actual fun intCallback(callback: (() -> Int)?): InteropPointer = callback
+    actual fun nativePointerCallback(callback: (() -> NativePointer)?): InteropPointer = callback
+    actual fun interopPointerCallback(callback: (() -> InteropPointer)?): InteropPointer = callback
+    actual fun booleanCallback(callback: (() -> Boolean)?): InteropPointer = callback
+
+    actual fun virtual(method: () -> Unit) = callback(method)
+    actual fun virtualInt(method: () -> Int) = intCallback(method)
+    actual fun virtualNativePointer(method: () -> NativePointer) = nativePointerCallback(method)
+    actual fun virtualInteropPointer(method: () -> InteropPointer) = interopPointerCallback(method)
+    actual fun virtualBoolean(method: () -> Boolean) = booleanCallback(method)
+
+    actual fun release() {}
+}
+
+actual class NativePointerArray constructor(size: Int, internal val backing: LongArray) {
+
+    actual constructor(size: Int) : this(size, LongArray(size))
+
+    actual operator fun get(index: Int): NativePointer {
+        return backing[index]
+    }
+
+    actual operator fun set(index: Int, value: NativePointer) {
+        backing[index] = value
+    }
+
+    actual val size: Int
+        get() = backing.size
+}

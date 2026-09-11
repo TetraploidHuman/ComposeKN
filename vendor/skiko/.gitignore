@@ -1,0 +1,15 @@
+build
+.gradle
+.kotlin
+.project
+local.properties
+.DS_Store
+.idea
+.vscode
+deploy.sh
+deploy.bat
+*.xcodeproj
+skiko/src/jvmMain/java
+.cache
+.clangd
+**/kotlin-js-store/

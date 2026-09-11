@@ -1,0 +1,159 @@
+name: Docker Build and Publish
+
+on:
+  workflow_dispatch: # Allow manual triggering with an option to publish
+    inputs:
+      publish:
+        description: 'Publish to registry (if false, only dry-run build)'
+        required: false
+        type: boolean
+        default: true
+  workflow_call: # Allow being called by other workflows
+    inputs:
+      publish:
+        description: 'Publish to registry (if false, only dry-run build)'
+        required: true
+        type: boolean
+
+jobs:
+  changes:
+    name: 'Detect Docker Changes'
+    runs-on: ubuntu-24.04
+    outputs:
+      linux_amd64: ${{ steps.filter.outputs.linux_amd64 }}
+      linux_compat: ${{ steps.filter.outputs.linux_compat }}
+      linux_emscripten_amd64: ${{ steps.filter.outputs.linux_emscripten_amd64 }}
+      windows: ${{ steps.filter.outputs.windows }}
+      docker_workflow: ${{ steps.filter.outputs.docker_workflow }}
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.before || 'master' }}
+          filters: |
+            docker_workflow:
+              - '.github/actions/docker-skiko-publish/**'
+              - '.github/workflows/docker-publish.yml'
+            linux_amd64:
+              - 'skiko/docker/linux-amd64/**'
+            linux_compat:
+              - 'skiko/docker/linux-compat/**'
+            linux_emscripten_amd64:
+              - 'skiko/docker/linux-emscripten-amd64/**'
+            windows:
+              - 'skiko/docker/windows/**'
+
+  linux-amd64:
+    name: 'Docker Linux (x64)'
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: |
+      needs.changes.outputs.linux_amd64 == 'true' ||
+      needs.changes.outputs.docker_workflow == 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/docker-skiko-publish
+        name: 'Build and Publish Docker Image'
+        id: docker-publish
+        with:
+          image_name: linux-amd64
+          tag: ${{ github.ref_name }}
+          should_publish: ${{ inputs.publish }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-compat:
+    name: 'Docker Linux (Compatibility)'
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: |
+      needs.changes.outputs.linux_compat == 'true' ||
+      needs.changes.outputs.docker_workflow == 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/docker-skiko-publish
+        name: 'Build and Publish Docker Image'
+        id: docker-publish
+        with:
+          image_name: linux-compat
+          platforms: linux/amd64,linux/arm64
+          tag: ${{ github.ref_name }}
+          should_publish: ${{ inputs.publish }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-emscripten-amd64:
+    name: 'Docker Linux with Emscripten (x64)'
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: |
+      needs.changes.outputs.linux_emscripten_amd64 == 'true' ||
+      needs.changes.outputs.docker_workflow == 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/docker-skiko-publish
+        name: 'Build and Publish Docker Image'
+        id: docker-publish
+        with:
+          image_name: linux-emscripten-amd64
+          tag: ${{ github.ref_name }}
+          should_publish: ${{ inputs.publish }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  windows:
+    name: 'Docker Windows'
+    runs-on: windows-2022
+    needs: changes
+    if: |
+      needs.changes.outputs.windows == 'true' ||
+      needs.changes.outputs.docker_workflow == 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - name: 'Set Variables'
+        shell: pwsh
+        run: |
+          "IMAGE_REPOSITORY=$($env:GITHUB_REPOSITORY.ToLower())" >> $env:GITHUB_ENV
+          $tag = "${{ github.ref_name }}".Replace('/', '-')
+          "TAG=$tag" >> $env:GITHUB_ENV
+
+      - name: 'Log in to GitHub Container Registry'
+        if: inputs.publish == true
+        shell: pwsh
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: 'Build Image'
+        shell: pwsh
+        working-directory: ./skiko/docker/windows
+        run: |
+          docker build -t "ghcr.io/$($env:IMAGE_REPOSITORY)/windows-amd64:$($env:TAG)" -m 2G .
+
+      - name: 'Push Image'
+        if: inputs.publish == true
+        shell: pwsh
+        run: |
+          docker push "ghcr.io/$($env:IMAGE_REPOSITORY)/windows-amd64:$($env:TAG)"

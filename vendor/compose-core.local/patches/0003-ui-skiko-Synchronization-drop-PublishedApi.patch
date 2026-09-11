@@ -1,0 +1,10 @@
+--- a/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/Synchronization.skiko.kt
++++ b/ui/src/skikoMain/kotlin/androidx/compose/ui/platform/Synchronization.skiko.kt
+@@ -27,7 +27,6 @@
+ @Suppress("NOTHING_TO_INLINE")
+ internal actual inline fun makeSynchronizedObject(ref: Any?) = SynchronizedObject()
+ 
+-@PublishedApi
+ @Suppress("BanInlineOptIn")
+ @OptIn(ExperimentalContracts::class)
+ internal actual inline fun <R> synchronized(lock: SynchronizedObject, block: () -> R): R {

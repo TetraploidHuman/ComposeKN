@@ -1,0 +1,43 @@
+name: Skiko Documentation
+
+on:
+  workflow_call: # Allow being called by other workflows
+    inputs:
+      publish:
+        description: 'Publish documentation (if false, only dry-run build)'
+        required: true
+        type: boolean
+    secrets:
+      ACCESS_TOKEN:
+        description: 'GitHub token for deploying to gh-pages (required when publish is true)'
+        required: false
+
+jobs:
+  dokka:
+    name: 'Build and Publish Documentation'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Build Dokka Documentation'
+        with:
+          image_name: linux-compat
+          command: |
+            ./gradlew --no-daemon --stacktrace \
+              -Pskiko.native.enabled=true \
+              -Pskiko.wasm.enabled=true \
+              -Pskiko.android.enabled=true \
+              :skiko:dokkaHtml
+
+      - name: 'Publish Documentation'
+        if: ${{ inputs.publish }}
+        uses: JamesIves/github-pages-deploy-action@releases/v3
+        with:
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          BRANCH: gh-pages
+          FOLDER: ./skiko/build/dokka/html

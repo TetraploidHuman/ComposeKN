@@ -1,0 +1,1385 @@
+package org.jetbrains.skia
+
+import org.jetbrains.skia.impl.*
+import org.jetbrains.skia.impl.Library.Companion.staticLoad
+import kotlin.math.min
+
+/**
+ * Path contain geometry. Path may be empty, or contain one or more verbs that
+ * outline a figure. Path always starts with a move verb to a Cartesian coordinate,
+ * and may be followed by additional verbs that add lines or curves.
+ *
+ * Adding a close verb makes the geometry into a continuous loop, a closed contour.
+ * Path may contain any number of contours, each beginning with a move verb.
+ *
+ * Path contours may contain only a move verb, or may also contain lines,
+ * quadratic beziers, conics, and cubic beziers. Path contours may be open or
+ * closed.
+ *
+ * When used to draw a filled area, Path describes whether the fill is inside or
+ * outside the geometry. Path also describes the winding rule used to fill
+ * overlapping contours.
+ *
+ * Internally, Path lazily computes metrics likes bounds and convexity. Call
+ * [updateBoundsCache] to make Path thread safe.
+ */
+class Path internal constructor(ptr: NativePointer) : Managed(ptr, _FinalizerHolder.PTR), Iterable<PathSegment?> {
+    companion object {
+        fun makeFromSVGString(svg: String): Path  {
+            Stats.onNativeCall()
+            val result = interopScope {
+                _nMakeFromSVGString(toInterop(svg))
+            }
+
+            if (result == NullPointer) {
+                throw IllegalArgumentException("Failed to parse SVG Path string: $svg")
+            } else {
+                return Path(result)
+            }
+        }
+
+        /**
+         * Creates a new path with the specified spans.
+         *
+         * The points and weights arrays are read in order, based on the sequence of verbs.
+         *
+         * - Move    1 point
+         * - Line    1 point
+         * - Quad    2 points
+         * - Conic   2 points and 1 weight
+         * - Cubic   3 points
+         * - Close   0 points
+         *
+         * If an illegal sequence of verbs is encountered, or the specified number of points
+         * or weights is not sufficient given the verbs, an empty Path is returned.
+         *
+         * A legal sequence of verbs consists of any number of Contours. A contour always begins
+         * with a Move verb, followed by 0 or more segments: Line, Quad, Conic, Cubic, followed
+         * by an optional Close.
+         *
+         * @param pts        array of points
+         * @param verbs      array of path verbs
+         * @param conicWeights array of conic weights
+         * @param fillType   fill type for the path
+         * @param isVolatile whether the path is volatile
+         * @return           new Path constructed from the provided data
+         */
+        fun Raw(
+            pts: Array<Point>,
+            verbs: Array<PathVerb>,
+            conicWeights: FloatArray = FloatArray(0),
+            fillType: PathFillMode = PathFillMode.WINDING,
+            isVolatile: Boolean = false
+        ): Path {
+            Stats.onNativeCall()
+            val ptsFlat = FloatArray(pts.size * 2)
+            for (i in pts.indices) {
+                ptsFlat[i * 2] = pts[i].x
+                ptsFlat[i * 2 + 1] = pts[i].y
+            }
+            val verbsBytes = ByteArray(verbs.size) { verbs[it].ordinal.toByte() }
+            return interopScope {
+                val result = _nMakeFromRaw(
+                    toInterop(ptsFlat), pts.size,
+                    toInterop(verbsBytes), verbs.size,
+                    toInterop(conicWeights), conicWeights.size,
+                    fillType.ordinal, isVolatile
+                )
+                require(result != NullPointer) { "Failed to create Path from raw data" }
+                Path(result)
+            }
+        }
+
+        /**
+         * Creates a rectangular path.
+         *
+         * @param rect       rectangle bounds
+         * @param fillType   fill type for the path
+         * @param direction  direction to wind the rectangle
+         * @param startIndex starting corner index (0-3)
+         * @return           new rectangular Path
+         */
+        fun Rect(
+            rect: Rect,
+            fillType: PathFillMode = PathFillMode.WINDING,
+            direction: PathDirection = PathDirection.CLOCKWISE,
+            startIndex: Int = 0
+        ): Path {
+            Stats.onNativeCall()
+            val result = _nMakeFromRect(rect.left, rect.top, rect.right, rect.bottom, fillType.ordinal, direction.ordinal, startIndex)
+            require(result != NullPointer) { "Failed to create Path from rectangle" }
+            return Path(result)
+        }
+
+        /**
+         * Creates an oval path.
+         *
+         * @param rect       oval bounds
+         * @param direction  direction to wind the oval
+         * @param startIndex starting point index
+         * @return           new oval Path
+         */
+        fun Oval(
+            rect: Rect,
+            direction: PathDirection = PathDirection.CLOCKWISE,
+            startIndex: Int = 1
+        ): Path {
+            Stats.onNativeCall()
+            val result = _nMakeFromOval(rect.left, rect.top, rect.right, rect.bottom, direction.ordinal, startIndex)
+            require(result != NullPointer) { "Failed to create Path from oval" }
+            return Path(result)
+        }
+
+        /**
+         * Creates a circular path.
+         *
+         * @param centerX    x-coordinate of circle center
+         * @param centerY    y-coordinate of circle center
+         * @param radius     circle radius
+         * @param direction  direction to wind the circle
+         * @return           new circular Path
+         */
+        fun Circle(
+            centerX: Float,
+            centerY: Float,
+            radius: Float,
+            direction: PathDirection = PathDirection.CLOCKWISE
+        ): Path {
+            Stats.onNativeCall()
+            val result = _nMakeFromCircle(centerX, centerY, radius, direction.ordinal)
+            require(result != NullPointer) { "Failed to create Path from circle" }
+            return Path(result)
+        }
+
+        /**
+         * Creates a rounded rectangle path.
+         *
+         * @param rrect      rounded rectangle
+         * @param direction  direction to wind the rounded rectangle
+         * @param startIndex starting point index
+         * @return           new rounded rectangle Path
+         */
+        fun RRect(
+            rrect: RRect,
+            direction: PathDirection = PathDirection.CLOCKWISE,
+            startIndex: Int = if (direction == PathDirection.CLOCKWISE) 6 else 7
+        ): Path {
+            Stats.onNativeCall()
+            return interopScope {
+                val result = _nMakeFromRRect(toInterop(rrect.radii), rrect.left, rrect.top, rrect.right, rrect.bottom, direction.ordinal, startIndex)
+                require(result != NullPointer) { "Failed to create Path from rounded rectangle" }
+                Path(result)
+            }
+        }
+
+        /**
+         * Creates a rounded rectangle path from bounds and corner radii.
+         *
+         * @param bounds     rectangle bounds
+         * @param rx         x-axis radius of corners
+         * @param ry         y-axis radius of corners
+         * @param direction  direction to wind the rounded rectangle
+         * @return           new rounded rectangle Path
+         */
+        fun RRect(
+            bounds: Rect,
+            rx: Float,
+            ry: Float,
+            direction: PathDirection = PathDirection.CLOCKWISE
+        ): Path {
+            Stats.onNativeCall()
+            val result = _nMakeFromRRectXY(bounds.left, bounds.top, bounds.right, bounds.bottom, rx, ry, direction.ordinal)
+            require(result != NullPointer) { "Failed to create Path from rounded rectangle" }
+            return Path(result)
+        }
+
+        /**
+         * Creates a polygon path from an array of points.
+         *
+         * @param pts        array of polygon vertices
+         * @param isClosed   whether to close the polygon
+         * @param fillType   fill type for the path
+         * @param isVolatile whether the path is volatile
+         * @return           new polygon Path
+         */
+        fun Polygon(
+            pts: Array<Point>,
+            isClosed: Boolean,
+            fillType: PathFillMode = PathFillMode.WINDING,
+            isVolatile: Boolean = false
+        ): Path {
+            Stats.onNativeCall()
+            val ptsFlat = FloatArray(pts.size * 2)
+            for (i in pts.indices) {
+                ptsFlat[i * 2] = pts[i].x
+                ptsFlat[i * 2 + 1] = pts[i].y
+            }
+            return interopScope {
+                val result = _nMakeFromPolygon(toInterop(ptsFlat), pts.size, isClosed, fillType.ordinal, isVolatile)
+                require(result != NullPointer) { "Failed to create Path from polygon" }
+                Path(result)
+            }
+        }
+
+        /**
+         * Creates a simple line path between two points.
+         *
+         * @param p0 start point
+         * @param p1 end point
+         * @return   new line Path
+         */
+        fun Line(p0: Point, p1: Point): Path {
+            return Polygon(arrayOf(p0, p1), false)
+        }
+
+        /**
+         *
+         * Tests if line between Point pair is degenerate.
+         *
+         *
+         * Line with no length or that moves a very short distance is degenerate; it is
+         * treated as a point.
+         *
+         *
+         * exact changes the equality test. If true, returns true only if p1 equals p2.
+         * If false, returns true if p1 equals or nearly equals p2.
+         *
+         * @param p1     line start point
+         * @param p2     line end point
+         * @param exact  if false, allow nearly equals
+         * @return       true if line is degenerate; its length is effectively zero
+         *
+         * @see [https://fiddle.skia.org/c/@Path_IsLineDegenerate](https://fiddle.skia.org/c/@Path_IsLineDegenerate)
+         */
+        fun isLineDegenerate(p1: Point, p2: Point, exact: Boolean): Boolean {
+            Stats.onNativeCall()
+            return _nIsLineDegenerate(p1.x, p1.y, p2.x, p2.y, exact)
+        }
+
+        /**
+         *
+         * Tests if quad is degenerate.
+         *
+         *
+         * Quad with no length or that moves a very short distance is degenerate; it is
+         * treated as a point.
+         *
+         * @param p1     quad start point
+         * @param p2     quad control point
+         * @param p3     quad end point
+         * @param exact  if true, returns true only if p1, p2, and p3 are equal;
+         * if false, returns true if p1, p2, and p3 are equal or nearly equal
+         * @return       true if quad is degenerate; its length is effectively zero
+         */
+        fun isQuadDegenerate(p1: Point, p2: Point, p3: Point, exact: Boolean): Boolean {
+            Stats.onNativeCall()
+            return _nIsQuadDegenerate(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, exact)
+        }
+
+        /**
+         *
+         * Tests if cubic is degenerate.
+         *
+         *
+         * Cubic with no length or that moves a very short distance is degenerate; it is
+         * treated as a point.
+         *
+         * @param p1     cubic start point
+         * @param p2     cubic control point 1
+         * @param p3     cubic control point 2
+         * @param p4     cubic end point
+         * @param exact  if true, returns true only if p1, p2, p3, and p4 are equal;
+         * if false, returns true if p1, p2, p3, and p4 are equal or nearly equal
+         * @return       true if cubic is degenerate; its length is effectively zero
+         */
+        fun isCubicDegenerate(p1: Point, p2: Point, p3: Point, p4: Point, exact: Boolean): Boolean {
+            Stats.onNativeCall()
+            return _nIsCubicDegenerate(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y, exact)
+        }
+
+        /**
+         *
+         * Approximates conic with quad array. Conic is constructed from start Point p0,
+         * control Point p1, end Point p2, and weight w.
+         *
+         *
+         * Quad array is stored in pts; this storage is supplied by caller.
+         *
+         *
+         * Maximum quad count is 2 to the pow2.
+         *
+         *
+         * Every third point in array shares last Point of previous quad and first Point of
+         * next quad. Maximum pts storage size is given by: `(1 + 2 * (1 << pow2)).</p>`
+         *
+         *
+         * Returns quad count used the approximation, which may be smaller
+         * than the number requested.
+         *
+         *
+         * conic weight determines the amount of influence conic control point has on the curve.
+         *
+         *
+         * w less than one represents an elliptical section. w greater than one represents
+         * a hyperbolic section. w equal to one represents a parabolic section.
+         *
+         *
+         * Two quad curves are sufficient to approximate an elliptical conic with a sweep
+         * of up to 90 degrees; in this case, set pow2 to one.
+         *
+         * @param p0    conic start Point
+         * @param p1    conic control Point
+         * @param p2    conic end Point
+         * @param w     conic weight
+         * @param pow2  quad count, as power of two, normally 0 to 5 (1 to 32 quad curves)
+         * @return      number of quad curves written to pts
+         */
+        fun convertConicToQuads(p0: Point, p1: Point, p2: Point, w: Float, pow2: Int): Array<Point> {
+            Stats.onNativeCall()
+            val maxResultPointCount = (1 + 2 * (1 shl pow2)) // See Skia docs
+            var pointCount = 0
+            val coords = withResult(FloatArray(maxResultPointCount * 2)) {
+                pointCount = _nConvertConicToQuads(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y, w, pow2, it)
+            }
+            return Array(pointCount) { Point(coords[2 * it], coords[2 * it + 1]) }
+        }
+
+        /**
+         *
+         * Returns Path that is the result of applying the Op to the first path and the second path.
+         *
+         * The resulting path will be constructed from non-overlapping contours.
+         *
+         * The curve order is reduced where possible so that cubics may be turned
+         * into quadratics, and quadratics maybe turned into lines.
+         *
+         * @param one The first operand (for difference, the minuend)
+         * @param two The second operand (for difference, the subtrahend)
+         * @param op  The operator to apply.
+         * @return    Path if operation was able to produce a result, null otherwise
+         */
+        fun makeCombining(one: Path, two: Path, op: PathOp): Path? {
+            return try {
+                Stats.onNativeCall()
+                val ptr = _nMakeCombining(
+                    getPtr(one),
+                    getPtr(two),
+                    op.ordinal
+                )
+                if (ptr == NullPointer) null else Path(ptr)
+            } finally {
+                reachabilityBarrier(one)
+                reachabilityBarrier(two)
+            }
+        }
+
+        /**
+         * Initializes Path from byte buffer. Throws exception if the buffer
+         * data is inconsistent, or the length is too small.
+         *
+         * Reads [PathFillMode], verb array, Point array, conic weight, and
+         * additionally reads computed information like path convexity and bounds.
+         *
+         * Used only in concert with [serializeToBytes];
+         * the format used for Path in memory is not guaranteed.
+         *
+         * @param data  storage for Path
+         * @return      reconstructed Path
+         *
+         * @see [https://fiddle.skia.org/c/@Path_readFromMemory](https://fiddle.skia.org/c/@Path_readFromMemory)
+         */
+        fun makeFromBytes(data: ByteArray): Path {
+            Stats.onNativeCall()
+            val result = interopScope {
+                _nMakeFromBytes(toInterop(data), data.size)
+            }
+
+            if (result == NullPointer) {
+                throw IllegalArgumentException("Failed to parse serialized Path")
+            } else {
+                return Path(result)
+            }
+        }
+
+        init {
+            staticLoad()
+        }
+    }
+
+    internal object _FinalizerHolder {
+        val PTR = Path_nGetFinalizer()
+    }
+
+    /**
+     * Constructs an empty Path. By default, Path has no verbs, no [Point], and no weights.
+     * FillMode is set to [PathFillMode.WINDING].
+     */
+    constructor() : this(Path_nMake()) {
+        Stats.onNativeCall()
+    }
+
+    /**
+     * Compares this path and o; Returns true if [PathFillMode], verb array, Point array, and weights
+     * are equivalent.
+     *
+     * @param other  Path to compare
+     * @return   true if this and Path are equivalent
+     */
+    override fun nativeEquals(other: Native?): Boolean {
+        return try {
+            Path_nEquals(_ptr, getPtr(other))
+        } finally {
+            reachabilityBarrier(this)
+            reachabilityBarrier(other)
+        }
+    }
+
+    /**
+     * Returns true if Path contain equal verbs and equal weights.
+     * If Path contain one or more conics, the weights must match.
+     *
+     * conicTo may add different verbs depending on conic weight, so it is not
+     * trivial to interpolate a pair of Path containing conics with different
+     * conic weight values.
+     *
+     * @param compare  Path to compare
+     * @return         true if Path verb array and weights are equivalent
+     *
+     * @see [https://fiddle.skia.org/c/@Path_isInterpolatable](https://fiddle.skia.org/c/@Path_isInterpolatable)
+     */
+    fun isInterpolatable(compare: Path?): Boolean {
+        return try {
+            Stats.onNativeCall()
+            _nIsInterpolatable(
+                _ptr,
+                getPtr(compare)
+            )
+        } finally {
+            reachabilityBarrier(this)
+            reachabilityBarrier(compare)
+        }
+    }
+
+    /**
+     * Interpolates between Path with [Point] array of equal size.
+     * Copy verb array and weights to out, and set out Point array to a weighted
+     * average of this Point array and ending Point array, using the formula:
+     *
+     *
+     * `(Path Point * weight) + ending Point * (1 - weight)`
+     *
+     *
+     * weight is most useful when between zero (ending Point array) and
+     * one (this Point_Array); will work with values outside of this
+     * range.
+     *
+     *
+     * interpolate() returns null if Point array is not
+     * the same size as ending Point array. Call [.isInterpolatable] to check Path
+     * compatibility prior to calling interpolate().
+     *
+     * @param ending  Point array averaged with this Point array
+     * @param weight  contribution of this Point array, and
+     * one minus contribution of ending Point array
+     * @return        interpolated Path if Path contain same number of Point, null otherwise
+     *
+     * @see [https://fiddle.skia.org/c/@Path_interpolate](https://fiddle.skia.org/c/@Path_interpolate)
+     */
+    fun makeLerp(ending: Path?, weight: Float): Path {
+        return try {
+            Stats.onNativeCall()
+            val ptr = _nMakeLerp(
+                _ptr,
+                getPtr(ending),
+                weight
+            )
+            require(ptr != NullPointer) { "Point array is not the same size as ending Point array" }
+            Path(ptr)
+        } finally {
+            reachabilityBarrier(this)
+            reachabilityBarrier(ending)
+        }
+    }
+
+    /**
+     * Returns the path's fill type. This defines how "inside" is computed.
+     * The default value is [PathFillMode.WINDING].
+     *
+     * @return  this path's [PathFillMode]
+     */
+    var fillMode: PathFillMode
+        get() = try {
+            Stats.onNativeCall()
+            PathFillMode.entries[_nGetFillMode(_ptr)]
+        } finally {
+            reachabilityBarrier(this)
+        }
+        set(value) = try {
+            Stats.onNativeCall()
+            _nSetFillMode(_ptr, value.ordinal)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns true if the path is convex. If necessary, it will first compute the convexity.
+     *
+     * @return  true or false
+     */
+    val isConvex: Boolean
+        get() = try {
+            Stats.onNativeCall()
+            _nIsConvex(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns oval bounds if this path is recognized as an oval or circle.
+     *
+     * @return  bounds is recognized as an oval or circle, null otherwise
+     *
+     * @see [https://fiddle.skia.org/c/@Path_isOval](https://fiddle.skia.org/c/@Path_isOval)
+     */
+    val isOval: Rect?
+        get() = try {
+            Stats.onNativeCall()
+            Rect.fromInteropPointerNullable { _nIsOval(_ptr, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns rect bounds if this path is recognized as a rectangle.
+     *
+     * @return  bounds if recognized as a rectangle, null otherwise
+     *
+     * @see [https://fiddle.skia.org/c/@Path_isRect](https://fiddle.skia.org/c/@Path_isRect)
+     */
+    val isRect: Rect?
+        get() = try {
+            Stats.onNativeCall()
+            Rect.fromInteropPointerNullable { _nIsRect(_ptr, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns [RRect] if this path is recognized as an oval, circle or RRect.
+     *
+     * @return  bounds is recognized as an oval, circle or RRect, null otherwise
+     *
+     * @see [https://fiddle.skia.org/c/@Path_isRRect](https://fiddle.skia.org/c/@Path_isRRect)
+     */
+    val isRRect: RRect?
+        get() = try {
+            Stats.onNativeCall()
+            RRect.fromInteropPointerNullable { _nIsRRect(_ptr, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+
+    /**
+     * Returns if Path is empty.
+     *
+     * Empty Path may have FillMode but has no [Point], [PathVerb], or conic weight.
+     * [Path] constructor constructs empty Path.
+     *
+     * @return  true if the path contains no Verb array
+     */
+    val isEmpty: Boolean
+        get() = try {
+            Stats.onNativeCall()
+            _nIsEmpty(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns if contour is closed.
+     *
+     * Contour is closed if Path Verb array was last modified by close verb. When stroked,
+     * closed contour draws [PaintStrokeJoin] instead of [PaintStrokeCap] at first and last Point.
+     *
+     * @return  true if the last contour ends with a [PathVerb.CLOSE]
+     *
+     * @see [https://fiddle.skia.org/c/@Path_isLastContourClosed](https://fiddle.skia.org/c/@Path_isLastContourClosed)
+     */
+    val isLastContourClosed: Boolean
+        get() = try {
+            Stats.onNativeCall()
+            _nIsLastContourClosed(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns true for finite Point array values between negative Float.MIN_VALUE and
+     * positive Float.MAX_VALUE. Returns false for any Point array value of
+     * Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, or Float.NaN.
+     *
+     * @return  true if all Point values are finite
+     */
+    val isFinite: Boolean
+        get() = try {
+            Stats.onNativeCall()
+            // TODO For some reason this method returns 0 instead of false in JS target, investigate
+            !!_nIsFinite(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     *
+     * Specifies whether Path is volatile; whether it will be altered or discarded
+     * by the caller after it is drawn. Path by default have volatile set false, allowing
+     * SkBaseDevice to attach a cache of data which speeds repeated drawing.
+     *
+     * Mark temporary paths, discarded or modified after use, as volatile
+     * to inform SkBaseDevice that the path need not be cached.
+     *
+     * Mark animating Path volatile to improve performance.
+     * Mark unchanging Path non-volatile to improve repeated rendering.
+     *
+     * raster surface Path draws are affected by volatile for some shadows.
+     * GPU surface Path draws are affected by volatile for some shadows and concave geometries.
+     *
+     * Returns true if the path is volatile; it will not be altered or discarded
+     * by the caller after it is drawn. Path by default have volatile set false, allowing
+     * [Surface] to attach a cache of data which speeds repeated drawing. If true, [Surface]
+     * may not speed repeated drawing.
+     *
+     * @return  true if caller will alter Path after drawing
+     */
+    var isVolatile: Boolean
+        get() = try {
+            Stats.onNativeCall()
+            Path_nIsVolatile(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+        set(value) = try {
+            Stats.onNativeCall()
+            Path_nSetVolatile(_ptr, value)
+        } finally {
+            reachabilityBarrier(this)
+        }
+    
+    /**
+     *
+     * Specifies whether Path is volatile; whether it will be altered or discarded
+     * by the caller after it is drawn. Path by default have volatile set false, allowing
+     * SkBaseDevice to attach a cache of data which speeds repeated drawing.
+     *
+     *
+     * Mark temporary paths, discarded or modified after use, as volatile
+     * to inform SkBaseDevice that the path need not be cached.
+     *
+     *
+     * Mark animating Path volatile to improve performance.
+     * Mark unchanging Path non-volatile to improve repeated rendering.
+     *
+     *
+     * raster surface Path draws are affected by volatile for some shadows.
+     * GPU surface Path draws are affected by volatile for some shadows and concave geometries.
+     *
+     * @param isVolatile  true if caller will alter Path after drawing
+     * @return            this
+     */
+    fun setVolatile(isVolatile: Boolean): Path {
+        Stats.onNativeCall()
+        Path_nSetVolatile(_ptr, isVolatile)
+        return this
+    }
+
+    /**
+     * Returns array of two points if Path contains only one line;
+     * Verb array has two entries: [PathVerb.MOVE], [PathVerb.LINE].
+     * Returns null if Path is not one line.
+     *
+     * @return  Point[2] if Path contains exactly one line, null otherwise
+     *
+     * @see [https://fiddle.skia.org/c/@Path_isLine](https://fiddle.skia.org/c/@Path_isLine)
+     */
+    val asLine: Array<Point>?
+        get() = try {
+            Stats.onNativeCall()
+            // HACK Use a temporary Rect as a buffer to store two points
+            val rectBuffer = Rect.fromInteropPointerNullable { _nMaybeGetAsLine(_ptr, it) }
+            rectBuffer?.run {
+                arrayOf(
+                    Point(left, top),
+                    Point(right, bottom)
+                )
+            }
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns the number of points in Path.
+     * Point count is initially zero.
+     *
+     * @return  Path Point array length
+     *
+     * @see [https://fiddle.skia.org/c/@Path_countPoints](https://fiddle.skia.org/c/@Path_countPoints)
+     */
+    val pointsCount: Int
+        get() = try {
+            Stats.onNativeCall()
+            _nGetPointsCount(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     *
+     * Returns Point at index in Point array. Valid range for index is
+     * 0 to countPoints() - 1.
+     *
+     *
+     * Returns (0, 0) if index is out of range.
+     *
+     * @param index  Point array element selector
+     * @return       Point array value or (0, 0)
+     *
+     * @see [https://fiddle.skia.org/c/@Path_getPoint](https://fiddle.skia.org/c/@Path_getPoint)
+     */
+    fun getPoint(index: Int): Point {
+        return try {
+            Stats.onNativeCall()
+            Point.fromInteropPointer { _nGetPoint(_ptr, index, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+    }
+
+    /**
+     *
+     * Returns all points in Path.
+     *
+     * @return        Path Point array length
+     *
+     * @see [https://fiddle.skia.org/c/@Path_getPoints](https://fiddle.skia.org/c/@Path_getPoints)
+     */
+    val points: Array<Point?>
+        get() {
+            val res = arrayOfNulls<Point>(pointsCount)
+            getPoints(res, res.size)
+            return res
+        }
+
+    /**
+     *
+     * Returns number of points in Path. Up to max points are copied.
+     *
+     *
+     * points may be null; then, max must be zero.
+     * If max is greater than number of points, excess points storage is unaltered.
+     *
+     * @param points  storage for Path Point array. May be null
+     * @param max     maximum to copy; must be greater than or equal to zero
+     * @return        Path Point array length
+     *
+     * @see [https://fiddle.skia.org/c/@Path_getPoints](https://fiddle.skia.org/c/@Path_getPoints)
+     */
+    fun getPoints(points: Array<Point?>?, max: Int): Int {
+        return try {
+            require(if (points == null) max == 0 else max >= 0)
+            Stats.onNativeCall()
+            if (points == null) {
+                interopScope {
+                    _nGetPoints(_ptr, toInterop(null as FloatArray?), max)
+                }
+            } else {
+                var result = 0
+                val coords = withResult(FloatArray(max * 2)) {
+                    result = _nGetPoints(_ptr, it, max)
+                }
+                for (i in 0 until min(max, result)) {
+                    points[i] = Point(coords[2 * i], coords[2 * i + 1])
+                }
+                result
+            }
+        } finally {
+            reachabilityBarrier(this)
+        }
+    }
+
+    /**
+     * Returns last point on Path in lastPt. Returns null if Point array is empty.
+     *
+     * @return        point if Point array contains one or more Point, null otherwise
+     *
+     * @see [https://fiddle.skia.org/c/@Path_getLastPt](https://fiddle.skia.org/c/@Path_getLastPt)
+     */
+    val lastPt: Point?
+        get() = try {
+            Stats.onNativeCall()
+            Point.fromNullableInteropPointer { _nGetLastPt(_ptr, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns the number of verbs: [PathVerb.MOVE], [PathVerb.LINE], [PathVerb.QUAD], [PathVerb.CONIC],
+     * [PathVerb.CUBIC], and [PathVerb.CLOSE]; added to Path.
+     *
+     * @return  length of verb array
+     *
+     * @see [https://fiddle.skia.org/c/@Path_countVerbs](https://fiddle.skia.org/c/@Path_countVerbs)
+     */
+    val verbsCount: Int
+        get() = try {
+            Stats.onNativeCall()
+            _nCountVerbs(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+    /**
+     * Returns all verbs in Path.
+     *
+     * @return  Array containing all Path verbs
+     *
+     * @see [https://fiddle.skia.org/c/@Path_getVerbs](https://fiddle.skia.org/c/@Path_getVerbs)
+     */
+    val verbs: Array<PathVerb?>
+        get() {
+            val res = arrayOfNulls<PathVerb>(verbsCount)
+            getVerbs(res, res.size)
+            return res
+        }
+
+    /**
+     * Returns the number of verbs in the path. Up to max verbs are copied.
+     *
+     * @param verbs  storage for verbs, may be null
+     * @param max    maximum number to copy into verbs
+     * @return       the actual number of verbs in the path
+     *
+     * @see [https://fiddle.skia.org/c/@Path_getVerbs](https://fiddle.skia.org/c/@Path_getVerbs)
+     */
+    fun getVerbs(verbs: Array<PathVerb?>?, max: Int): Int {
+        return try {
+            require(if (verbs == null) max == 0 else true)
+            Stats.onNativeCall()
+            val out = if (verbs == null) null else ByteArray(max)
+            val count = interopScope {
+                val ptr = toInterop(out)
+                _nGetVerbs(_ptr, ptr, max).also {
+                    out?.let { ptr.fromInterop(it) }
+                }
+            }
+            if (verbs != null) for (i in 0 until minOf(count, max)) verbs[i] = PathVerb.entries[out!![i].toInt()]
+            count
+        } finally {
+            reachabilityBarrier(this)
+        }
+    }
+
+    /**
+     * Returns the approximate byte size of the Path in memory.
+     *
+     * @return  approximate size in bytes
+     */
+    val approximateBytesUsed: Int
+        get() = try {
+            Stats.onNativeCall()
+            _nApproximateBytesUsed(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     *
+     * Exchanges the verb array, Point array, weights, and FillMode with other.
+     * Cached state is also exchanged. swap() internally exchanges pointers, so
+     * it is lightweight and does not allocate memory.
+     *
+     * @param   other  Path exchanged by value
+     * @return  this
+     *
+     * @see [https://fiddle.skia.org/c/@Path_swap](https://fiddle.skia.org/c/@Path_swap)
+     */
+    fun swap(other: Path?): Path {
+        return try {
+            Stats.onNativeCall()
+            Path_nSwap(_ptr, getPtr(other))
+            this
+        } finally {
+            reachabilityBarrier(this)
+            reachabilityBarrier(other)
+        }
+    }
+
+    /**
+     *
+     * Returns minimum and maximum axes values of Point array.
+     *
+     *
+     * Returns (0, 0, 0, 0) if Path contains no points. Returned bounds width and height may
+     * be larger or smaller than area affected when Path is drawn.
+     *
+     *
+     * Rect returned includes all Point added to Path, including Point associated with
+     * [PathVerb.MOVE] that define empty contours.
+     *
+     * @return  bounds of all Point in Point array
+     */
+    val bounds: Rect
+        get() = try {
+            Stats.onNativeCall()
+            Rect.fromInteropPointer { _nGetBounds(_ptr, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Updates internal bounds so that subsequent calls to [bounds] are instantaneous.
+     * Unaltered copies of Path may also access cached bounds through [bounds].
+     *
+     * For now, identical to calling [bounds] and ignoring the returned value.
+     *
+     * Call to prepare Path subsequently drawn from multiple threads,
+     * to avoid a race condition where each draw separately computes the bounds.
+     *
+     * @return  this
+     */
+    fun updateBoundsCache(): Path {
+        Stats.onNativeCall()
+        _nUpdateBoundsCache(_ptr)
+        return this
+    }
+
+    /**
+     * Returns minimum and maximum axes values of the lines and curves in Path.
+     * Returns (0, 0, 0, 0) if Path contains no points.
+     * Returned bounds width and height may be larger or smaller than area affected
+     * when Path is drawn.
+     *
+     * Includes Point associated with [PathVerb.MOVE] that define empty
+     * contours.
+     *
+     * Behaves identically to [bounds] when Path contains
+     * only lines. If Path contains curves, computed bounds includes
+     * the maximum extent of the quad, conic, or cubic; is slower than [bounds];
+     * and unlike [bounds], does not cache the result.
+     *
+     * @return  tight bounds of curves in Path
+     *
+     * @see [https://fiddle.skia.org/c/@Path_computeTightBounds](https://fiddle.skia.org/c/@Path_computeTightBounds)
+     */
+    fun computeTightBounds(): Rect {
+        return try {
+            Stats.onNativeCall()
+            Rect.fromInteropPointer { _nComputeTightBounds(_ptr, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+    }
+
+    /**
+     *
+     * Returns true if rect is contained by Path.
+     * May return false when rect is contained by Path.
+     *
+     *
+     * For now, only returns true if Path has one contour and is convex.
+     * rect may share points and edges with Path and be contained.
+     * Returns true if rect is empty, that is, it has zero width or height; and
+     * the Point or line described by rect is contained by Path.
+     *
+     * @param rect  Rect, line, or Point checked for containment
+     * @return      true if rect is contained
+     *
+     * @see [https://fiddle.skia.org/c/@Path_conservativelyContainsRect](https://fiddle.skia.org/c/@Path_conservativelyContainsRect)
+     */
+    fun conservativelyContainsRect(rect: Rect): Boolean {
+        return try {
+            Stats.onNativeCall()
+            _nConservativelyContainsRect(
+                _ptr,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom
+            )
+        } finally {
+            reachabilityBarrier(this)
+        }
+    }
+
+    /**
+     *
+     * Returns a mask, where each set bit corresponds to a SegmentMask constant
+     * if Path contains one or more verbs of that type.
+     *
+     *
+     * Returns zero if Path contains no lines, or curves: quads, conics, or cubics.
+     *
+     *
+     * getSegmentMasks() returns a cached result; it is very fast.
+     *
+     * @return  SegmentMask bits or zero
+     *
+     * @see PathSegmentMask.LINE
+     *
+     * @see PathSegmentMask.QUAD
+     *
+     * @see PathSegmentMask.CONIC
+     *
+     * @see PathSegmentMask.CUBIC
+     */
+    val segmentMasks: Int
+        get() = try {
+            Stats.onNativeCall()
+            _nGetSegmentMasks(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    override fun iterator(): PathSegmentIterator {
+        return iterator(false)
+    }
+
+    fun iterator(forceClose: Boolean): PathSegmentIterator {
+        return PathSegmentIterator.make(this, forceClose)
+    }
+
+    /**
+     * Returns true if the point (x, y) is contained by Path, taking into
+     * account [PathFillMode].
+     *
+     * @param x  x-axis value of containment test
+     * @param y  y-axis value of containment test
+     * @return   true if Point is in Path
+     *
+     * @see [https://fiddle.skia.org/c/@Path_contains](https://fiddle.skia.org/c/@Path_contains)
+     */
+    fun contains(x: Float, y: Float): Boolean {
+        return try {
+            Stats.onNativeCall()
+            _nContains(_ptr, x, y)
+        } finally {
+            reachabilityBarrier(this)
+        }
+    }
+
+    /**
+     * Returns true if the point is contained by Path, taking into
+     * account [PathFillMode].
+     *
+     * @param p  point of containment test
+     * @return   true if Point is in Path
+     *
+     * @see [https://fiddle.skia.org/c/@Path_contains](https://fiddle.skia.org/c/@Path_contains)
+     */
+    operator fun contains(p: Point): Boolean {
+        return contains(p.x, p.y)
+    }
+
+    /**
+     * Writes text representation of Path to standard output. The representation may be
+     * directly compiled as C++ code. Floating point values are written
+     * with limited precision; it may not be possible to reconstruct original Path
+     * from output.
+     *
+     * @return  this
+     *
+     * @see [https://fiddle.skia.org/c/@Path_dump_2](https://fiddle.skia.org/c/@Path_dump_2)
+     */
+    fun dump(): Path {
+        Stats.onNativeCall()
+        _nDump(_ptr)
+        return this
+    }
+
+    /**
+     * Writes text representation of Path to standard output. The representation may be
+     * directly compiled as C++ code. Floating point values are written
+     * in hexadecimal to preserve their exact bit pattern. The output reconstructs the
+     * original Path.
+     *
+     * Use instead of [dump] when precision is important.
+     *
+     * @return  this
+     *
+     * @see [https://fiddle.skia.org/c/@Path_dumpHex](https://fiddle.skia.org/c/@Path_dumpHex)
+     */
+    fun dumpHex(): Path {
+        Stats.onNativeCall()
+        _nDumpHex(_ptr)
+        return this
+    }
+
+    /**
+     * Writes Path to byte buffer.
+     *
+     * Writes [PathFillMode], verb array, Point array, conic weight, and
+     * additionally writes computed information like path convexity and bounds.
+     *
+     * Use only in concert with [makeFromBytes];
+     * the format used for Path in memory is not guaranteed.
+     *
+     * @return  serialized Path; length always a multiple of 4
+     *
+     * @see [https://fiddle.skia.org/c/@Path_writeToMemory](https://fiddle.skia.org/c/@Path_writeToMemory)
+     */
+    fun serializeToBytes(): ByteArray {
+        return try {
+            Stats.onNativeCall()
+            val size = interopScope { _nSerializeToBytes(_ptr, toInterop(null as ByteArray?)) }
+            if (size == -1) {
+                throw Error("Path is too big")
+            }
+            withResult(ByteArray(size)) {
+                _nSerializeToBytes(_ptr, it)
+            }
+        } finally {
+            reachabilityBarrier(this)
+        }
+    }
+
+    /**
+     *
+     * Returns a non-zero, globally unique value. A different value is returned
+     * if verb array, Point array, or conic weight changes.
+     *
+     *
+     * Setting [PathFillMode] does not change generation identifier.
+     *
+     *
+     * Each time the path is modified, a different generation identifier will be returned.
+     * [PathFillMode] does affect generation identifier on Android framework.
+     *
+     * @return  non-zero, globally unique value
+     *
+     * @see [https://fiddle.skia.org/c/@Path_getGenerationID](https://fiddle.skia.org/c/@Path_getGenerationID)
+     *
+     * @see [https://bugs.chromium.org/p/skia/issues/detail?id=1762](https://bugs.chromium.org/p/skia/issues/detail?id=1762)
+     */
+    val generationId: Int
+        get() = try {
+            Stats.onNativeCall()
+            Path_nGetGenerationId(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+
+    /**
+     * Returns if Path data is consistent. Corrupt Path data is detected if
+     * internal values are out of range or internal storage does not match
+     * array dimensions.
+     *
+     * @return  true if Path data is consistent
+     */
+    val isValid: Boolean
+        get() = try {
+            Stats.onNativeCall()
+            _nIsValid(_ptr)
+        } finally {
+            reachabilityBarrier(this)
+        }
+}
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetFinalizer")
+internal external fun Path_nGetFinalizer(): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMake")
+private external fun Path_nMake(): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nEquals")
+private external fun Path_nEquals(aPtr: NativePointer, bPtr: NativePointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsVolatile")
+private external fun Path_nIsVolatile(ptr: NativePointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nSetVolatile")
+private external fun Path_nSetVolatile(ptr: NativePointer, isVolatile: Boolean)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nSwap")
+private external fun Path_nSwap(ptr: NativePointer, otherPtr: NativePointer)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetGenerationId")
+private external fun Path_nGetGenerationId(ptr: NativePointer): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromRaw")
+private external fun _nMakeFromRaw(
+    pts: InteropPointer, ptsCount: Int,
+    verbs: InteropPointer, verbsCount: Int,
+    conicWeights: InteropPointer, conicWeightsCount: Int,
+    fillType: Int, isVolatile: Boolean
+): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromRect")
+private external fun _nMakeFromRect(
+    left: Float, top: Float, right: Float, bottom: Float,
+    fillType: Int, direction: Int, startIndex: Int
+): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromOval")
+private external fun _nMakeFromOval(
+    left: Float, top: Float, right: Float, bottom: Float,
+    direction: Int, startIndex: Int
+): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromCircle")
+private external fun _nMakeFromCircle(
+    centerX: Float, centerY: Float, radius: Float, direction: Int
+): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromRRect")
+private external fun _nMakeFromRRect(
+    radii: InteropPointer,
+    left: Float, top: Float, right: Float, bottom: Float,
+    direction: Int, startIndex: Int
+): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromRRectXY")
+private external fun _nMakeFromRRectXY(
+    left: Float, top: Float, right: Float, bottom: Float,
+    rx: Float, ry: Float, direction: Int
+): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromPolygon")
+private external fun _nMakeFromPolygon(
+    pts: InteropPointer, ptsCount: Int,
+    isClosed: Boolean, fillType: Int, isVolatile: Boolean
+): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromSVGString")
+private external fun _nMakeFromSVGString(svg: InteropPointer): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsInterpolatable")
+private external fun _nIsInterpolatable(ptr: NativePointer, comparePtr: NativePointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeLerp")
+private external fun _nMakeLerp(ptr: NativePointer, endingPtr: NativePointer, weight: Float): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetFillMode")
+private external fun _nGetFillMode(ptr: NativePointer): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nSetFillMode")
+private external fun _nSetFillMode(ptr: NativePointer, fillMode: Int)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsConvex")
+private external fun _nIsConvex(ptr: NativePointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsOval")
+private external fun _nIsOval(ptr: NativePointer, rect: InteropPointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsRect")
+private external fun _nIsRect(ptr: NativePointer, rect: InteropPointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsRRect")
+private external fun _nIsRRect(ptr: NativePointer, rrect: InteropPointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsEmpty")
+private external fun _nIsEmpty(ptr: NativePointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsLastContourClosed")
+private external fun _nIsLastContourClosed(ptr: NativePointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsFinite")
+private external fun _nIsFinite(ptr: NativePointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsLineDegenerate")
+private external fun _nIsLineDegenerate(x0: Float, y0: Float, x1: Float, y1: Float, exact: Boolean): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsQuadDegenerate")
+private external fun _nIsQuadDegenerate(
+    x0: Float,
+    y0: Float,
+    x1: Float,
+    y1: Float,
+    x2: Float,
+    y2: Float,
+    exact: Boolean
+): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsCubicDegenerate")
+private external fun _nIsCubicDegenerate(
+    x0: Float,
+    y0: Float,
+    x1: Float,
+    y1: Float,
+    x2: Float,
+    y2: Float,
+    x3: Float,
+    y3: Float,
+    exact: Boolean
+): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMaybeGetAsLine")
+private external fun _nMaybeGetAsLine(ptr: NativePointer, rectBuffer: InteropPointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetPointsCount")
+private external fun _nGetPointsCount(ptr: NativePointer): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetPoint")
+private external fun _nGetPoint(ptr: NativePointer, index: Int, result: InteropPointer)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetPoints")
+private external fun _nGetPoints(ptr: NativePointer, points: InteropPointer, max: Int): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nCountVerbs")
+private external fun _nCountVerbs(ptr: NativePointer): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetVerbs")
+private external fun _nGetVerbs(ptr: NativePointer, verbs: InteropPointer, max: Int): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nApproximateBytesUsed")
+private external fun _nApproximateBytesUsed(ptr: NativePointer): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetBounds")
+private external fun _nGetBounds(ptr: NativePointer, rect: InteropPointer)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nUpdateBoundsCache")
+private external fun _nUpdateBoundsCache(ptr: NativePointer)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nComputeTightBounds")
+private external fun _nComputeTightBounds(ptr: NativePointer, rect: InteropPointer)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nConservativelyContainsRect")
+private external fun _nConservativelyContainsRect(ptr: NativePointer, l: Float, t: Float, r: Float, b: Float): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nConvertConicToQuads")
+private external fun _nConvertConicToQuads(
+    x0: Float,
+    y0: Float,
+    x1: Float,
+    y1: Float,
+    x2: Float,
+    y2: Float,
+    w: Float,
+    pow2: Int,
+    result: InteropPointer
+): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetLastPt")
+private external fun _nGetLastPt(ptr: NativePointer, result: InteropPointer): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nGetSegmentMasks")
+private external fun _nGetSegmentMasks(ptr: NativePointer): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nContains")
+private external fun _nContains(ptr: NativePointer, x: Float, y: Float): Boolean
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nDump")
+private external fun _nDump(ptr: NativePointer)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nDumpHex")
+private external fun _nDumpHex(ptr: NativePointer)
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nSerializeToBytes")
+private external fun _nSerializeToBytes(ptr: NativePointer, dst: InteropPointer): Int
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeCombining")
+private external fun _nMakeCombining(onePtr: NativePointer, twoPtr: NativePointer, op: Int): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nMakeFromBytes")
+private external fun _nMakeFromBytes(data: InteropPointer, size: Int): NativePointer
+
+@ExternalSymbolName("org_jetbrains_skia_Path__1nIsValid")
+private external fun _nIsValid(ptr: NativePointer): Boolean

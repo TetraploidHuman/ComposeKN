@@ -1,0 +1,16 @@
+--- a/ui-text/src/commonMain/kotlin/androidx/compose/ui/text/platform/Dispatcher.kt
++++ b/ui-text/src/commonMain/kotlin/androidx/compose/ui/text/platform/Dispatcher.kt
+@@ -17,7 +17,6 @@
+ package androidx.compose.ui.text.platform
+ 
+ import kotlinx.coroutines.CoroutineDispatcher
+-import kotlinx.coroutines.Dispatchers
+ 
+ /**
+  * Dispatcher to do font load cache coroutines on during font load fallback.
+@@ -30,4 +29,4 @@
+  * It is important that this dispatcher, if it is shared with other coroutines, implements `yield`
+  * to dispatch.
+  */
+-internal val FontCacheManagementDispatcher: CoroutineDispatcher = Dispatchers.Main
++internal expect val FontCacheManagementDispatcher: CoroutineDispatcher

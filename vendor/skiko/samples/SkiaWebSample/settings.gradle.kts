@@ -1,0 +1,41 @@
+pluginManagement {
+    repositories {
+        mavenLocal()
+        mavenCentral {
+            url = uri("https://cache-redirector.jetbrains.com/maven-central")
+        }
+        gradlePluginPortal()
+        maven {
+            url = uri("https://dl.bintray.com/kotlin/kotlin-eap")
+        }
+    }
+    plugins {
+        val kotlinVersion = extra["kotlin.version"] as String
+        kotlin("multiplatform").version(kotlinVersion)
+    }
+}
+
+// Define version catalog programmatically so we can read versions from gradle.properties
+// This overrides the automatic import of gradle/libs.versions.toml for the "libs" catalog.
+dependencyResolutionManagement {
+    versionCatalogs {
+        create("libs") {
+            version("skiko", providers.gradleProperty("skiko.version").get())
+            version("kotlinxBrowser", "0.5.0")
+
+            library("skiko", "org.jetbrains.skiko", "skiko").versionRef("skiko")
+            library("skiko-wasm-runtime", "org.jetbrains.skiko", "skiko-js-wasm-runtime").versionRef("skiko")
+            library("browser", "org.jetbrains.kotlinx", "kotlinx-browser").versionRef("kotlinxBrowser")
+        }
+    }
+}
+
+rootProject.name = "SkiaWebSample"
+
+if (extra.properties.getOrDefault("skiko.composite.build", "") == "1") {
+    includeBuild("../../skiko") {
+        dependencySubstitution {
+            substitute(module("org.jetbrains.skiko:skiko")).using(project(":"))
+        }
+    }
+}
