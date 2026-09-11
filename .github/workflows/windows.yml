@@ -24,11 +24,16 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.5.0'
+
       - name: Build windows demo (release)
         shell: pwsh
         run: |
-          ./gradlew :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon `
-            -Porg.gradle.jvmargs="-Xmx6g"
+          gradle.bat :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon `
+            "-Porg.gradle.jvmargs=-Xmx6g"
 
       - name: Upload exe
         uses: actions/upload-artifact@v4
