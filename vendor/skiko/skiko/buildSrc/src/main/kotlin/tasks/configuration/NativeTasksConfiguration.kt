@@ -339,14 +339,6 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
             }
             mutableListOfLinkerOptions(options)
         }
-        OS.Windows -> {
-            val options = mutableListOf<String>()
-            options.addAll(resolvedBinaryInputs.directStaticArchivePaths)
-            options.addAll(resolvedBinaryInputs.staticArchivePaths)
-            options.addAll(resolvedBinaryInputs.dynamicLibNames.map { "-l$it" })
-            options.addAll(resolvedBinaryInputs.linkFlags)
-            mutableListOfLinkerOptions(options)
-        }
         else -> mutableListOf()
     }
     if (skiko.includeTestHelpers) {
@@ -393,8 +385,13 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
                 argumentProviders.add { listOf("-crs", staticLib) }
             }
             OS.Windows -> {
-                executable = if (hostOs == OS.Windows) "llvm-lib.exe" else "x86_64-w64-mingw32-gcc-ar"
-                argumentProviders.add { listOf("rcs", staticLib) }
+                if (hostOs == OS.Windows) {
+                    executable = "llvm-lib.exe"
+                    argumentProviders.add { listOf("/out:$staticLib") + objectFiles.files.map { it.absolutePath } }
+                } else {
+                    executable = "x86_64-w64-mingw32-gcc-ar"
+                    argumentProviders.add { listOf("rcs", staticLib) + objectFiles.files.map { it.absolutePath } }
+                }
             }
             OS.MacOS, OS.IOS, OS.TVOS -> {
                 executable = "libtool"
