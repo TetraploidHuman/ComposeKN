@@ -6,13 +6,13 @@ on:
     branches: [ main, master ]
     paths:
       - ".github/workflows/windows.yml"
-      - "compose-kn-windows/**"
+      - "samples/windows-jvm-demo/**"
       - "samples/windows-demo/**"
-      - "vendor/skiko/**"
-      - "build-logic/**"
+      - "compose-kn-windows/**"
 
 jobs:
-  build-windows:
+  # Windows 官方路径: Kotlin/JVM + Compose Desktop + skiko native dll (MSVC ABI)
+  windows-jvm-exe:
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -29,16 +29,42 @@ jobs:
         with:
           gradle-version: '9.5.0'
 
-      - name: Build windows demo (release)
+      - name: Build Windows app (jpackage → exe)
         shell: pwsh
         run: |
-          gradle.bat :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon --stacktrace `
-            "-Porg.gradle.jvmargs=-Xmx6g"
+          gradle.bat -p samples/windows-jvm-demo packageDistributionForCurrentOS --no-daemon `
+            "-Porg.gradle.jvmargs=-Xmx4g"
 
-      - name: Upload exe
+      - name: Upload Windows exe
         uses: actions/upload-artifact@v4
         with:
-          name: windows-demo-exe
+          name: composekn-windows-jvm
           path: |
-            samples/windows-demo/build/bin/mingwX64/releaseExecutable/*.exe
+            samples/windows-jvm-demo/build/compose/binaries/main/**/*.exe
+            samples/windows-jvm-demo/build/compose/binaries/main/**/*.msi
           if-no-files-found: error
+
+  # Windows/Kotlin-Native: 目前止步于 ABI 边界 (skia MSVC vs K/N mingw Itanium)
+  windows-native-mingw:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.5.0'
+
+      - name: Build windows demo (native)
+        shell: pwsh
+        run: |
+          gradle.bat :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon `
+            "-Porg.gradle.jvmargs=-Xmx6g"
