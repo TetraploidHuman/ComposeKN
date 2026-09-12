@@ -621,3 +621,31 @@ Kotlin `main` 已能执行、窗口创建成功（`WM_CREATE`/首次 `WM_PAINT`�
 2. **~10 秒后 GC 崩溃**：Wine 下 `kotlin::alloc::FixedBlockPage::Sweep<ObjectSweepTraits>`
    读 `0x100000008` 崩溃。怀疑是 Wine 对 K/N GC 的线程挂起支持不完善
    （可能是 Wine 特有），需要在 Windows 实机验证。
+
+### 13.1 追加修复：Kotlin 侧 Win32 桥接的指针语义错误（2025-09-13 深夜）
+
+修掉 `atexit` 递归后，窗口能创建、但暴露出两个新症状：
+**① 窗口标题与日志全是乱码；② 启动约 10 秒后 GC 崩溃**
+（Wine 与 Windows 实机完全一致，`kotlin::alloc::FixedBlockPage::Sweep` 读到坏对象指针）。
+
+根因都在 Win32 桥接的 Kotlin 声明上：
+
+1. **字符串按 Kotlin 对象指针传入**。Linux 桥接用的是
+   `external fun f(s: CPointer<ByteVar>)` + 调用处 `f(s.cstr.ptr)`；
+   Windows 桥接却写成了 `external fun f(s: String)` —— 传过去的是 Kotlin String
+   对象指针，C 侧按 `const char*` 处理，于是标题/日志乱码。
+   本工程使用的 K/N 版本里 `"x".cstr` 返回 `CValues<ByteVar>`，而
+   `CValues<ByteVar>.ptr` 这个扩展在此 target 不可用；直接用 `CValuesRef<ByteVar>`
+   作 external 参数时传过去的又是「CValues 包装对象」的地址，仍是乱码。
+   **最终做法**：手工 pin 一个 NUL 结尾的 UTF-8 `ByteArray` 并用 `addressOf(0)`
+   取首地址（见 `Win32Native.kt` 的 `String.useCString {}`），参数类型用 `CPointer<ByteVar>`。
+
+2. **数组按 Kotlin 对象指针传入 → 直接写坏 Kotlin 堆**。
+   `composekn_win32_pop_event_flat` 原来声明了 8 个 `IntArray/FloatArray/UIntArray`
+   参数，C 侧往里写就等于往 Kotlin 堆对象头上写，堆被破坏后几秒 GC 一跑就崩。
+   已改成 `CValuesRef` 之外的正规做法：`memScoped { alloc<IntVar>() ... .ptr }`。
+   `composekn_win32_clipboard_get_text` 的 `ByteArray` 同病，改成
+   `usePinned { it.addressOf(0) }`。
+
+修复后（Wine，带 `icudtl.dat`）：`main: entry` 日志正常、窗口标题正确
+`title="ComposeKN Windows Demo"`、连续运行 60 秒无崩溃。

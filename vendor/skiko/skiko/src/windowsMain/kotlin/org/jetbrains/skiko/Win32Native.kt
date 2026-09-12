@@ -3,6 +3,8 @@
 package org.jetbrains.skiko
 
 import kotlinx.cinterop.*
+import kotlinx.cinterop.ByteVar
+import kotlinx.cinterop.CPointer
 
 /**
  * Kotlin/Native Windows (mingw) Win32 bridge bindings — mirrors the Wayland
@@ -10,7 +12,7 @@ import kotlinx.cinterop.*
  * skiko's compileNativeBridges into the final executable.
  */
 @SymbolName("composekn_win32_create")
-internal external fun composekn_win32_create(title: String, width: Int, height: Int): COpaquePointer?
+internal external fun composekn_win32_create(title: CPointer<ByteVar>, width: Int, height: Int): COpaquePointer?
 
 @SymbolName("composekn_win32_destroy")
 internal external fun composekn_win32_destroy(window: COpaquePointer?)
@@ -21,14 +23,14 @@ internal external fun composekn_win32_pump(window: COpaquePointer?): Boolean
 @SymbolName("composekn_win32_pop_event_flat")
 internal external fun composekn_win32_pop_event_flat(
     window: COpaquePointer?,
-    type: IntArray?,
-    x: FloatArray?,
-    y: FloatArray?,
-    button: UIntArray?,
-    state: UIntArray?,
-    a: IntArray?,
-    b: IntArray?,
-    modifiers: UIntArray?,
+    type: CPointer<IntVar>,
+    x: CPointer<FloatVar>,
+    y: CPointer<FloatVar>,
+    button: CPointer<UIntVar>,
+    state: CPointer<UIntVar>,
+    a: CPointer<IntVar>,
+    b: CPointer<IntVar>,
+    modifiers: CPointer<UIntVar>,
 ): Boolean
 
 @SymbolName("composekn_win32_present")
@@ -59,18 +61,18 @@ internal external fun composekn_win32_is_minimized(window: COpaquePointer?): Boo
 internal external fun composekn_win32_request_close(window: COpaquePointer?)
 
 @SymbolName("composekn_win32_set_title")
-internal external fun composekn_win32_set_title(window: COpaquePointer?, title: String)
+internal external fun composekn_win32_set_title(window: COpaquePointer?, title: CPointer<ByteVar>)
 
 @SymbolName("composekn_win32_clipboard_get_text")
 internal external fun composekn_win32_clipboard_get_text(
     window: COpaquePointer?,
-    buffer: ByteArray?,
+    buffer: CPointer<ByteVar>,
     bufferSize: ULong,
     ok: CPointer<BooleanVar>?,
 )
 
 @SymbolName("composekn_win32_clipboard_set_text")
-internal external fun composekn_win32_clipboard_set_text(window: COpaquePointer?, text: String)
+internal external fun composekn_win32_clipboard_set_text(window: COpaquePointer?, text: CPointer<ByteVar>)
 
 /** SW_SHOWMINIMIZED etc. */
 const val SW_WINDOWS_SHOW = 5
@@ -100,40 +102,52 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
     var clipboard: String?
         set(value) {
-            if (value != null) composekn_win32_clipboard_set_text(native, value)
+            if (value != null) value.useCString { composekn_win32_clipboard_set_text(native, it) }
         }
         get() {
             return memScoped {
                 val ok = alloc<BooleanVar>()
                 val buffer = ByteArray(8192)
-                composekn_win32_clipboard_get_text(native, buffer, buffer.size.convert(), ok.ptr)
+                buffer.usePinned { pinned ->
+                    composekn_win32_clipboard_get_text(
+                        native, pinned.addressOf(0), buffer.size.convert(), ok.ptr
+                    )
+                }
                 if (ok.value) StringBytesDecoding(buffer) else null
             }
         }
 
     fun pump(): Boolean = composekn_win32_pump(native)
 
-    fun popEvent(): Win32Event? {
-        val type = IntArray(1)
-        val x = FloatArray(1)
-        val y = FloatArray(1)
-        val button = UIntArray(1)
-        val state = UIntArray(1)
-        val a = IntArray(1)
-        val b = IntArray(1)
-        val modifiers = UIntArray(1)
-        if (!composekn_win32_pop_event_flat(native, type, x, y, button, state, a, b, modifiers)) {
-            return null
+    // 注意：这里必须用 memScoped + alloc<>().ptr 传「真实指针」。
+    // Kotlin 的 IntArray/FloatArray/UIntArray 是托管对象，传给 external 函数时
+    // 传过去的是「对象指针」而不是元素首地址，C 侧写入会砸坏 Kotlin 堆对象头，
+    // 表现为几秒后 GC（FixedBlockPage::Sweep）崩溃。
+    fun popEvent(): Win32Event? = memScoped {
+        val type = alloc<IntVar>()
+        val x = alloc<FloatVar>()
+        val y = alloc<FloatVar>()
+        val button = alloc<UIntVar>()
+        val state = alloc<UIntVar>()
+        val a = alloc<IntVar>()
+        val b = alloc<IntVar>()
+        val modifiers = alloc<UIntVar>()
+        if (!composekn_win32_pop_event_flat(
+                native, type.ptr, x.ptr, y.ptr, button.ptr,
+                state.ptr, a.ptr, b.ptr, modifiers.ptr,
+            )
+        ) {
+            return@memScoped null
         }
-        return Win32Event(
-            type = type[0],
-            x = x[0],
-            y = y[0],
-            button = button[0],
-            state = state[0],
-            a = a[0],
-            b = b[0],
-            modifiers = modifiers[0],
+        Win32Event(
+            type = type.value,
+            x = x.value,
+            y = y.value,
+            button = button.value,
+            state = state.value,
+            a = a.value,
+            b = b.value,
+            modifiers = modifiers.value,
         )
     }
 
@@ -143,7 +157,7 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     fun show() = composekn_win32_show(native, SW_WINDOWS_SHOW)
 
     fun requestClose() = composekn_win32_request_close(native)
-    fun setTitle(title: String) = composekn_win32_set_title(native, title)
+    fun setTitle(title: String) = title.useCString { composekn_win32_set_title(native, it) }
 
     /**
      * Begin a native move drag from a WM_NCLBUTTONDOWN/HTCAPTION synthetic event.
@@ -160,10 +174,10 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 internal external fun composekn_win32_begin_move(window: COpaquePointer?)
 
 @SymbolName("composekn_win32_log")
-internal external fun composekn_win32_log(message: String)
+internal external fun composekn_win32_log(message: CPointer<ByteVar>)
 
 /** Append a line to composekn-startup.log (next to the exe). */
-fun win32Log(message: String) = composekn_win32_log(message)
+fun win32Log(message: String) = message.useCString { composekn_win32_log(it) }
 
 /**
  * Flat Win32 event delivered from the C bridge.
@@ -192,10 +206,26 @@ data class Win32Event(
     }
 }
 
-private fun ensureCreated(title: String, width: Int, height: Int): COpaquePointer {
-    val native = composekn_win32_create(title, width, height)
-    checkNotNull(native) { "Failed to create Win32 window (title=$title)" }
-    return native
+private fun ensureCreated(title: String, width: Int, height: Int): COpaquePointer =
+    title.useCString { p ->
+        val native = composekn_win32_create(p, width, height)
+        checkNotNull(native) { "Failed to create Win32 window (title=$title)" }
+        native
+    }
+
+/**
+ * 把 Kotlin String 以 NUL 结尾的 UTF-8 缓冲区固定住，并把真实数据指针交给 C 侧。
+ *
+ * 注意不要用 `"x".cstr`：在本工程使用的 K/N 版本里，`CValues<ByteVar>` 作为
+ * external 函数参数时传过去的是「CValues 包装对象」，C 侧拿到的不是字符串首地址
+ * （Windows 窗口标题、日志全都变乱码）。这里手工 pin ByteArray + addressOf(0)
+ * 拿到的一定是元素首地址。字符串在 block 返回前保持 pinned。
+ */
+private inline fun <R> String.useCString(block: (CPointer<ByteVar>) -> R): R {
+    val bytes = encodeToByteArray()
+    val buf = ByteArray(bytes.size + 1)   // 末尾保留 \0
+    bytes.copyInto(buf)
+    return buf.usePinned { block(it.addressOf(0)) }
 }
 
 private fun StringBytesDecoding(bytes: ByteArray): String {
