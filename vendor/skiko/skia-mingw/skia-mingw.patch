@@ -1,0 +1,638 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 3b9b67a..778e1e0 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -171,7 +171,7 @@ is_loong64 = current_cpu == "loong64"
+ opts("ml3") {
+   enabled = is_x86
+   sources = skia_opts.ml3_sources
+-  if (is_win) {
++  if (is_msvc) {
+     cflags = [ "/arch:AVX2" ]
+   } else if (current_cpu == "x86") {
+     cflags = [ "-march=haswell" ]
+@@ -183,7 +183,7 @@ opts("ml3") {
+ opts("ml4") {
+   enabled = is_x86
+   sources = skia_opts.ml4_sources
+-  if (is_win) {
++  if (is_msvc) {
+     cflags = [ "/arch:AVX512" ]
+   } else if (current_cpu == "x86") {
+     cflags = [ "-march=skylake-avx512" ]
+diff --git a/gn/BUILDCONFIG.gn b/gn/BUILDCONFIG.gn
+index 2f12f9f..e2e7615 100644
+--- a/gn/BUILDCONFIG.gn
++++ b/gn/BUILDCONFIG.gn
+@@ -38,6 +38,23 @@ declare_args() {
+   # Enable -H, which prints the include tree during compilation.
+   # For use by external tools for analyzing include files.
+   show_includes = false
++
++  # ComposeKN: build for Windows using the MinGW-w64 / GNU toolchain (GNU ABI,
++  # Itanium C++ mangling) instead of MSVC. Required so that Kotlin/Native's
++  # mingwX64 backend can link against this Skia build.
++  skia_mingw = false
++
++  # ComposeKN: cross toolchain locations for the mingw build.
++  #   mingw_clang_dir     - LLVM toolchain dir (clang++, llvm-ar, ...)
++  #   mingw_sysroot_dir   - MinGW-w64 sysroot prefix (contains x86_64-w64-mingw32/
++  #                         and include/c++/<ver>)
++  mingw_clang_dir = ""
++  mingw_sysroot_dir = ""
++
++  # Extra -isystem dirs for the mingw (GNU ABI) Windows build. Used to point at
++  # a modern libstdc++ (and its threading headers) while the sysroot provides
++  # the Win32 headers/CRT.
++  mingw_cxx_include_dirs = []
+ }
+ declare_args() {
+   is_debug = !is_official_build
+@@ -71,6 +88,9 @@ is_mac = current_os == "mac"
+ is_wasm = current_os == "wasm"
+ is_win = current_os == "win"
+ 
++# ComposeKN: MSVC-specific flag plumbing must not apply to the mingw toolchain.
++is_msvc = is_win && !skia_mingw
++
+ # Dawn has references to fuchsia, but Skia's GN rules do not
+ is_fuchsia = false
+ 
+@@ -128,7 +148,8 @@ if (is_android) {
+   }
+ }
+ 
+-if (target_os == "win") {
++if (target_os == "win" && !skia_mingw) {
++
+   # By default we look for 2017 (Enterprise, Pro, and Community), then 2015. If MSVC is installed in a
+   # non-default location, you can set win_vc to inform us where it is.
+ 
+@@ -139,7 +160,7 @@ if (target_os == "win") {
+                         # directory.
+ }
+ 
+-if (target_os == "win") {
++if (target_os == "win" && !skia_mingw) {
+   if (win_toolchain_version == "") {
+     win_toolchain_version = exec_script("//gn/highest_version_dir.py",
+                                         [
+@@ -236,7 +257,12 @@ if (!is_official_build) {
+       [ "//gn/skia:warnings_for_public_headers" ]
+ }
+ 
+-if (is_win) {
++if (is_win && skia_mingw) {
++  # ComposeKN: MinGW-w64 cross toolchain (GNU ABI) for Windows.
++  set_default_toolchain("//gn/toolchain:mingw")
++  default_toolchain_name = "mingw"
++  host_toolchain = "gcc_like_host"
++} else if (is_win) {
+   # Windows tool chain
+   set_default_toolchain("//gn/toolchain:msvc")
+   default_toolchain_name = "msvc"
+diff --git a/gn/portable/BUILD.gn b/gn/portable/BUILD.gn
+index 48cb62c..0ff000d 100644
+--- a/gn/portable/BUILD.gn
++++ b/gn/portable/BUILD.gn
+@@ -4,7 +4,7 @@
+ # found in the LICENSE file.
+ 
+ config("add_exceptions") {
+-  if (is_win) {
++  if (is_msvc) {
+     cflags_cc = [ "/EHsc" ]
+   } else {
+     cflags_cc = [ "-fexceptions" ]
+@@ -12,7 +12,7 @@ config("add_exceptions") {
+ }
+ 
+ config("add_rtti") {
+-  if (is_win) {
++  if (is_msvc) {
+     cflags_cc = [ "/GR" ]
+   } else {
+     cflags_cc = [ "-frtti" ]
+diff --git a/gn/skia/BUILD.gn b/gn/skia/BUILD.gn
+index a7bc723..1d38cbd 100644
+--- a/gn/skia/BUILD.gn
++++ b/gn/skia/BUILD.gn
+@@ -59,7 +59,7 @@ config("default") {
+   # Disable warnings about unknown attributes.
+   # (These unknown attribute warnings are on by default, so we don't make
+   # disabling them part of :warnings, as some targets remove :warnings.)
+-  if (is_win && !is_clang) {
++  if (is_msvc && !is_clang) {
+     cflags += [
+       "/wd5030",
+       "/wd5051",
+@@ -68,13 +68,13 @@ config("default") {
+     cflags += [ "-Wno-attributes" ]
+   }
+ 
+-  if (is_clang && !is_win) {
++  if (is_clang && !is_msvc) {
+     # In Clang 14, this default was changed. We turn this off to (hopefully) make our
+     # GMs more consistent in the transition.
+     cflags += [ "-ffp-contract=off" ]
+   }
+ 
+-  if (is_win) {
++  if (is_msvc) {
+     if (is_clang && current_cpu == "arm64") {
+       cflags += [ "--target=arm64-windows" ]
+     }
+@@ -123,6 +123,26 @@ config("default") {
+       "$win_sdk/Lib/$win_sdk_version/um/$current_cpu",
+       "$win_vc/Tools/MSVC/$win_toolchain_version/lib/$current_cpu",
+     ]
++  } else if (skia_mingw) {
++    # ComposeKN: MinGW-w64 (clang, GNU ABI) flags for Windows targets.
++    cflags += [
++      "-ffp-contract=off",
++    ]
++    cflags_cc += [
++      "-fvisibility-inlines-hidden",
++      "-std=c++20",
++    ]
++    foreach(dir, mingw_cxx_include_dirs) {
++      cflags += [
++        "-isystem",
++        dir,
++      ]
++    }
++    defines += [
++      "_CRT_SECURE_NO_WARNINGS",
++      "WIN32_LEAN_AND_MEAN",
++      "NOMINMAX",
++    ]
+   } else {
+     cflags += [
+       "-fPIC",
+@@ -138,7 +158,7 @@ config("default") {
+       "-mfpu=neon",
+       "-mthumb",
+     ]
+-  } else if (current_cpu == "x86" && !is_win) {
++  } else if (current_cpu == "x86" && !is_msvc) {
+     asmflags += [ "-m32" ]
+     cflags += [
+       "-m32",
+@@ -153,7 +173,7 @@ config("default") {
+     ]
+   }
+ 
+-  if (malloc != "" && !is_win) {
++  if (malloc != "" && !is_msvc) {
+     cflags += [
+       "-fno-builtin-malloc",
+       "-fno-builtin-calloc",
+@@ -170,7 +190,7 @@ config("default") {
+ 
+   if (show_includes) {
+     assert(is_clang, "show_includes requires clang to build.")
+-    if (is_win) {
++    if (is_msvc) {
+       cflags += [
+         "/clang:-H",
+         "/clang:-fshow-skipped-includes",
+@@ -314,7 +334,7 @@ config("default") {
+     sanitize = ""
+   }
+ 
+-  if (is_win && !is_clang && sanitize == "ASAN") {
++  if (is_msvc && !is_clang && sanitize == "ASAN") {
+     sanitizers = "address"
+     cflags += [ "/fsanitize=$sanitizers" ]
+   } else if (sanitize != "" && sanitize != "MSVC") {
+@@ -350,7 +370,7 @@ config("default") {
+       cflags += [ "-fno-sanitize=function" ]
+     }
+ 
+-    if (is_win) {
++    if (is_msvc) {
+       cflags += [
+         # On Release builds, we get strange warnings about string literals.
+         "/GF-",
+@@ -377,7 +397,7 @@ config("default") {
+       ldflags += [ "-fsanitize=$sanitizers" ]
+     }
+ 
+-    if (is_win && sanitize == "ASAN") {
++    if (is_msvc && sanitize == "ASAN") {
+       copy("copy_asan_runtime") {
+         sources = [ "$clang_win/lib/clang/$clang_win_version/lib/windows/clang_rt.asan_dynamic-x86_64.dll" ]
+         outputs = [ "$root_out_dir/clang_rt.asan_dynamic-x86_64.dll" ]
+@@ -402,14 +422,14 @@ config("default") {
+ 
+ # See skbug.com/40041063.
+ config("recover_pointer_overflow") {
+-  if (sanitize == "ASAN" && !(is_win && !is_clang)) {
++  if (sanitize == "ASAN" && !(is_msvc && !is_clang)) {
+     cflags = [ "-fsanitize-recover=pointer-overflow" ]
+   }
+ }
+ 
+ config("no_exceptions") {
+   # Exceptions are disabled by default on Windows.  (Use /EHsc to enable them.)
+-  if (!is_win) {
++  if (!is_msvc) {
+     cflags_cc = [ "-fno-exceptions" ]
+     cflags_objcc = cflags_cc
+   }
+@@ -422,14 +442,14 @@ config("warnings") {
+   cflags_objcc = []
+ 
+   if (werror) {
+-    if (is_win) {
++    if (is_msvc) {
+       cflags += [ "/WX" ]
+     } else {
+       cflags += [ "-Werror" ]
+     }
+   }
+ 
+-  if (is_win) {
++  if (is_msvc) {
+     cflags += [
+       "/W3",  # Turn on lots of warnings.
+ 
+@@ -502,7 +522,7 @@ config("warnings") {
+     #   - clang-cl doesn't recognize the flag
+     #   - The (old) Mac/iOS SDK used on the bots breaks this rule in various headers
+     #     TODO: Re-enable on Apple when we update XCode
+-    if (!is_win && !is_apple && current_cpu != "loong64") {
++    if (!is_msvc && !is_apple && current_cpu != "loong64") {
+       cflags += [ "-fno-lax-vector-conversions" ]
+     }
+ 
+@@ -639,7 +659,7 @@ config("warnings") {
+   }
+ 
+   # !is_clang is a proxy for gcc.
+-  if (!is_clang && !is_win) {
++  if (!is_clang && !is_msvc) {
+     cflags += [
+       "-Wno-unreachable-code",  # Causes false positives in old GCC; removed
+                                 # from modern GCC entirely
+@@ -683,7 +703,7 @@ config("debug_symbols") {
+       "-gline-tables-only",
+       "-funwind-tables",  # Helps make in-process backtraces fuller.
+     ]
+-  } else if (is_win) {
++  } else if (is_msvc) {
+     cflags = [ "/Z7" ]
+     if (is_clang) {
+       cflags += [ "-gcodeview-ghash" ]
+@@ -703,7 +723,7 @@ config("no_rtti") {
+   # -fsanitize=vptr requires RTTI which is enabled as a part of
+   # -fsanitize=undefined
+   if (sanitize != "ASAN") {
+-    if (is_win) {
++    if (is_msvc) {
+       cflags_cc = [ "/GR-" ]
+     } else {
+       cflags_cc = [ "-fno-rtti" ]
+@@ -714,7 +734,7 @@ config("no_rtti") {
+ 
+ config("optimize") {
+   ldflags = []
+-  if (is_win) {
++  if (is_msvc) {
+     cflags = [
+       "/O2",
+       "/Zc:inline",
+@@ -769,12 +789,12 @@ config("trivial_abi") {
+ #
+ # As of 2024, only GCC is aggressive about strict aliasing. Clang isn't.
+ config("strict_aliasing") {
+-  if (!is_win) {
++  if (!is_msvc) {
+     cflags = [ "-fstrict-aliasing" ]
+   }
+ }
+ config("no_strict_aliasing") {
+-  if (!is_win) {
++  if (!is_msvc) {
+     cflags = [ "-fno-strict-aliasing" ]
+   }
+ }
+@@ -792,7 +812,7 @@ config("executable") {
+       "-rdynamic",
+       "-Wl,-rpath,\$ORIGIN",
+     ]
+-  } else if (is_win) {
++  } else if (is_msvc) {
+     ldflags = [
+       "/SUBSYSTEM:CONSOLE",  # Quiet "no subsystem specified; CONSOLE assumed".
+       "/INCREMENTAL:NO",  # Quiet warnings about failing to incrementally link
+diff --git a/gn/toolchain/BUILD.gn b/gn/toolchain/BUILD.gn
+index 4357b64..b63d453 100644
+--- a/gn/toolchain/BUILD.gn
++++ b/gn/toolchain/BUILD.gn
+@@ -445,6 +445,22 @@ gcc_like_toolchain("gcc_like") {
+   link = target_link
+ }
+ 
++# ComposeKN: MinGW-w64 toolchain for Windows (GNU ABI / Itanium mangling).
++# Uses clang with the MinGW-w64 sysroot, matching the toolchain family that
++# Kotlin/Native uses for its mingwX64 target.
++if (skia_mingw) {
++  # Uses the MinGW-w64 cross toolchain from PATH (nix-shell provides the
++  # wrapper, which supplies the sysroot/include/lib paths).
++  gcc_like_toolchain("mingw") {
++    cpu = "x64"
++    os = "win"
++    ar = "x86_64-w64-mingw32-ar"
++    cc = "x86_64-w64-mingw32-gcc"
++    cxx = "x86_64-w64-mingw32-g++"
++    link = "x86_64-w64-mingw32-g++"
++  }
++}
++
+ gcc_like_toolchain("gcc_like_host") {
+   cpu = host_cpu
+   os = host_os
+diff --git a/include/private/base/SkAttributes.h b/include/private/base/SkAttributes.h
+index ff1adaa..504bf11 100644
+--- a/include/private/base/SkAttributes.h
++++ b/include/private/base/SkAttributes.h
+@@ -24,7 +24,11 @@
+  *     SK_ALWAYS_INLINE void someMethod() { ... }   // should always be inlined
+  */
+ #if !defined(SK_ALWAYS_INLINE)
+-#  if defined(SK_BUILD_FOR_WIN)
++   // ComposeKN: GCC targeting Windows has no __forceinline keyword (mingw-w64
++   // only provides it when its headers are included); use the GNU attribute.
++#  if defined(__GNUC__) && !defined(__clang__)
++#    define SK_ALWAYS_INLINE SK_ATTRIBUTE(always_inline) inline
++#  elif defined(SK_BUILD_FOR_WIN)
+ #    define SK_ALWAYS_INLINE __forceinline
+ #  else
+ #    define SK_ALWAYS_INLINE SK_ATTRIBUTE(always_inline) inline
+@@ -36,7 +40,10 @@
+  * you can use SK_NEVER_INLINE to prevent inlining.
+  */
+ #if !defined(SK_NEVER_INLINE)
+-#  if defined(SK_BUILD_FOR_WIN)
++   // ComposeKN: same as above; GCC uses __attribute__((noinline)).
++#  if defined(__GNUC__) && !defined(__clang__)
++#    define SK_NEVER_INLINE SK_ATTRIBUTE(noinline)
++#  elif defined(SK_BUILD_FOR_WIN)
+ #    define SK_NEVER_INLINE __declspec(noinline)
+ #  else
+ #    define SK_NEVER_INLINE SK_ATTRIBUTE(noinline)
+diff --git a/modules/skcms/BUILD.gn b/modules/skcms/BUILD.gn
+index 5d037a9..a2edadd 100644
+--- a/modules/skcms/BUILD.gn
++++ b/modules/skcms/BUILD.gn
+@@ -33,7 +33,7 @@ template("arch") {
+ arch("skcms_TransformHsw") {
+   enabled = current_cpu == "x64" && target_os != "android"
+   sources = skcms_TransformHsw
+-  if (is_win) {
++  if (is_msvc) {
+     if (is_clang) {
+       cflags = [
+         "/clang:-mavx2",
+@@ -55,7 +55,7 @@ arch("skcms_TransformHsw") {
+ arch("skcms_TransformSkx") {
+   enabled = current_cpu == "x64" && target_os != "android"
+   sources = skcms_TransformSkx
+-  if (is_win) {
++  if (is_msvc) {
+     if (is_clang) {
+       cflags = [
+         "/clang:-mavx512f",
+@@ -82,7 +82,7 @@ arch("skcms_TransformSkx") {
+ 
+ static_library("skcms") {
+   cflags = []
+-  if (!is_win || is_clang) {
++  if (!is_msvc || is_clang) {
+     cflags += [ "-std=c11" ]
+   }
+   if (target_cpu != "x64" || target_os == "android") {
+diff --git a/src/core/SkRasterPipeline.h b/src/core/SkRasterPipeline.h
+index 2a2fd2c..92f3a14 100644
+--- a/src/core/SkRasterPipeline.h
++++ b/src/core/SkRasterPipeline.h
+@@ -26,8 +26,11 @@ enum SkColorType : int;
+ struct SkImageInfo;
+ struct skcms_TransferFunction;
+ 
+-#if __has_cpp_attribute(clang::musttail) && !defined(__EMSCRIPTEN__) && !defined(SK_CPU_ARM32) && \
+-        !defined(SK_CPU_LOONGARCH) && !defined(SK_CPU_PPC) && \
++// ComposeKN: GCC 15 reports __has_cpp_attribute(clang::musttail) but rejects
++// these tail calls ("argument must be passed by copying"), so restrict the
++// musttail fast path to clang.
++#if defined(__clang__) && __has_cpp_attribute(clang::musttail) && !defined(__EMSCRIPTEN__) && \
++        !defined(SK_CPU_ARM32) && !defined(SK_CPU_LOONGARCH) && !defined(SK_CPU_PPC) && \
+         !(defined(_WIN32) && defined(SK_BUILD_FOR_ANDROID_FRAMEWORK))
+     // [[clang::musttail]] is disabled for the Android version of Skia running on Windows as it
+     // causes crashes (This is probably related to http://crbug.com/1505442).
+diff --git a/src/ports/SkScalerContext_win_dw.cpp b/src/ports/SkScalerContext_win_dw.cpp
+index 68eb71e..40629c9 100644
+--- a/src/ports/SkScalerContext_win_dw.cpp
++++ b/src/ports/SkScalerContext_win_dw.cpp
+@@ -35,6 +35,27 @@
+ #include "src/core/SkRasterClip.h"
+ #include "src/core/SkScalerContext.h"
+ #include "src/ports/SkScalerContext_win_dw.h"
++
++// ComposeKN: mingw-w64's dwrite headers declare the DirectWrite color-font
++// (COLRv1 paint reader / IDWriteFontFace4) APIs with slightly different
++// parameter lists than the Windows SDK that upstream Skia targets:
++//   * the paint-reader navigation calls take an extra "struct_size" argument
++//   * IDWriteFontFace4::GetGlyphImageFormats is spelled GetGlyphImageFormats_
++// Normalize both spellings here so a single source tree builds for MSVC and
++// mingw-w64.
++#if defined(__MINGW32__)
++#define SK_DW_SET_CURRENT_GLYPH(r, gi, pe, cb, at) \
++    ((r)->SetCurrentGlyph((gi), (pe), sizeof(DWRITE_PAINT_ELEMENT), (cb), (at)))
++#define SK_DW_MOVE_TO_FIRST_CHILD(r, pe) ((r)->MoveToFirstChild((pe), sizeof(DWRITE_PAINT_ELEMENT)))
++#define SK_DW_MOVE_TO_NEXT_SIBLING(r, pe) ((r)->MoveToNextSibling((pe), sizeof(DWRITE_PAINT_ELEMENT)))
++#define SK_DW_GET_GLYPH_IMAGE_FORMATS(ff, g, a, b, f) ((ff)->GetGlyphImageFormats_((g), (a), (b), (f)))
++#else
++#define SK_DW_SET_CURRENT_GLYPH(r, gi, pe, cb, at) ((r)->SetCurrentGlyph((gi), (pe), (cb), (at)))
++#define SK_DW_MOVE_TO_FIRST_CHILD(r, pe) ((r)->MoveToFirstChild((pe)))
++#define SK_DW_MOVE_TO_NEXT_SIBLING(r, pe) ((r)->MoveToNextSibling((pe)))
++#define SK_DW_GET_GLYPH_IMAGE_FORMATS(ff, g, a, b, f) ((ff)->GetGlyphImageFormats((g), (a), (b), (f)))
++#endif
++
+ #include "src/ports/SkTypeface_win_dw.h"
+ #include "src/sfnt/SkOTTable_EBLC.h"
+ #include "src/sfnt/SkOTTable_EBSC.h"
+@@ -623,11 +644,11 @@ bool SkScalerContext_DW::drawColorV1Paint(SkCanvas& canvas,
+     auto drawChildren = [&](uint32_t childCount) -> bool {
+         if (childCount != 0) {
+             DWRITE_PAINT_ELEMENT childElement;
+-            HRB(reader.MoveToFirstChild(&childElement));
++            HRB(SK_DW_MOVE_TO_FIRST_CHILD(&reader, &childElement));
+             this->drawColorV1Paint(canvas, reader, childElement);
+ 
+             for (uint32_t i = 1; i < childCount; i++) {
+-                HRB(reader.MoveToNextSibling(&childElement));
++                HRB(SK_DW_MOVE_TO_NEXT_SIBLING(&reader, &childElement));
+                 this->drawColorV1Paint(canvas, reader, childElement);
+             }
+ 
+@@ -1190,13 +1211,13 @@ bool SkScalerContext_DW::drawColorV1Paint(SkCanvas& canvas,
+         DWRITE_PAINT_ELEMENT sourceElement;
+         DWRITE_PAINT_ELEMENT backdropElement;
+ 
+-        HRBM(reader.MoveToFirstChild(&sourceElement), "Could not move to child.");
+-        HRBM(reader.MoveToNextSibling(&backdropElement), "Could not move to sibiling.");
++        HRBM(SK_DW_MOVE_TO_FIRST_CHILD(&reader, &sourceElement), "Could not move to child.");
++        HRBM(SK_DW_MOVE_TO_NEXT_SIBLING(&reader, &backdropElement), "Could not move to sibiling.");
+         canvas.saveLayer(nullptr, nullptr);
+         this->drawColorV1Paint(canvas, reader, backdropElement);
+ 
+         HRBM(reader.MoveToParent(), "Could not move to parent.");
+-        HRBM(reader.MoveToFirstChild(&sourceElement), "Could not move to child.");
++        HRBM(SK_DW_MOVE_TO_FIRST_CHILD(&reader, &sourceElement), "Could not move to child.");
+         canvas.saveLayer(nullptr, &blendModePaint);
+         this->drawColorV1Paint(canvas, reader, sourceElement);
+ 
+@@ -1227,7 +1248,7 @@ bool SkScalerContext_DW::drawColorV1Image(const SkGlyph& glyph, SkCanvas& canvas
+     DWRITE_PAINT_ELEMENT paintElement;
+     D2D_RECT_F clipBox;
+     DWRITE_PAINT_ATTRIBUTES attributes;
+-    HRBM(paintReader->SetCurrentGlyph(glyphIndex, &paintElement, &clipBox, &attributes),
++    HRBM(SK_DW_SET_CURRENT_GLYPH(paintReader, glyphIndex, &paintElement, &clipBox, &attributes),
+          "Could not set current glyph.");
+ 
+     if (paintElement.paintType == DWRITE_PAINT_TYPE_NONE) {
+@@ -1256,7 +1277,12 @@ bool SkScalerContext_DW::drawColorV1Image(const SkGlyph& glyph, SkCanvas& canvas
+ 
+     // The DirectWrite interface returns resolved colors if these are provided.
+     // Indexes and alphas are reported but there is no reason to duplicate the color calculation.
++#if defined(__MINGW32__)
++    DWRITE_COLOR_F textColor = dw_color_from(SkColor4f::FromColor(fRec.fForegroundColor));
++    paintReader->SetTextColor(&textColor);
++#else
+     paintReader->SetTextColor(dw_color_from(SkColor4f::FromColor(fRec.fForegroundColor)));
++#endif
+     paintReader->SetCustomColorPalette(typeface->fDWPalette.get(), typeface->fPaletteEntryCount);
+ 
+     return this->drawColorV1Paint(canvas, *paintReader, paintElement);
+@@ -1293,11 +1319,11 @@ bool SkScalerContext_DW::generateColorV1PaintBounds(
+             return true;
+         }
+         DWRITE_PAINT_ELEMENT childElement;
+-        HRB(reader.MoveToFirstChild(&childElement));
++        HRB(SK_DW_MOVE_TO_FIRST_CHILD(&reader, &childElement));
+         this->generateColorV1PaintBounds(ctm, bounds, reader, childElement);
+ 
+         for (uint32_t i = 1; i < childCount; ++i) {
+-            HRB(reader.MoveToNextSibling(&childElement));
++            HRB(SK_DW_MOVE_TO_NEXT_SIBLING(&reader, &childElement));
+             this->generateColorV1PaintBounds(ctm, bounds, reader, childElement);
+         }
+ 
+@@ -1443,7 +1469,7 @@ bool SkScalerContext_DW::generateColorV1Metrics(const SkGlyph& glyph, SkRect* bo
+     D2D_RECT_F clipBox;
+     DWRITE_PAINT_ATTRIBUTES attributes;
+     // If the glyph is not color this will succeed but return paintType NONE.
+-    HRBM(paintReader->SetCurrentGlyph(glyphIndex, &paintElement, &clipBox, &attributes),
++    HRBM(SK_DW_SET_CURRENT_GLYPH(paintReader, glyphIndex, &paintElement, &clipBox, &attributes),
+          "Could not set the current glyph.");
+ 
+     if (paintElement.paintType == DWRITE_PAINT_TYPE_NONE) {
+@@ -1731,7 +1757,7 @@ bool SkScalerContext_DW::generatePngMetrics(const SkGlyph& glyph, SkRect* bounds
+     }
+ 
+     DWRITE_GLYPH_IMAGE_FORMATS imageFormats;
+-    HRBM(fontFace4->GetGlyphImageFormats(glyph.getGlyphID(), 0, UINT32_MAX, &imageFormats),
++    HRBM(SK_DW_GET_GLYPH_IMAGE_FORMATS(fontFace4, glyph.getGlyphID(), 0, UINT32_MAX, &imageFormats),
+          "Cannot get glyph image formats.");
+     if (!(imageFormats & DWRITE_GLYPH_IMAGE_FORMATS_PNG)) {
+         return false;
+@@ -2280,7 +2306,7 @@ bool SkScalerContext_DW::drawSVGImage(const SkGlyph& glyph, SkCanvas& canvas) {
+     }
+ 
+     DWRITE_GLYPH_IMAGE_FORMATS imageFormats;
+-    HRBM(fontFace4->GetGlyphImageFormats(glyph.getGlyphID(), 0, UINT32_MAX, &imageFormats),
++    HRBM(SK_DW_GET_GLYPH_IMAGE_FORMATS(fontFace4, glyph.getGlyphID(), 0, UINT32_MAX, &imageFormats),
+          "Cannot get glyph image formats.");
+     if (!(imageFormats & DWRITE_GLYPH_IMAGE_FORMATS_SVG)) {
+         return false;
+diff --git a/third_party/icu/BUILD.gn b/third_party/icu/BUILD.gn
+index a18494a..cb2732c 100644
+--- a/third_party/icu/BUILD.gn
++++ b/third_party/icu/BUILD.gn
+@@ -119,7 +119,12 @@ if (skia_use_system_icu) {
+         "U_NOEXCEPT=",
+         "U_STATIC_IMPLEMENTATION",
+       ]
+-      libs = [ "Advapi32.lib" ]
++      if (is_msvc) {
++        libs = [ "Advapi32.lib" ]
++      } else {
++        # mingw/GNU: advapi32 import lib
++        libs = [ "advapi32" ]
++      }
+       sources += [
+         "../externals/icu/source/stubdata/stubdata.cpp",
+         "SkLoadICU.cpp",
+diff --git a/third_party/libjpeg-turbo/BUILD.gn b/third_party/libjpeg-turbo/BUILD.gn
+index 35105dd..aad09a8 100644
+--- a/third_party/libjpeg-turbo/BUILD.gn
++++ b/third_party/libjpeg-turbo/BUILD.gn
+@@ -144,7 +144,7 @@ if (skia_use_system_libjpeg_turbo) {
+       "D_ARITH_CODING_SUPPORTED=1",
+     ]
+ 
+-    if (!is_win || is_clang) {
++    if (!is_msvc || is_clang) {
+       defines += [ "USE_CLZ_INTRINSIC" ]  # Cuts a 64K table.
+     }
+ 
+diff --git a/third_party/libwebp/BUILD.gn b/third_party/libwebp/BUILD.gn
+index 6f3d703..2efc06f 100644
+--- a/third_party/libwebp/BUILD.gn
++++ b/third_party/libwebp/BUILD.gn
+@@ -46,7 +46,7 @@ if (skia_use_system_libwebp) {
+       "../externals/libwebp/src/dsp/yuv_sse41.c",
+     ]
+     if ((current_cpu == "x86" || current_cpu == "x64") &&
+-        (!is_win || is_clang)) {
++        (!is_msvc || is_clang)) {
+       cflags_c = [ "-msse4.1" ]
+     }
+   }
+diff --git a/third_party/third_party.gni b/third_party/third_party.gni
+index cbcd16c..1174cf6 100644
+--- a/third_party/third_party.gni
++++ b/third_party/third_party.gni
+@@ -92,7 +92,7 @@ template("third_party") {
+       if (!defined(cflags)) {
+         cflags = []
+       }
+-      if (is_win) {
++      if (is_msvc) {
+         cflags += [ "/w" ]
+       } else {
+         cflags += [ "-w" ]
+diff --git a/third_party/zlib/BUILD.gn b/third_party/zlib/BUILD.gn
+index 7ebdbdb..bdca866 100644
+--- a/third_party/zlib/BUILD.gn
++++ b/third_party/zlib/BUILD.gn
+@@ -58,7 +58,7 @@ if (skia_use_system_zlib) {
+         "../externals/zlib/adler32_simd.h",
+       ]
+ 
+-      if (!is_win || is_clang) {
++      if (!is_msvc || is_clang) {
+         cflags = [ "-mssse3" ]
+       }
+     }
+@@ -178,7 +178,7 @@ if (skia_use_system_zlib) {
+         "../externals/zlib/crc_folding.c",
+       ]
+ 
+-      if (!is_win || is_clang) {
++      if (!is_msvc || is_clang) {
+         cflags = [
+           "-msse4.2",
+           "-mpclmul",

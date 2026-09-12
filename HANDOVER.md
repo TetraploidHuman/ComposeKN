@@ -473,3 +473,62 @@ window.beginMove()             // 开始拖拽移动
   a) 自建 windows-gnu 版 Skia（skia 构建系统原生不出 mingw 目标，工程量大，不推荐）；
   b) Windows 用 Compose Desktop JVM 版（官方支持，skiko Windows natives 本就按 AWT 设计；本项目"脱离 JVM 的 native"路线在 Windows 上走不通，除非重写渲染后端）；
   c) 接受现状：Windows 的全部窗口管理/输入/渲染代码已写完并在交叉编译中验证到 ABI 边界之前，供未来接触 mingw-skia 或 MSVC-K/N 后继续。
+
+
+## 12. mingw-Skia（GNU ABI）构建成功 —— Windows 原生路线的关键突破
+
+### 结论
+**Itanium-ABI（MinGW-w64/GNU）的 Skia 静态库已从源码构建成功**，ABI 与 Kotlin/Native 的
+mingwX64 后端一致，符号验证：
+
+| 来源 | SkCanvas::drawRect 符号 |
+|------|------------------------|
+| JetBrains 发布版（MSVC ABI，不可用） | `?drawRect@SkCanvas@@QEAAXAEBUSkRect@@AEBVSkPaint@@@Z` |
+| **本项目构建（GNU ABI，可用）** | `_ZN8SkCanvas8drawRectERK6SkRectRK7SkPaint` |
+
+### 产物（22 个静态库，out/mingw/）
+libskia.a (33MB) libicu.a (13MB) libharfbuzz.a (12MB) libskparagraph.a (12MB) libskshaper.a (8.8MB)
+libskunicode_core.a (33MB) libskunicode_icu.a (9.6MB) libskottie.a (8.6MB) libsksg.a (8.5MB)
+libsvg.a (1.4MB) libfreetype2.a (8.6MB) libwebp.a (1.4MB) libpng.a libjpeg.a libjpeg12.a libjpeg16.a
+libzlib.a libexpat.a libskcms.a libjsonreader.a libskresources.a libwebp_sse41.a
+
+### 可复现流程（已固化进仓库）
+- `vendor/skiko/skia-mingw/build-skia-mingw.sh` — 一键：克隆 → 打补丁 → 拉依赖 → gn+ninja
+- `vendor/skiko/skia-mingw/skia-mingw.patch` — 14 个文件的 mingw 适配补丁（23KB）
+- `vendor/skiko/skia-mingw/gn_args.txt` — GN 参数（可移植，无绝对路径）
+- `vendor/skiko/skia-mingw/fetch_deps.py` — 按 DEPS 精确拉取 8 个第三方依赖（含重试）
+- 构建命令：
+  `nix-shell -p git gn ninja python3 pkgsCross.mingwW64.stdenv.cc --run "SKIA_MINGW_WORK=<dir> ./vendor/skiko/skia-mingw/build-skia-mingw.sh"`
+
+### 关键技术决策与踩坑（重要）
+1. **工具链选择**：先试 konan 自带 clang 21 + msys2 头 → 缺 `<compare>` 等 C++20 头（msys2 libstdc++ 是 GCC 9.2）；
+   换 nixpkgs mingw GCC 15 的 libstdc++ 头 + clang → 撞 `__is_integer<__int128>` 的 strict-ANSI 不一致；
+   **最终选 nixpkgs mingw GCC 15 原生工具链**（编译器/libstdc++ 配套，最稳）。
+2. **skcms / SkRasterPipeline 的 musttail**：GCC 15 的 `__has_cpp_attribute(clang::musttail)` 为真但无法编译这些
+   尾调用（"argument must be passed by copying"）→ 用 `-DSKCMS_HAS_MUSTTAIL=0` +
+   改 `src/core/SkRasterPipeline.h` 把 musttail 限定到 clang。
+3. **`-std=c++20` 导致 `__STRICT_ANSI__`**：GCC 不再定义 `__GLIBCXX_TYPE_INT_N_0`，而 libstdc++ 的
+   `max_size_type.h` 仍按 `__SIZEOF_INT128__` 选 `unsigned __int128` → `__is_integer` 无特化、静态断言失败。
+   修法：`-D__GLIBCXX_TYPE_INT_N_0=__int128 -D__GLIBCXX_BITSIZE_INT_N_0=128`。
+   （另需 `-fext-numeric-literals` 解决 `__float128` 的 `Q` 字面量。）
+   ⚠️ 不要用 `-U__SIZEOF_INT128__`：会让 mingw `_mingw.h` 的 `__int128` typedef 与 GCC 关键字冲突。
+4. **`__forceinline` / `__declspec`**：GCC 目标 Windows 时未定义（mingw 头里才有）→ 给
+   `include/private/base/SkAttributes.h` 加 GCC 分支（`SK_ALWAYS_INLINE`/`SK_NEVER_INLINE`）。
+5. **GN 里 `is_win` 语义过载**：需要区分「Windows 平台」与「MSVC 工具链」。引入 `is_msvc = is_win && !skia_mingw`，
+   把 flag/库路径类的 `is_win` 全部改为 `is_msvc`（`gn/skia/BUILD.gn`、`gn/toolchain/BUILD.gn`、
+   `third_party/third_party.gni` 的 `/w`→`-w`、`gn/portable`、`third_party/{zlib,icu,libjpeg-turbo,libwebp}`、顶层 `BUILD.gn` 的 `/arch:`）。
+6. **`is_official_build=true` 默认使用系统库**：必须显式 `skia_use_system_* = false` 让 GN 从
+   `third_party/externals` 构建（否则找不到 `png.h`/`ft2build.h`）。
+7. **DirectWrite 头差异**：mingw-w64 的 `IDWritePaintReader`/`IDWriteFontFace4` 参数表与 Windows SDK 不同
+   （多一个 `struct_size` 参数、`GetGlyphImageFormats_` 带下划线、`SetTextColor` 取指针）→
+   在 `src/ports/SkScalerContext_win_dw.cpp` 用 `SK_DW_*` 宏按 `__MINGW32__` 归一化，**功能保留**。
+8. **GPU 全部关闭**（`skia_enable_ganesh=false` 等）：Windows 渲染走软件光栅（StretchDIBits），
+   不需要 GL/Vulkan/Dawn/ANGLE，省掉海量依赖。
+
+### 下一步（尚未完成）
+- [ ] **skiko 集成**：`compileNativeBridgesWindowsX64` 目前仍按 JetBrains MSVC 库；需改为引用本构建的
+      `.a` 集合，并在 skiko 的 C++ 桥里把 GPU 入口（`DirectContext.cc`/`BackendTexture.cc`/
+      `BackendRenderTarget.cc`/`Surface.cc`/`Image.cc`/`render.cc` 中的 `Gr*` 引用）用宏屏蔽（Windows 软件光栅不用）。
+- [ ] **最终链接**：K/N 链接时需 `-L` 指向 nixpkgs mingw 的 libstdc++/libgcc（GCC 15），
+      或把 skia 换成与 konan msys2 (GCC 9.2) 匹配的旧 libstdc++ 头编译。
+- [ ] CI 化（可选：把 skia 构建产物缓存为 artifact，避免每次 20 分钟重建）。
