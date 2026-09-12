@@ -159,6 +159,12 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 @SymbolName("composekn_win32_begin_move")
 internal external fun composekn_win32_begin_move(window: COpaquePointer?)
 
+@SymbolName("composekn_win32_log")
+internal external fun composekn_win32_log(message: String)
+
+/** Append a line to composekn-startup.log (next to the exe). */
+fun win32Log(message: String) = composekn_win32_log(message)
+
 /**
  * Flat Win32 event delivered from the C bridge.
  */

@@ -6,6 +6,7 @@ import org.jetbrains.skiko.SkikoRenderDelegate
 import org.jetbrains.skiko.Win32Event
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.flushMainUIDispatcher
+import org.jetbrains.skiko.win32Log
 import org.jetbrains.skiko.initWindowsMainThread
 
 /**
@@ -34,16 +35,22 @@ class WindowsComposeWindow(
      * Run the window with event handling.
      */
     fun run(onEvent: (WindowsEvent) -> Unit) {
+        win32Log("run: enter")
         initWindowsMainThread()
+        win32Log("run: create Win32 window ${width}x$height")
         val win = Win32Window(title, width, height)
         win32Window = win
         println("WindowsComposeWindow: created window '$title' (${win.width}x${win.height})")
+        win32Log("run: window created ok ${win.width}x${win.height}")
 
         check(layer.renderDelegate != null) {
             "SkiaLayer.renderDelegate must be set before WindowsComposeWindow.run()"
         }
+        win32Log("run: attachTo layer")
         layer.attachTo(win)
+        win32Log("run: layer attached; entering message loop")
 
+        var frames = 0
         var running = true
         try {
             while (running) {
@@ -51,10 +58,17 @@ class WindowsComposeWindow(
                 flushMainUIDispatcher()
                 translateAndDispatch(win, onEvent)
                 layer.renderImmediately()
+                if (frames == 0) win32Log("run: first renderImmediately ok")
+                frames++
                 isMaximized = win.isMaximized
                 isMinimized = win.isMinimized
             }
+        } catch (t: Throwable) {
+            win32Log("run: EXCEPTION ${t::class.simpleName}: ${t.message}")
+            t.stackTraceToString().lineSequence().take(25).forEach { win32Log("    $it") }
+            throw t
         } finally {
+            win32Log("run: exiting loop after $frames frames")
             layer.detach()
             win.close()
         }

@@ -31,6 +31,11 @@ fun main() {
 
     // Full Compose UI application
     println("ComposeKN Windows: Starting Compose UI application")
+    try {
+        com.composekn.windows.internal.winlog("main: entry (Kotlin main reached)")
+    } catch (t: Throwable) {
+        // 忽略：仅诊断用
+    }
     WindowsComposeApplication("ComposeKN Windows Demo").run {
         MaterialTheme {
             Surface(modifier = Modifier.fillMaxSize()) {

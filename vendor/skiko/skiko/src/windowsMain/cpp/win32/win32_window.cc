@@ -6,10 +6,96 @@
 #include "win32_bridge.h"
 #include <windows.h>
 #include <windowsx.h>
+#include <cstdarg>
+#include <string>
+#include <cstdio>
+#include <ctime>
 #include <vector>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+
+// ---------------------------------------------------------------------------
+// ComposeKN 启动诊断日志
+//
+// 日志写到 exe 同目录下的 composekn-startup.log（失败时退回 %TEMP%），
+// 并安装未处理异常过滤器，把崩溃代码/地址也写进去。这样即使双击运行时
+// 控制台窗口一闪而过，也能拿到启动过程记录。
+// ---------------------------------------------------------------------------
+namespace {
+
+FILE* composeknOpenLog() {
+    // 1) exe 所在目录
+    wchar_t module[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameW(nullptr, module, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::wstring dir(module, n);
+        size_t pos = dir.find_last_of(L"\\/");
+        if (pos != std::wstring::npos) {
+            std::wstring path = dir.substr(0, pos + 1) + L"composekn-startup.log";
+            FILE* f = _wfopen(path.c_str(), L"a");
+            if (f != nullptr) {
+                return f;
+            }
+        }
+    }
+    // 2) 退回 %TEMP%
+    wchar_t tmp[MAX_PATH] = {0};
+    DWORD t = GetTempPathW(MAX_PATH, tmp);
+    if (t > 0 && t < MAX_PATH) {
+        std::wstring path(tmp);
+        path += L"composekn-startup.log";
+        return _wfopen(path.c_str(), L"a");
+    }
+    return nullptr;
+}
+
+void composeknLog(const char* fmt, ...) {
+    FILE* f = composeknOpenLog();
+    if (f == nullptr) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', f);
+    std::fflush(f);
+    std::fclose(f);
+}
+
+LONG WINAPI composeknUnhandledFilter(EXCEPTION_POINTERS* info) {
+    if (info != nullptr && info->ExceptionRecord != nullptr) {
+        composeknLog("!!! UNHANDLED EXCEPTION code=0x%08lX addr=%p flags=0x%lX",
+                     (unsigned long)info->ExceptionRecord->ExceptionCode,
+                     (void*)info->ExceptionRecord->ExceptionAddress,
+                     (unsigned long)info->ExceptionRecord->ExceptionFlags);
+        if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+            info->ExceptionRecord->NumberParameters >= 2) {
+            composeknLog("    access violation: %s address=%p",
+                         info->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                         (void*)info->ExceptionRecord->ExceptionInformation[1]);
+        }
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// 在 CRT 初始化阶段（main 之前）就写好第一行，用于确认日志本身能工作。
+struct ComposeKNStartupLogger {
+    ComposeKNStartupLogger() {
+        composeknLog("=== composekn native bridge: C++ static init (exe=%p) ===", (void*)GetModuleHandleW(nullptr));
+        SetUnhandledExceptionFilter(composeknUnhandledFilter);
+    }
+};
+
+ComposeKNStartupLogger g_composeknStartupLogger;
+
+}  // namespace
+
+extern "C" void composekn_win32_log(const char* message) {
+    composeknLog("%s", message == nullptr ? "(null)" : message);
+}
 
 namespace {
 
@@ -29,6 +115,9 @@ struct ComposeKNWin32Window {
     int trackPointerButtons = 0;
     int pressedButtonMask = 0;
     bool imeEnabled = false;
+    bool paintLogged = false;
+    bool sizeLogged = false;
+    bool presentLogged = false;
 };
 
 namespace {
@@ -58,6 +147,9 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }
     switch (message) {
+        case WM_CREATE:
+            composeknLog("wndproc: WM_CREATE hwnd=%p", (void*)hwnd);
+            break;
         case WM_NCHITTEST: {
             if (window->hwnd == hwnd) {
                 // Parent is our window; keep default edges for maximized/menus
@@ -136,6 +228,10 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             break;
         }
         case WM_PAINT: {
+            if (window != nullptr && !window->paintLogged) {
+                window->paintLogged = true;
+                composeknLog("wndproc: first WM_PAINT (client %dx%d)", window->width, window->height);
+            }
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
@@ -281,6 +377,7 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
         MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle.data(), wlen);
     }
 
+    composeknLog("composekn_win32_create: title=\"%s\" size=%dx%d", title, width, height);
     ComposeKNWin32Window* window = new ComposeKNWin32Window();
     window->width = width;
     window->height = height;
@@ -296,9 +393,11 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
         window /* lpParam -> WM_NCCREATE sets GWLP_USERDATA */
     );
     if (window->hwnd == nullptr) {
+        composeknLog("composekn_win32_create: CreateWindowExW FAILED GetLastError=%lu", (unsigned long)GetLastError());
         delete window;
         return nullptr;
     }
+    composeknLog("composekn_win32_create: hwnd=%p ok", (void*)window->hwnd);
     window->dpi = queryWindowDpi(window->hwnd);
     ShowWindow(window->hwnd, SW_SHOWNORMAL);
     UpdateWindow(window->hwnd);
@@ -367,8 +466,16 @@ extern "C" void composekn_win32_present(
     int stride_px
 ) {
     if (window == nullptr || window->hwnd == nullptr || pixels == nullptr) return;
+    if (!window->presentLogged) {
+        window->presentLogged = true;
+        composeknLog("composekn_win32_present: first frame %dx%d stride=%d pixels=%p",
+                     width, height, stride_px, pixels);
+    }
     HDC dc = GetDC(window->hwnd);
-    if (dc == nullptr) return;
+    if (dc == nullptr) {
+        composeknLog("composekn_win32_present: GetDC failed");
+        return;
+    }
     BITMAPINFO bmi;
     ZeroMemory(&bmi, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);

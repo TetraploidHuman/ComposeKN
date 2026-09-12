@@ -15,6 +15,7 @@ import androidx.lifecycle.enableSavedStateHandles
 import org.jetbrains.skiko.SkikoDispatchers
 import org.jetbrains.skia.Canvas
 import org.jetbrains.skiko.SkikoRenderDelegate
+import org.jetbrains.skiko.win32Log
 
 /**
  * Windows host for real Compose UI ([CanvasLayersComposeScene] + [FrameRecomposer]).
@@ -65,7 +66,14 @@ class WindowsComposeApplication(
             }
         }
 
-        window.run(onEvent = ::handleEvent)
+        win32Log("app: scene + content ready, starting window loop")
+        try {
+            window.run(onEvent = ::handleEvent)
+        } catch (t: Throwable) {
+            win32Log("app: EXCEPTION from window.run -> ${t::class.simpleName}: ${t.message}")
+            throw t
+        }
+        win32Log("app: window loop finished normally")
 
         archComponentsOwner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         archComponentsOwner.viewModelStore.clear()

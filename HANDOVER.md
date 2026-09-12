@@ -563,3 +563,61 @@ nix-shell -p gn ninja python3 pkgsCross.mingwW64.stdenv.cc --run \
 - [ ] CI 化：把 skia 构建产物缓存为 artifact，避免每次 ~20 分钟重建；
       可加 "启动 exe 3 秒不崩溃" 的 smoke test。
 - [ ] skia 构建目前关闭了 GPU（ganesh/vulkan/dawn）；若将来需要 GPU 加速需另行处理。
+
+---
+
+## 13. Windows 原生 exe「启动即静默退出」根因与修复（2025-09-13）
+
+### 症状
+`ComposeKN-Windows-Native-Debug.exe` 在 Windows 10 实机与 Wine 上表现一致：
+**进程干净退出、退出码 1、stdout 无任何输出、连 `composekn-startup.log` 都不生成**。
+
+### 定位过程（Wine + winedbg）
+1. `WINEDEBUG=+seh` 只看到无从判断的噪音；`hello.exe`（普通 mingw）与最小 K/N
+   `konan` exe 都能正常跑 → 排除 Wine 与 K/N 运行时本身。
+2. winedbg 在绝对地址下断点：命中 `mainCRTStartup`(0x1400014f0) → `__tmainCRTStartup`(0x140001180)
+   → `_initterm`(XI/XC) → `_pei386_runtime_relocator` → `__mingw_init_ehandler` → `_fpreset`
+   → `__main`(0x1407e3050) → `__do_global_ctors`，**之后再无断点命中，进程即终止**。
+3. 从 PE 文件里解出 `__CTOR_LIST__`（refptr @0x141353460 → 0x141458548）：
+   `-1` + 64 个构造器 + NULL 终止符，表本身是好的。
+4. 逐个构造器下断点 → 第一个被调用的是 `0x1411603e0: jmp __gcc_register_frame`
+   （`crtbegin.o` 的静态构造器，函数体只有一句 `atexit(__gcc_deregister_frame)`）。
+5. `stepi` 单步跟进 `atexit`(0x140001520) → `call _onexit`(0x1407e1b40) →
+   **`_onexit` 内部又 `call atexit`** → 无限相互递归 → 栈溢出 → 静默退出。
+
+### 根因
+两套 CRT 混链：
+
+| 来源 | 实现 |
+|---|---|
+| konan 自带 sysroot 的 `crt2.o` | `int atexit(void(*f)(void)) { return _onexit(f) ? 0 : -1; }` |
+| nixpkgs mingw-w64 (UCRT) 的 `libucrtbase.a` / `libmsvcrt.a` 各自带的 `_onexit` 成员 | `int _onexit(_onexit_t f) { return atexit(f) ? f : NULL; }` |
+
+第一个 `atexit` 调用点就是被 `crtbegin.o` 注册的 `__gcc_register_frame`，
+于是进程在 `__do_global_ctors` 阶段直接递归爆栈。
+
+### 修复
+1. **`shim/libstdcxx-symbols-shim.cpp` 导出 `_onexit`**（返回入参 = 注册成功，不真正登记），
+   shim 归档排在所有 UCRT 导入库之前，递归即被打断。
+   代价：退出时不会执行 `atexit` 注册的回调（含 C++ 全局析构）；本项目只有
+   `__gcc_register_frame`（注册一个空函数）用到，因此无影响。
+2. **构建脚本里删掉 nixpkgs UCRT 库中的 `_onexit` 成员**（`ar d`），避免重复定义。
+3. **`-Pskiko.mingw.libDirs` 不能包含 nixpkgs 的 MinGW 库目录**：一旦包含，
+   konan 默认的 `-lmingw32` 会解析到 nixpkgs 那个精简版 `libmingw32.a`，
+   而 `mingw_app_type` / `__security_init_cookie` / `__mingw_init_ehandler` /
+   `mingw_initlts*_force` 只存在于 konan 自带 sysroot 的 `libmingw32.a` 里
+   → 链接报 7 个未定义符号。nixpkgs 的库全部用绝对路径给出，不需要 `-L`。
+
+### 修复后进展
+Kotlin `main` 已能执行、窗口创建成功（`WM_CREATE`/首次 `WM_PAINT`、952x606 客户区）、
+`composekn-startup.log` 正常生成。
+
+### 两个遗留问题
+1. **ICU 数据文件**：Skia 的 `SkLoadICU()` 在运行时按 `<exe目录>\\icudtl.dat` 查找 ICU 数据
+   （见 exe 内宽字符串 `SkLoadICU: datafile '%s' is missing`）。构建产物
+   `skia/out/mingw/icudtl.dat`（10 MB）必须随 exe 一起分发，否则文本排版会失败，
+   并且失败路径会向 `std::wcerr` 打印 —— 而 `wcerr` 在这个混链里 vptr 为 NULL，直接 access violation。
+   （后续可考虑把 icudtl.dat 嵌进 exe 并在启动时释放到 exe 同目录，保持单文件。）
+2. **~10 秒后 GC 崩溃**：Wine 下 `kotlin::alloc::FixedBlockPage::Sweep<ObjectSweepTraits>`
+   读 `0x100000008` 崩溃。怀疑是 Wine 对 K/N GC 的线程挂起支持不完善
+   （可能是 Wine 特有），需要在 Windows 实机验证。

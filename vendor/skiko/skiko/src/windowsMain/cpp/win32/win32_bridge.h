@@ -36,6 +36,9 @@ typedef struct ComposeKNWin32Event {
     uint32_t modifiers;
 } ComposeKNWin32Event;
 
+/** Append a line to the startup diagnostic log (composekn-startup.log). */
+void composekn_win32_log(const char* message);
+
 /** Begin native move drag (ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION). */
 void composekn_win32_begin_move(ComposeKNWin32Window* window);
 

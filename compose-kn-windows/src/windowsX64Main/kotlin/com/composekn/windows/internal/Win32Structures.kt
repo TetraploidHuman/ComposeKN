@@ -126,3 +126,13 @@ const val WM_TIMER = 0x0113
 // Custom messages
 const val WM_APP = 0x8000
 const val WM_COMPOSE_INVALIDATE = WM_APP + 1
+
+
+/** 启动诊断日志：写入 exe 同目录的 composekn-startup.log。 */
+fun winlog(message: String) {
+    try {
+        org.jetbrains.skiko.win32Log(message)
+    } catch (t: Throwable) {
+        // 日志失败不影响主流程
+    }
+}
