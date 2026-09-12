@@ -84,6 +84,13 @@ SKIKO_EXPORT KNativePointer org_jetbrains_skia_Surface__1nMakeFromBackendRenderT
 
     std::unique_ptr<SkSurfaceProps> surfaceProps = skija::SurfaceProps::toSkSurfaceProps(surfacePropsInts);
 
+#if defined(SKIKO_MINGW_NO_GPU)
+    // ComposeKN: this Skia build has GPU backends disabled; the software raster
+    // path used on Windows never calls this entry point.
+    (void)context; (void)backendRenderTarget; (void)grSurfaceOrigin;
+    (void)skColorType; (void)colorSpace; (void)surfaceProps;
+    return nullptr;
+#else
     sk_sp<SkSurface> surface = SkSurfaces::WrapBackendRenderTarget(
         static_cast<GrRecordingContext*>(context),
         *backendRenderTarget,
@@ -95,6 +102,7 @@ SKIKO_EXPORT KNativePointer org_jetbrains_skia_Surface__1nMakeFromBackendRenderT
         /* ReleaseContext */ nullptr
     );
     return reinterpret_cast<KNativePointer>(surface.release());
+#endif
 }
 
 SKIKO_EXPORT KNativePointer org_jetbrains_skia_Surface__1nMakeFromMTKView
@@ -137,6 +145,12 @@ SKIKO_EXPORT KNativePointer org_jetbrains_skia_Surface__1nMakeRenderTarget
                                               sk_ref_sp<SkColorSpace>(colorSpace));
     std::unique_ptr<SkSurfaceProps> surfaceProps = skija::SurfaceProps::toSkSurfaceProps(surfacePropsInts);
 
+#if defined(SKIKO_MINGW_NO_GPU)
+    // ComposeKN: GPU backends disabled in this Skia build (see above).
+    (void)context; (void)budgeted; (void)imageInfo; (void)sampleCount;
+    (void)surfaceOrigin; (void)surfaceProps; (void)shouldCreateWithMips;
+    return nullptr;
+#else
     sk_sp<SkSurface> instance = SkSurfaces::RenderTarget(
       context, budgeted ? skgpu::Budgeted::kYes : skgpu::Budgeted::kNo,
       imageInfo,
@@ -144,6 +158,7 @@ SKIKO_EXPORT KNativePointer org_jetbrains_skia_Surface__1nMakeRenderTarget
       surfaceProps.get(),
       shouldCreateWithMips);
     return reinterpret_cast<KNativePointer>(instance.release());
+#endif
 }
 
 SKIKO_EXPORT KNativePointer org_jetbrains_skia_Surface__1nMakeNull

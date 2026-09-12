@@ -162,6 +162,11 @@ SKIKO_EXPORT KNativePointer org_jetbrains_skia_Image__1nAdoptTextureFrom
     GrDirectContext* context = reinterpret_cast<GrDirectContext*>(contextPtr);
     GrBackendTexture* backendTexture = reinterpret_cast<GrBackendTexture*>(backendTexturePtr);
 
+#if defined(SKIKO_MINGW_NO_GPU)
+    // ComposeKN: GPU backends disabled in this Skia build.
+    (void)context; (void)backendTexture; (void)surfaceOrigin; (void)colorType;
+    return nullptr;
+#else
     sk_sp<SkImage> image = SkImages::AdoptTextureFrom(
         static_cast<GrRecordingContext*>(context),
         *backendTexture,
@@ -170,4 +175,5 @@ SKIKO_EXPORT KNativePointer org_jetbrains_skia_Image__1nAdoptTextureFrom
     );
 
     return reinterpret_cast<KNativePointer>(image.release());
+#endif
 }

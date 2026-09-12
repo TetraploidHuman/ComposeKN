@@ -164,16 +164,26 @@ fun SkikoProjectContext.compileNativeBridgesTask(
                     ))
                 } else {
                     // Cross-compiling for mingw-w64 from a POSIX host.
-                    val windowsFlags = mutableListOf(
-                        "-target",
-                        if (arch == Arch.X64) "x86_64-w64-windows-gnu" else error("Unexpected arch $arch"),
-                        *buildType.clangFlags,
+                    val windowsFlags = mutableListOf<String>()
+                    if (compilerForTarget(os, arch).startsWith("clang")) {
+                        windowsFlags.add("-target")
+                        windowsFlags.add(
+                            if (arch == Arch.X64) "x86_64-w64-windows-gnu"
+                            else error("Unexpected arch $arch")
+                        )
+                    }
+                    windowsFlags.addAll(buildType.clangFlags)
+                    windowsFlags.addAll(listOf(
                         "-fno-rtti",
                         "-fno-exceptions",
                         "-fvisibility=hidden",
                         "-fvisibility-inlines-hidden",
-                        *skiaPreprocessorFlags(OS.Windows, buildType)
-                    )
+                    ))
+                    windowsFlags.addAll(skiaPreprocessorFlags(OS.Windows, buildType))
+                    if (project.findProperty("skiko.skia.mingw.dir") != null) {
+                        // GPU backends are disabled in the MinGW Skia build.
+                        windowsFlags.add("-DSKIKO_MINGW_NO_GPU")
+                    }
                     flags.set(windowsFlags)
                 }
             }
@@ -252,7 +262,18 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
 
     val skiaBinDir = "$skiaDir/out/${buildType.id}-$targetString"
     val resolvedBinaryInputs = resolveBinaryInputs(os, arch, TargetEnv.NATIVE, skiaBinDir)
-    val nativeArchives = resolvedBinaryInputs.staticArchivePaths.distinct()
+    // ComposeKN: allow swapping the shipped MSVC-ABI Skia .lib files for a
+    // GNU-ABI (MinGW) Skia build produced by
+    // vendor/skiko/skia-mingw/build-skia-mingw.sh. Kotlin/Native's mingwX64
+    // backend links with the GNU ABI, so the MSVC archives cannot be used.
+    val mingwSkiaDir = (project.findProperty("skiko.skia.mingw.dir") as? String)?.takeIf { it.isNotBlank() }
+    val mingwNativeArchives: List<String>? = mingwSkiaDir?.let { dir ->
+        val files = File(dir).listFiles { f: File -> f.isFile && f.name.endsWith(".a") } ?: emptyArray()
+        files.map { it.absolutePath }.sorted().also {
+            println("ComposeKN: embedding ${it.size} MinGW Skia archives from $dir")
+        }
+    }
+    val nativeArchives = mingwNativeArchives ?: resolvedBinaryInputs.staticArchivePaths.distinct()
     val allLibraries = if (requiresSymbolPatching) {
         nativeArchives.map { lib ->
             "${patchedLibsDir.absolutePath}/${File(lib).name}"
@@ -331,8 +352,33 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
         }
         OS.Windows -> {
             val options = mutableListOf<String>()
-            options.addAll(resolvedBinaryInputs.staticArchivePaths)
-            options.addAll(resolvedBinaryInputs.directStaticArchivePaths)
+            // ComposeKN: when `skiko.skia.mingw.dir` is set, link the GNU-ABI
+            // (MinGW/Itanium-mangling) Skia archives built from source by
+            // vendor/skiko/skia-mingw/build-skia-mingw.sh instead of the
+            // MSVC-ABI .lib files shipped with skiko. Kotlin/Native's mingwX64
+            // backend needs the GNU ABI.
+            val mingwSkiaDir = (project.findProperty("skiko.skia.mingw.dir") as? String)?.takeIf { it.isNotBlank() }
+            if (mingwSkiaDir != null) {
+                val dir = File(mingwSkiaDir)
+                val archives = (dir.listFiles { f: File -> f.isFile && f.name.endsWith(".a") } ?: emptyArray())
+                    .map { it.absolutePath }
+                    .sorted()
+                println("ComposeKN: linking ${archives.size} MinGW Skia archives from $mingwSkiaDir")
+                options.add("-Wl,--start-group")
+                options.addAll(archives)
+                options.add("-Wl,--end-group")
+                // Extra library search paths (libstdc++/libgcc from the GCC used
+                // to build Skia).
+                (project.findProperty("skiko.mingw.libDirs") as? String)
+                    ?.split(File.pathSeparatorChar, ',')
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotEmpty() }
+                    ?.forEach { options.add("-L$it") }
+                options.addAll(listOf("-lstdc++", "-lmcfgthread"))
+            } else {
+                options.addAll(resolvedBinaryInputs.staticArchivePaths)
+                options.addAll(resolvedBinaryInputs.directStaticArchivePaths)
+            }
             options.addAll(resolvedBinaryInputs.linkFlags)
             listOf("gdi32", "user32", "ole32", "shell32", "advapi32", "uuid", "kernel32").forEach {
                 options.add("-l$it")

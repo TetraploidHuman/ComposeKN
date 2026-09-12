@@ -525,10 +525,41 @@ libzlib.a libexpat.a libskcms.a libjsonreader.a libskresources.a libwebp_sse41.a
 8. **GPU 全部关闭**（`skia_enable_ganesh=false` 等）：Windows 渲染走软件光栅（StretchDIBits），
    不需要 GL/Vulkan/Dawn/ANGLE，省掉海量依赖。
 
+### ★ 最终链接成功（同日完成）★
+**`windows-demo.exe` (27MB) 已成功链接** —— Kotlin/Native mingwX64 + GNU-ABI Skia。
+依赖仅系统 DLL（msvcrt / ucrtbase / ntdll / kernel32 / user32 / gdi32 / advapi32），
+**无需附带任何额外运行时 DLL**，单文件即可运行。
+
+#### 打通链接的三个关键点
+1. **`-include-binary` 路径**：klib 的 `targets/mingw_x64/included/` 才是真正参与链接的库
+   （KLIB 里的 `linkerOpts` 不会传到最终链接！Linux 侧靠的是 cinterop def 的 linkerOpts）。
+   → 在 `NativeTasksConfiguration` 里用 gradle 属性 `skiko.skia.mingw.dir` 覆盖 `nativeArchives`。
+2. **GPU 入口屏蔽**：软件光栅用不到 Ganesh，给 `SKIKO_MINGW_NO_GPU` 定义 + 在
+   `Surface.cc`（WrapBackendRenderTarget / RenderTarget）与 `Image.cc`（AdoptTextureFrom）
+   里 guard 掉 3 个 GPU 入口（保留 C 符号，返回 nullptr）。
+3. **libstdc++ 版本差**：Skia 用 GCC 15 头编译（需要 C++20），konan 链接的是它自带的
+   静态 libstdc++ **GCC 9.2** → 缺 3 个 GCC 11+ 符号。用
+   `vendor/skiko/skia-mingw/shim/libstdcxx-symbols-shim.cpp` 显式实例化补齐
+   （`_M_replace_cold` 定义直接取自安装的 `<bits/basic_string.tcc>`），
+   **避免引入第二个 libstdc++（DLL）**，保持单一 C++ 运行时。
+   另需 4 个导入库：`libmcfgthread.a`（GCC15 的 threading）、
+   `libmsvcrt.a`/`libucrtbase.a`（`__timezone`/`__tzname`/`stat64i32`/`__imp__strtof_l`）、
+   `libntdll.a`（mcfgthread 的 `Nt*`）、`libmingwex.a`（`__mingw_fix_stat_path`）。
+
+#### 构建命令（已固化为脚本）
+```bash
+# 1) 构建 GNU-ABI Skia
+nix-shell -p git gn ninja python3 pkgsCross.mingwW64.stdenv.cc --run \
+  "SKIA_MINGW_WORK=<dir> ./vendor/skiko/skia-mingw/build-skia-mingw.sh"
+
+# 2) 端到端链接出 exe（含 shim 构建）
+nix-shell -p gn ninja python3 pkgsCross.mingwW64.stdenv.cc --run \
+  "SKIA_MINGW_WORK=<dir> ./vendor/skiko/skia-mingw/build-windows-native-demo.sh"
+```
+
 ### 下一步（尚未完成）
-- [ ] **skiko 集成**：`compileNativeBridgesWindowsX64` 目前仍按 JetBrains MSVC 库；需改为引用本构建的
-      `.a` 集合，并在 skiko 的 C++ 桥里把 GPU 入口（`DirectContext.cc`/`BackendTexture.cc`/
-      `BackendRenderTarget.cc`/`Surface.cc`/`Image.cc`/`render.cc` 中的 `Gr*` 引用）用宏屏蔽（Windows 软件光栅不用）。
-- [ ] **最终链接**：K/N 链接时需 `-L` 指向 nixpkgs mingw 的 libstdc++/libgcc（GCC 15），
-      或把 skia 换成与 konan msys2 (GCC 9.2) 匹配的旧 libstdc++ 头编译。
-- [ ] CI 化（可选：把 skia 构建产物缓存为 artifact，避免每次 20 分钟重建）。
+- [ ] **Windows 上实机运行验证**（本机是 Linux，只能验证链接；需跑
+      `windows-demo.exe` 确认窗口/输入/软件光栅渲染）。
+- [ ] CI 化：把 skia 构建产物缓存为 artifact，避免每次 ~20 分钟重建；
+      可加 "启动 exe 3 秒不崩溃" 的 smoke test。
+- [ ] skia 构建目前关闭了 GPU（ganesh/vulkan/dawn）；若将来需要 GPU 加速需另行处理。
