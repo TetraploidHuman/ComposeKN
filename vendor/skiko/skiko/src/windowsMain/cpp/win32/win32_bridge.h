@@ -39,6 +39,9 @@ typedef struct ComposeKNWin32Event {
 /** Append a line to the startup diagnostic log (composekn-startup.log). */
 void composekn_win32_log(const char* message);
 
+/** 物理像素 / 逻辑像素（= dpi / 96.0）。 */
+float composekn_win32_dpi_scale(ComposeKNWin32Window* window);
+
 /** Begin native move drag (ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION). */
 void composekn_win32_begin_move(ComposeKNWin32Window* window);
 

@@ -675,3 +675,30 @@ Wine 下没有窗口管理器，从 X 侧（xdotool）缩放无法转成 Win32 �
 `Win32Native.kt`/`WindowsSoftwareContextHandler` 已加轻量日志：
 - `event: resize WxH`（应用层收到 WM_SIZE）
 - `swctx.present: surface=WxH window=WxH`（每次 surface 尺寸变化时记录一次）
+
+### 13.4 窗口外观/DPI/缩放闪白修复（真机反馈）
+
+真机截图暴露的四个问题与修复：
+
+1. **两条标题栏**（系统标题栏 + 自绘 CSD 栏各一条）
+   根因：`WM_NCCALCSIZE` 只在 `wParam != 0` 时返回 0 去掉非客户区，窗口创建
+   (`wParam == 0`) 时 `break` 走了 `DefWindowProc` → 系统标题栏被画出来。
+   修复：两种 `wParam` 都返回 0、不调用 `DefWindowProc`。
+   验证：客户区从 944x601（含边框）变为整窗 960x640，截图中只剩自绘标题栏。
+   （顺带修掉「拖拽缩放时系统标题栏消失」——那正是 `wParam != 0` 分支造成的。）
+
+2. **缩放过程中整窗闪白**
+   `WM_ERASEBKGND` 用类背景刷（白色）擦除，且 `WM_PAINT` 只 `BeginPaint/EndPaint`。
+   修复：`WM_ERASEBKGND` 返回 1（不擦背景）；`present()` 缓存最近一帧像素，
+   `WM_PAINT`/`blitFrame()` 立刻把缓存帧（按当前客户区拉伸）贴回去。
+
+3. **HiDPI 下 UI 发糊**
+   exe 没有 DPI 感知，Windows 把整个窗口位图拉伸。修复：启动时调用
+   `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`（失败回退 `SetProcessDPIAware`）。
+   同时 `composekn_win32_width/height` 改为返回**逻辑像素**（物理 / dpiScale），
+   新增 `composekn_win32_dpi_scale`；渲染表面 = 逻辑 × scale = 物理像素，
+   与客户区 1:1，既不模糊也不过小。Kotlin 侧 `Win32Window.dpiScale` 不再硬编码 1.0f。
+
+4. **缩放后重绘**
+   由第 2 条的帧缓存 + `blitFrame()` 覆盖：缩放/重绘期间窗口显示上一帧（拉伸），
+   不再出现白屏空窗。

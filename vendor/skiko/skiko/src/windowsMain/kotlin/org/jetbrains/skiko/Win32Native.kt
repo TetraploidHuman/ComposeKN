@@ -88,7 +88,9 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     constructor(title: String, width: Int = 960, height: Int = 640) :
         this(ensureCreated(title, width, height))
 
-    val dpiScale: Float = 1.0f
+    /** 物理像素 / 逻辑像素。窗口客户区按逻辑像素上报，渲染表面用物理像素。 */
+    val dpiScale: Float
+        get() = composekn_win32_dpi_scale(native)
 
     val width: Int
         get() = composekn_win32_width(native)
@@ -172,6 +174,9 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
 @SymbolName("composekn_win32_begin_move")
 internal external fun composekn_win32_begin_move(window: COpaquePointer?)
+
+@SymbolName("composekn_win32_dpi_scale")
+internal external fun composekn_win32_dpi_scale(window: COpaquePointer?): Float
 
 @SymbolName("composekn_win32_log")
 internal external fun composekn_win32_log(message: CPointer<ByteVar>)

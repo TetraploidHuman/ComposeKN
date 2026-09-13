@@ -118,6 +118,10 @@ struct ComposeKNWin32Window {
     bool paintLogged = false;
     bool sizeLogged = false;
     bool presentLogged = false;
+    // 最近一帧的像素缓存：缩放/重绘期间用来立刻重绘，避免白屏
+    std::vector<unsigned char> frame;
+    int frameW = 0;
+    int frameH = 0;
 };
 
 namespace {
@@ -139,6 +143,53 @@ static void pushEvent(ComposeKNWin32Window* window, const ComposeKNWin32Event& e
 
 static int edgeMargin(ComposeKNWin32Window* window) {
     return MulDiv(kEdgeMarginBase, window->dpi, 96);
+}
+
+static double dpiScaleOf(const ComposeKNWin32Window* window) {
+    return (window != nullptr && window->dpi > 0) ? (window->dpi / 96.0) : 1.0;
+}
+
+// 让进程具备 DPI 感知：否则 HiDPI 显示器上 Windows 会把整个窗口位图拉伸，
+// 自绘 UI 会明显发糊。PER_MONITOR_AWARE_V2 = -4。
+static void enableDpiAwareness() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 == nullptr) return;
+    typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(HANDLE);
+    auto setCtx = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+        GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+    if (setCtx != nullptr && setCtx(reinterpret_cast<HANDLE>(-4))) return;
+    typedef BOOL (WINAPI *SetProcessDPIAwareFn)();
+    auto setAware = reinterpret_cast<SetProcessDPIAwareFn>(
+        GetProcAddress(user32, "SetProcessDPIAware"));
+    if (setAware != nullptr) setAware();
+}
+
+// 把最近一帧（必要时拉伸）贴到当前客户区。缩放/重绘时用它立刻补画。
+static void blitFrame(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    if (window->frame.empty() || window->frameW <= 0 || window->frameH <= 0) return;
+    RECT rc;
+    if (!GetClientRect(window->hwnd, &rc)) return;
+    int cw = rc.right - rc.left;
+    int ch = rc.bottom - rc.top;
+    if (cw <= 0 || ch <= 0) return;
+    HDC dc = GetDC(window->hwnd);
+    if (dc == nullptr) return;
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = window->frameW;
+    bmi.bmiHeader.biHeight = -window->frameH;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, 0, 0, cw, ch, 0, 0, window->frameW, window->frameH,
+                  window->frame.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(window->hwnd, dc);
 }
 
 static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -180,16 +231,15 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             break;
         }
         case WM_NCCALCSIZE: {
-            // Borderless: remove the system frame + title bar (we draw our
-            // own chrome), keep resize behavior via WM_NCHITTEST below.
-            if (wParam != 0) {
-                if (IsZoomed(hwnd)) {
-                    NCCALCSIZE_PARAMS* nc = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
-                    nc->rgrc[0].top += 8;
-                }
-                return 0;
+            // 无系统边框/标题栏：我们自绘标题栏（CSD），缩放靠 WM_NCHITTEST。
+            // 注意 wParam == 0（窗口创建/普通查询）也必须返回 0 且不调用
+            // DefWindowProc，否则系统标题栏会被画出来（会出现两条标题栏，
+            // 而拖拽缩放时 wParam != 0 又变回无边框，看起来像"标题栏消失"）。
+            if (wParam != 0 && IsZoomed(hwnd)) {
+                NCCALCSIZE_PARAMS* nc = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+                nc->rgrc[0].top += 8;
             }
-            break;
+            return 0;
         }
         case WM_SIZE: {
             int w = LOWORD(lParam);
@@ -227,6 +277,9 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             pushEvent(window, e);
             break;
         }
+        case WM_ERASEBKGND:
+            // 自己负责全部像素：不要用背景刷擦成白色（缩放时会闪白）。
+            return 1;
         case WM_PAINT: {
             if (window != nullptr && !window->paintLogged) {
                 window->paintLogged = true;
@@ -235,6 +288,7 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
+            blitFrame(window);
             return 0;
         }
         case WM_KEYDOWN:
@@ -364,6 +418,7 @@ static int queryWindowDpi(HWND hwnd) {
 } // namespace
 
 extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int width, int height) {
+    enableDpiAwareness();
     HINSTANCE instance = GetModuleHandleW(nullptr);
     static bool classRegistered = false;
     if (!classRegistered) {
@@ -471,38 +526,29 @@ extern "C" void composekn_win32_present(
         composeknLog("composekn_win32_present: first frame %dx%d stride=%d pixels=%p",
                      width, height, stride_px, pixels);
     }
-    HDC dc = GetDC(window->hwnd);
-    if (dc == nullptr) {
-        composeknLog("composekn_win32_present: GetDC failed");
-        return;
-    }
-    BITMAPINFO bmi;
-    ZeroMemory(&bmi, sizeof(bmi));
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    SetStretchBltMode(dc, COLORONCOLOR);
-    StretchDIBits(
-        dc,
-        0, 0, width, height,
-        0, 0, width, height,
-        pixels,
-        &bmi,
-        DIB_RGB_COLORS,
-        SRCCOPY
-    );
-    ReleaseDC(window->hwnd, dc);
+    // 缓存这一帧：WM_PAINT / 缩放过程中用它立刻重绘
+    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+    window->frame.assign(static_cast<const unsigned char*>(pixels),
+                         static_cast<const unsigned char*>(pixels) + bytes);
+    window->frameW = width;
+    window->frameH = height;
+    blitFrame(window);
 }
 
+// 逻辑像素（= 物理像素 / dpiScale）。渲染表面尺寸 = 逻辑尺寸 * dpiScale，
+// 与窗口客户区物理像素 1:1，配合 DPI 感知即可得到清晰（不糊）的 UI。
 extern "C" int composekn_win32_width(ComposeKNWin32Window* window) {
-    return window ? window->width : 0;
+    if (window == nullptr) return 0;
+    return static_cast<int>(window->width / dpiScaleOf(window) + 0.5);
 }
 
 extern "C" int composekn_win32_height(ComposeKNWin32Window* window) {
-    return window ? window->height : 0;
+    if (window == nullptr) return 0;
+    return static_cast<int>(window->height / dpiScaleOf(window) + 0.5);
+}
+
+extern "C" float composekn_win32_dpi_scale(ComposeKNWin32Window* window) {
+    return static_cast<float>(dpiScaleOf(window));
 }
 
 extern "C" void composekn_win32_show(ComposeKNWin32Window* window, int cmd) {
