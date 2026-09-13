@@ -11,6 +11,7 @@ import kotlinx.coroutines.launch
 import kotlin.time.TimeSource
 import com.composekn.windows.WindowsComposeApplication
 import com.composekn.windows.internal.winlog
+import org.jetbrains.skiko.win32ProcessorCount
 import kotlin.system.exitProcess
 import platform.posix.getenv
 import kotlinx.cinterop.toKString
@@ -53,7 +54,10 @@ fun main(args: Array<String>) {
             // 每帧 +1：既驱动 HUD 上的帧计数，也让界面持续重组（等价于动画场景的压力）。
             LaunchedEffect(Unit) {
                 while (true) {
-                    withFrameNanos { probe.frames++ }
+                    withFrameNanos {
+                        probe.frames++
+                        probe.animTicks++
+                    }
                 }
             }
         } else {
@@ -64,20 +68,76 @@ fun main(args: Array<String>) {
             }
         }
 
+        // 性能日志：每秒一行，同时写到 stdout 和 exe 同目录的 composekn-startup.log。
+        //
+        // 真机（Windows）上任务管理器看不了细节、或想直接留证据时，跑一遍把
+        // composekn-startup.log 拷出来即可。字段含义：
+        //   fps            —— 宿主真实渲染帧率（= 每秒重绘次数）
+        //   frames/s       —— 这一秒渲染的帧数
+        //   recompose(...) —— 各作用域这一秒的重组次数：gallery=根、hud=HUD 函数体、
+        //                     hudInner=读 frames 的最小作用域、summary=文本重算次数。
+        //                     动画在跑时预期是 0/0/≈60/≈60 —— 只有最小作用域重组，
+        //                     根和 HUD 函数体不涨，就是「按需重组生效」的证据。
+        //   cpu            —— 本进程这一秒消耗的 CPU 时间（1000ms/s = 满一个逻辑核），
+        //                     由 GetProcessTimes 自测，不需要任务管理器。
+        val cores = win32ProcessorCount
+        LaunchedEffect(Unit) {
+            val win = app.window
+            val banner = "PERF-BANNER: 窗口=${win.logicalWidth}x${win.logicalHeight}dp" +
+                " dpi=${fmt1(win.layer.contentScale.toDouble())}" +
+                " 刷新率=${win.nativeWindow?.refreshHz ?: 0}Hz" +
+                " 动画=$animate 逻辑核=$cores" +
+                " 日志=exe 同目录 composekn-startup.log"
+            println(banner)
+            log(banner)
+        }
+
         // 标题里显示实测帧率：人工测试和脚本（xwininfo -root -tree）都能直接读到
         // 宿主真实的渲染节奏 —— 「按需渲染 + 帧节流」是否生效一眼可见。
         // 这个协程每秒醒一次（用 delay，不依赖渲染），所以静止时也会把 fps=0 刷出来。
         LaunchedEffect(Unit) {
             var lastFrames = 0
+            var lastGallery = probe.galleryComposes
+            var lastHud = probe.hudComposes
+            var lastHudInner = probe.hudInnerComposes
+            var lastSummary = probe.summaryCalls
+            var lastCpu = app.window.nativeWindow?.processCpuNanos() ?: -1L
             var lastMark = TimeSource.Monotonic.markNow()
             while (true) {
                 delay(1000)
                 val elapsed = lastMark.elapsedNow()
+                val elapsedNanos = elapsed.inWholeNanoseconds
                 val total = app.window.frameCount
-                val fps = (total - lastFrames) * 1_000_000_000.0 / elapsed.inWholeNanoseconds
+                val fps = if (elapsedNanos > 0) {
+                    (total - lastFrames) * 1_000_000_000.0 / elapsedNanos
+                } else {
+                    0.0
+                }
+                val cpuNow = app.window.nativeWindow?.processCpuNanos() ?: -1L
+                val cpuDelta = if (cpuNow >= 0 && lastCpu >= 0) cpuNow - lastCpu else -1L
+                val cpuBit = if (cpuDelta >= 0 && elapsedNanos > 0) {
+                    val oneCore = cpuDelta.toDouble() / elapsedNanos * 100.0
+                    "cpu=${fmt1(cpuDelta / 1_000_000.0)}ms/s" +
+                        " (${fmt1(oneCore)}% of one core, ${fmt1(oneCore / cores)}% of $cores logical)"
+                } else {
+                    "cpu=n/a"
+                }
+                val line = "GALLERY-STATS: fps=${fmt1(fps)} frames/s=${total - lastFrames}" +
+                    " recompose(gallery/hud/hudInner/summary)=" +
+                    "+${probe.galleryComposes - lastGallery}" +
+                    "/+${probe.hudComposes - lastHud}" +
+                    "/+${probe.hudInnerComposes - lastHudInner}" +
+                    "/+${probe.summaryCalls - lastSummary} $cpuBit"
+                println(line)
+                log(line)
                 lastFrames = total
+                lastGallery = probe.galleryComposes
+                lastHud = probe.hudComposes
+                lastHudInner = probe.hudInnerComposes
+                lastSummary = probe.summaryCalls
+                lastCpu = cpuNow
                 lastMark = TimeSource.Monotonic.markNow()
-                app.window.setTitle("ComposeKN Windows Demo — ${fpsOf(fps)} fps (frames=$total)")
+                app.window.setTitle("ComposeKN Windows Demo — ${fmt1(fps)} fps (frames=$total)")
             }
         }
 
@@ -120,7 +180,7 @@ private fun resolveGalleryAnimation(args: Array<String>): Boolean {
 }
 
 /** 一位小数（Kotlin/Native 上不依赖 String.format）。 */
-private fun fpsOf(value: Double): String {
+private fun fmt1(value: Double): String {
     if (value.isNaN() || value < 0) return "n/a"
     val ticks = (value * 10.0 + 0.5).toLong()
     return "${ticks / 10}.${ticks % 10}"

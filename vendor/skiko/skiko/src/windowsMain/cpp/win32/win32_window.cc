@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <string>
 #include <cstdio>
+#include <cstdint>
 #include <ctime>
 #include <vector>
 #include <cstdio>
@@ -632,6 +633,74 @@ extern "C" void composekn_win32_present(
     window->frameW = width;
     window->frameH = height;
     blitFrame(window);
+}
+
+// ---------------------------------------------------------------------------
+// 后备缓冲（present buffer）：对齐上游 skiko SOFTWARE_FAST 的零拷贝呈现
+//
+// 上游（awtMain/cpp/windows/SoftwareRedrawer.cc）的做法是：redrawer 持有一块
+// BITMAPINFO + 像素的内存，用 SkSurfaces::WrapPixels 让 Skia **直接画进去**，
+// finishFrame 里再 StretchDIBits 出去 —— 不产生任何多余的整窗拷贝。
+//
+// 这里做同样的事：`window->frame` 就是那块内存（紧密 BGRA），Kotlin 侧用
+// Surface.makeRasterDirect 包装它，画完调 composekn_win32_present_buffer 直接上传。
+// ---------------------------------------------------------------------------
+extern "C" void* composekn_win32_backbuffer_pixels(
+    ComposeKNWin32Window* window,
+    int width,
+    int height
+) {
+    if (window == nullptr || window->hwnd == nullptr) {
+        composeknLog("composekn_win32_backbuffer_pixels: 失败（window=%p hwnd=%p）",
+                     static_cast<void*>(window),
+                     window != nullptr ? static_cast<void*>(window->hwnd) : nullptr);
+        return nullptr;
+    }
+    if (width <= 0 || height <= 0) {
+        composeknLog("composekn_win32_backbuffer_pixels: 失败（尺寸 %dx%d 非法）", width, height);
+        return nullptr;
+    }
+    const size_t needed = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+    // 尺寸变了才重新分配（指针会变，调用方必须重建包装它的 surface）。
+    if (window->frameW != width || window->frameH != height || window->frame.size() != needed) {
+        window->frame.assign(needed, 0);
+        window->frameW = width;
+        window->frameH = height;
+        composeknLog("composekn_win32_backbuffer_pixels: 分配后备缓冲 %dx%d (%.1f MB) ptr=%p",
+                     width, height, static_cast<double>(needed) / (1024.0 * 1024.0),
+                     static_cast<void*>(window->frame.data()));
+    }
+    return window->frame.data();
+}
+
+extern "C" void composekn_win32_present_buffer(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    if (!window->presentLogged) {
+        window->presentLogged = true;
+        composeknLog("composekn_win32_present_buffer: first frame %dx%d (零拷贝后备缓冲)",
+                     window->frameW, window->frameH);
+    }
+    blitFrame(window);
+}
+
+extern "C" int64_t composekn_win32_process_cpu_nanos(ComposeKNWin32Window* window) {
+    (void)window;
+    FILETIME creation, exitTime, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exitTime, &kernel, &user)) {
+        return -1;
+    }
+    auto toNanos = [](const FILETIME& ft) -> int64_t {
+        // FILETIME 单位是 100ns
+        const uint64_t ticks = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) |
+                               static_cast<uint64_t>(ft.dwLowDateTime);
+        return static_cast<int64_t>(ticks * 100ull);
+    };
+    return toNanos(kernel) + toNanos(user);
+}
+
+extern "C" int32_t composekn_win32_processor_count(void) {
+    const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return n > 0 ? static_cast<int32_t>(n) : 1;
 }
 
 // 逻辑像素（= 物理像素 / dpiScale）。渲染表面尺寸 = 逻辑尺寸 * dpiScale，

@@ -6,6 +6,7 @@ import kotlinx.cinterop.*
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.staticCFunction
+import org.jetbrains.skia.impl.Native
 import org.jetbrains.skia.impl.NativePointer
 
 /**
@@ -57,6 +58,35 @@ internal external fun composekn_win32_wake(window: COpaquePointer?)
 /** 主显示器刷新率（Hz），拿不到时返回 0。 */
 @SymbolName("composekn_win32_refresh_hz")
 internal external fun composekn_win32_refresh_hz(window: COpaquePointer?): Int
+
+/**
+ * 后备缓冲像素指针（C 侧持有，紧密 BGRA）：Skia 直接画进这块内存，present 时
+ * GDI 从同一块内存上传 —— 零拷贝。见 WindowsSoftwareContextHandler。
+ *
+ * 尺寸变化后指针可能变，调用方必须重建包装它的 Skia surface。
+ *
+ * 注意返回类型**不能**写成 `NativePointer?`：C 的 `void*` 返回映射成 `NativePtr`
+ * （value class），空指针是 `Native.NullPointer` 而不是 Kotlin null，可空声明会让
+ * `!= null` 误判成功（拿到值为 0 的指针）。判断见 [Win32Window.backbufferPixels]。
+ */
+@SymbolName("composekn_win32_backbuffer_pixels")
+internal external fun composekn_win32_backbuffer_pixels(
+    window: COpaquePointer?,
+    width: Int,
+    height: Int,
+): NativePointer
+
+/** 把后备缓冲（Skia 刚画完的）上传到窗口客户区。 */
+@SymbolName("composekn_win32_present_buffer")
+internal external fun composekn_win32_present_buffer(window: COpaquePointer?)
+
+/** 本进程累计 CPU 时间（内核 + 用户），纳秒；失败返回 -1。 */
+@SymbolName("composekn_win32_process_cpu_nanos")
+internal external fun composekn_win32_process_cpu_nanos(window: COpaquePointer?): Long
+
+/** 逻辑处理器数量。 */
+@SymbolName("composekn_win32_processor_count")
+internal external fun composekn_win32_processor_count(): Int
 
 @SymbolName("composekn_win32_width")
 internal external fun composekn_win32_width(window: COpaquePointer?): Int
@@ -156,6 +186,24 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      */
     val refreshHz: Int get() = composekn_win32_refresh_hz(native)
 
+    /**
+     * 后备缓冲（present buffer）像素指针，由 C 侧持有并在尺寸变化时重分配。
+     * 返回 null 表示失败，调用方应回退到 `composekn_win32_present`（拷贝）路径。
+     */
+    fun backbufferPixels(width: Int, height: Int): NativePointer? {
+        val ptr = composekn_win32_backbuffer_pixels(native, width, height)
+        // 空指针必须用 Native.NullPointer 判断 —— C 的 void* 返回映射到 NativePtr
+        // （value class），空指针不是 Kotlin 的 null。声明成可空类型时 `!= null`
+        // 会误判成功，拿到值为 0 的指针（症状：makeRasterDirect(..., 0x0, ...)）。
+        return if (ptr == Native.NullPointer) null else ptr
+    }
+
+    /** 把 Kotlin 侧刚画好的后备缓冲上传到窗口（零拷贝，GDI 直接读同一块内存）。 */
+    fun presentBuffer(): Unit = composekn_win32_present_buffer(native)
+
+    /** 本进程累计 CPU 时间（纳秒），失败返回 -1。用于把 CPU 占用写进日志。 */
+    fun processCpuNanos(): Long = composekn_win32_process_cpu_nanos(native)
+
     // 注意：这里必须用 memScoped + alloc<>().ptr 传「真实指针」。
     // Kotlin 的 IntArray/FloatArray/UIntArray 是托管对象，传给 external 函数时
     // 传过去的是「对象指针」而不是元素首地址，C 侧写入会砸坏 Kotlin 堆对象头，
@@ -239,6 +287,9 @@ internal external fun composekn_win32_log(message: CPointer<ByteVar>)
 
 /** Append a line to composekn-startup.log (next to the exe). */
 fun win32Log(message: String) = message.useCString { composekn_win32_log(it) }
+
+/** 逻辑处理器数量（把进程 CPU 时间换算成「占整机百分比」用）。 */
+val win32ProcessorCount: Int get() = composekn_win32_processor_count()
 
 /**
  * Flat Win32 event delivered from the C bridge.

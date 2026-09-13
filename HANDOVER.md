@@ -1111,7 +1111,7 @@ runner 上的开销：链接 exe 约 **16 分钟**（4 核，比本地 32 核慢
 | 跨线程 | `WindowsMainDispatcher.enqueue()` 增加唤醒钩子：后台线程投递任务时 `PostMessage` 叫醒消息泵，而不是干等到下一条输入消息才上屏 |
 | 像素路径 | `Surface.peekPixels(Pixmap)` 直接把 raster surface 的像素指针交给 C（**Kotlin 侧零拷贝**）；`composekn_win32_present` 改为按 stride 逐行拷贝（surface 行可能有 padding） |
 | 自检 | window 阶段新增 4 条「性能契约」断言；截图阶段从窗口标题读实测 fps 做**外部**验证 |
-| 演示/调试 | 画廊标题实时显示 fps；`--no-animate` 关掉每帧动画以观察空闲行为；`COMPOSEKN_RENDER_PROFILE=1` 每 120 帧打印耗时拆解 |
+| 演示/调试 | 画廊标题实时显示 fps；`--no-animate` 关掉每帧动画以观察空闲行为；每 120 帧的耗时拆解现在**始终**写进日志（`profile:` 行，见 §16.3） |
 
 关键设计点：**渲染请求是唯一触发源**。Compose 的三条失效路径
 （`invalidateLayout`/`invalidateDraw`、`FrameRecomposer.onNewAwaiters`、
@@ -1129,7 +1129,7 @@ runner 上的开销：链接 exe 约 **16 分钟**（4 核，比本地 32 核慢
 | 静止窗口（`--no-animate`） | 约 100 fps 的白工 | **0.0 fps，frames=1**；主线程 8 秒内 1 个 tick ≈ **0%** |
 | 空闲时残留 CPU | — | 只剩 Wine 自己的 X11 驱动线程（8 秒 45 ticks）；**主线程 1 tick** |
 
-`COMPOSEKN_RENDER_PROFILE=1` 的每帧拆解（Wine，1100x760，60fps）：
+每帧拆解（Wine，1100x760，60fps；第二轮起拆得更细，见 §16.3）：
 
 ```
 profile: 120 帧  update=1.5ms  draw+present=6.2ms  total=7.7ms  窗口=1100x760
@@ -1160,10 +1160,10 @@ profile: 120 帧  update=1.5ms  draw+present=6.2ms  total=7.7ms  窗口=1100x760
 
 ### 15.6 还没做（下一步候选）
 
-1. **DIB section + 直接渲染**：用 `CreateDIBSection` 申请一块与 GDI 共享的内存，包成
-   Skia raster surface，让 Compose **直接画进去**，然后 `BitBlt` 出来。这样能一次干掉
-   「录 `Picture` → 回放」这一趟，以及 C 侧那次 3.3MB `memcpy`（DIB 本身就是重绘缓存），
-   预计还能再省掉每帧 20~40% 的 CPU。
+1. ~~**直接渲染进 present buffer**（去掉 C 侧那次 3.3MB `memcpy`）~~：**已在 §16.4 完成**
+   —— 对齐上游 `SOFTWARE_FAST` 的 `WrapPixels` 写法（我们用的是普通堆缓冲 + `StretchDIBits`，
+   与上游一致；`CreateDIBSection` 那一档上游也没用）。
+   剩下没做的是「录 `Picture` → 回放」这一趟：那需要 GPU 后端或脏矩形，见 §16.6。
 2. **真正的 vsync**：现在是按 `VREFRESH` 自己节流（GDI 没有 swap interval）。
    可以用 `DwmGetCompositionTimingInfo` / `DwmFlush` 跟合成器对齐，顺带消除撕裂。
 3. **GPU 后端**：GDI 软件光栅在 4K/高 DPI 下终究会吃力；真要省 CPU 得走
@@ -1171,3 +1171,111 @@ profile: 120 帧  update=1.5ms  draw+present=6.2ms  total=7.7ms  窗口=1100x760
    K/N 的 MinGW ABI 不兼容，这也是当年自建 GNU-ABI Skia 的原因）。
 4. **Linux 侧对照**：Linux 循环本来就是 Wayland 驱动（`poll()` 阻塞 + frame callback
    + `needRender -> requestFrame`），属于**正确实现**；这次只是把 Windows 对齐到同一模型。
+
+---
+
+## 16. 性能第二轮（真机反馈「还是 10% CPU / 10% 核显」）：先证明不是重组问题，再对齐上游 SOFTWARE_FAST
+
+### 16.1 现象与第一直觉
+
+真机（Windows）上动画跑起来：CPU ≈ 10%、核显 ≈ 10%。直觉怀疑「Compose 没有按需重组 /
+发生了全局重组，每帧把整棵树都重算了一遍」。
+
+### 16.2 测量：**不是**重组问题，而且重组粒度比预期更细
+
+动画场景（1100x760，Wine+Xvfb）每秒一行 `GALLERY-STATS`（现在同时写 stdout 和日志）：
+
+| 观测点 | 实测 | 含义 |
+|---|---|---|
+| `galleryComposes`（`ComponentGallery` 根作用域） | **+0 /秒** | 根从未重组 |
+| `hudComposes`（`DiagnosticsHud` **函数体**） | **恒为 1** | 首帧之后再没进过这个函数 |
+| `hudInnerComposes`（HUD 里 `BoxWithConstraints` 的 content lambda） | **+60 /秒** | 真正每帧重组的**最小失效作用域** |
+| `summaryCalls`（`summary()` 调用次数） | **+60 /秒** | 每帧重算的只有那一行文本 |
+| 像素 diff（相隔 10 秒两张截屏） | 83.6 万像素里**只有 ~50 个不同** | 就是 HUD 行末 `frames=` 的数字 |
+
+结论：`frames` 这个 state 的**读**发生在 `BoxWithConstraints` 的 content lambda 里，
+Compose 只把那个作用域标脏并重算 —— 连 `DiagnosticsHud` 的函数体都没重跑。
+这正是「按需/局部重组」该有的行为，`invalidate → RecomposeScope` 这条链在
+Windows 宿主上是完整对齐的。
+
+> **踩坑（值得记）**：一开始把计数器放在 `ComponentGallery`/`DiagnosticsHud` 函数体里，
+> 得到「两个计数器都是 1，但屏幕上的数字在动」的矛盾结果，差点误判成「重组没发生、
+> 画面却在变」的玄学。最后靠 `summary()` 调用计数 + 顶层全局计数器 + 像素 diff
+> 三路交叉验证，才定位到是**计数器放错作用域**（失效没冒泡到函数体）。
+> 教训：**先怀疑度量，再怀疑被测对象**；测重组要在「最小作用域」上加计数。
+
+### 16.3 那 10% 花在哪：每帧「整窗 CPU 光栅化 + 整窗上传」
+
+`WindowsSoftwareRedrawer` 现在**始终**记录每帧耗时（不再需要环境变量）并写成 `profile:` 行：
+
+```
+profile: 120 帧  update=1.5ms  replay=4.9ms  present=1.2ms  draw+present=6.2ms  total=7.7ms  窗口=1100x760  呈现=...
+```
+
+| 阶段 | 时间 | 占比 | 内容 |
+|---|---|---|---|
+| `update` | 1.5ms | 20% | Compose 场景 measure/layout/draw（录成 `Picture`） |
+| `replay` | **4.9ms** | **64%** | 回放 `Picture` → Skia **CPU** 光栅化**整个窗口** |
+| `present` | 1.2ms | 16% | 后备缓冲 → GDI `StretchDIBits` |
+| 合计 | ~7.7ms | | ×60fps ≈ 46% 单核 → 8 线程机约 6%、4 线程约 12%（= 真机看到的 10% 量级） |
+
+对照：`--no-animate` 时整段会话只渲染 **1 帧**，之后每秒 `frames/s=+0`、主线程 0 jiffies。
+
+**所以「该省的省了（静止 ≈ 0），该画的画到了刷新率」；剩下的 10% 是「软件光栅化
+整个窗口」的固有成本，和重组无关。** 唯一能真正干掉 `replay` 的是 GPU 后端（见 16.6）。
+
+### 16.4 对齐上游：SOFTWARE_FAST（零拷贝呈现）
+
+上游 skiko 的软件路径有两档：
+
+* `SOFTWARE_COMPAT`（`SoftwareContextHandler`）：画进 `Bitmap` → `readPixels` 成
+  `ByteArray` → `BufferedImage` → `drawImage`。**每帧两次整窗拷贝 + MB 级分配。**
+  （这正是本轮之前被我们优化掉的那种写法。）
+* `SOFTWARE_FAST`（`AbstractDirectSoftwareRedrawer` + `DirectSoftwareContextHandler`
+  + `awtMain/cpp/windows/SoftwareRedrawer.cc`）：**redrawer 持有 present buffer，
+  Skia 用 `SkSurfaces::WrapPixels` 直接画进去**，`finishFrame` 里 `StretchDIBits` 出去
+  —— 全程零拷贝，也是我们本轮对齐的目标。
+
+改动（`composekn_win32_backbuffer_pixels` / `composekn_win32_present_buffer`）：
+
+| 层 | 改动 |
+|---|---|
+| C 桥 | 新增 `composekn_win32_backbuffer_pixels(window,w,h)`：保证 `w*h*4` 紧密 BGRA 后备缓冲存在（尺寸变化时重分配）并返回指针；新增 `composekn_win32_present_buffer(window)`：直接 `StretchDIBits` 上传这块内存（不再拷贝） |
+| Kotlin | `WindowsSoftwareContextHandler.initCanvas` 首选 `Surface.makeRasterDirect(..., backbufferPixels(w,h), w*4)` —— Skia 直接画进 present buffer；拿不到指针时**自动回退**到旧的 `Surface.makeRaster` + `peekPixels` + 拷贝路径 |
+| 诊断 | `profile:` 行增加 `呈现=direct(wrap-pixels, zero-copy)` / `copy(...)` 字段，真机日志里一眼能看出走的是哪条路 |
+| 真机可观测 | 新增 `composekn_win32_process_cpu_nanos()`（`GetProcessTimes`）+ `composekn_win32_processor_count()`：demo 自己算 CPU 占用写进日志，**不用任务管理器** |
+
+### 16.5 真机怎么取数据（不需要看任务管理器）
+
+1. 解压发布包，双击 `windows-demo.exe`（动画版）跑 ~20 秒，关闭；
+2. 再跑一次：`windows-demo.exe --no-animate`，同样 ~20 秒；
+3. 把 exe 同目录的 **`composekn-startup.log`** 拷出来发我。
+
+要看的字段：
+
+```
+PERF-BANNER: 窗口=1100x760dp dpi=1.0 刷新率=60Hz 动画=true 逻辑核=8 日志=...
+GALLERY-STATS: fps=59.8 frames/s=60 recompose(gallery/hud/hudInner/summary)=+0/+0/+60/+60 cpu=770.0ms/s (77.0% of one core, 9.6% of 8 logical)
+profile: 120 帧  update=1.5ms  replay=4.9ms  present=1.2ms  draw+present=6.2ms  total=7.7ms  窗口=1100x760  呈现=direct(wrap-pixels, zero-copy)
+```
+
+* `recompose(...)=+0/+0/+60/+60` → 按需重组生效（根和 HUD 函数体不涨）；
+* `cpu=...ms/s (…% of one core)` → 真机 CPU 实测（`1000ms/s` = 满一个逻辑核）；
+* `--no-animate` 那份应当是：`frames/s=+0`、`fps=0.0`、`recompose` 全 0、`cpu≈0ms/s`；
+* `呈现=direct(...)` → 零拷贝路径生效。
+
+### 16.6 还没做 / 未解
+
+1. **Wine 下静止时有个副线程在烧 CPU**（最多约一个核）：主线程 0 jiffies（确实阻塞在
+   `MsgWaitForMultipleObjectsEx`），所以不是渲染循环；`gdb`/ptrace 在容器里被禁，
+   `wine notepad` 对照为 0%，无 X11 驱动时窗口建不起来 —— 暂时无法归因。
+   **真机 `--no-animate` 的 `cpu=` 字段一测就知道是不是 Wine 特有现象。**
+2. **真正的 vsync**：现在是按 `VREFRESH` 自己节流（GDI 没有 swap interval）；可以跟
+   `DwmGetCompositionTimingInfo` / `DwmFlush` 对齐。
+3. **GPU 后端（唯一能干掉 `replay` 4.9ms 的路）**：当前预编译 Skia 的 `args.gn` 里
+   `skia_use_gl / vulkan / direct3d / angle / metal` **全是 false**，`libskia.a` 里也没有
+   任何 GPU 后端符号 —— 所以要么先用 mingw 重建带 GL/ANGLE 的 Skia，再移植上游的
+   `openGLRedrawer.cc`/`AngleRedrawer.cc` + `OpenGLContextHandler.kt`，要么接受软件路径
+   的性能上限。**不做自研脏矩形/局部重绘**（那是渲染器的事，上游软件路径也没有）。
+4. **高刷屏**：`refreshHz` 只在启动时读一次；120/144Hz 屏上会按 144 次/秒整窗重绘
+   （CPU 同比上升）。需要动态重读 + 可配置上限。

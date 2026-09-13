@@ -22,6 +22,7 @@ internal class WindowsSoftwareRedrawer(
     private var profileFrames = 0
     private var profileUpdateNanos = 0L
     private var profileDrawNanos = 0L
+    private var profilePresentNanos = 0L
 
     /**
      * 「内容变了，需要重绘一帧」。
@@ -90,17 +91,11 @@ internal class WindowsSoftwareRedrawer(
         val w = window.width
         val h = window.height
         if (w <= 0 || h <= 0) return
-        if (!profileEnabled) {
-            update(currentNanoTime())
-            skiaLayer.inDrawScope {
-                contextHandler.draw()
-            }
-            return
-        }
-        // 只在 COMPOSEKN_RENDER_PROFILE=1 时计时：把每帧拆成
+        // 每帧拆成两段，用来判断「时间花在 Compose 光栅化还是窗口上传上」：
         //   update —— Compose 场景渲染（重组/布局/绘制 -> 录制 Picture）
-        //   draw   —— 回放 Picture 到 raster surface + 拷给 GDI + StretchDIBits
-        // 用来判断「还剩多少时间花在哪一步」，也是以后上 DIB section / 直接渲染的判据。
+        //   draw   —— 回放 Picture 到 raster surface + present（GDI 上传）
+        // 计时开销只有几次 QueryPerformanceCounter，始终打开，这样真机日志里
+        // （composekn-startup.log）直接就有每帧耗时，不需要额外开关。
         val t0 = currentNanoTime()
         update(t0)
         val t1 = currentNanoTime()
@@ -111,17 +106,22 @@ internal class WindowsSoftwareRedrawer(
         profileFrames++
         profileUpdateNanos += t1 - t0
         profileDrawNanos += t2 - t1
+        profilePresentNanos += contextHandler.lastBlitNanos
         if (profileFrames >= PROFILE_WINDOW_FRAMES) {
             val n = profileFrames.toDouble()
+            val replayNanos = profileDrawNanos - profilePresentNanos
             val line = "profile: ${profileFrames} 帧  update=${fmtMs(profileUpdateNanos / n)}" +
+                "  replay=${fmtMs(replayNanos.toDouble() / n)}" +
+                "  present=${fmtMs(profilePresentNanos.toDouble() / n)}" +
                 "  draw+present=${fmtMs(profileDrawNanos / n)}" +
                 "  total=${fmtMs((profileUpdateNanos + profileDrawNanos) / n)}" +
-                "  窗口=${w}x$h"
+                "  窗口=${w}x$h  呈现=${contextHandler.presentationMode}"
             println(line)
             win32Log(line)
             profileFrames = 0
             profileUpdateNanos = 0
             profileDrawNanos = 0
+            profilePresentNanos = 0
         }
     }
 
@@ -130,9 +130,6 @@ internal class WindowsSoftwareRedrawer(
 }
 
 private const val PROFILE_WINDOW_FRAMES = 120
-
-private val profileEnabled: Boolean =
-    platform.posix.getenv("COMPOSEKN_RENDER_PROFILE") != null
 
 private fun fmtMs(nanos: Double): String {
     val tenths = (nanos / 100_000.0 + 0.5).toLong()

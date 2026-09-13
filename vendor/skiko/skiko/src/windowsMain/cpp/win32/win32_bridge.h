@@ -92,6 +92,33 @@ bool composekn_win32_pop_event_flat(
 /** Present an 8-bit BGRA pixel buffer as the window client area. stride is in pixels. */
 void composekn_win32_present(ComposeKNWin32Window* window, const void* pixels, int width, int height, int stride);
 
+/**
+ * 后备缓冲（present buffer）：一块宽*高*4 字节、紧密排布的 BGRA 内存，**由 C 侧持有**。
+ *
+ * 这是对齐上游 skiko SOFTWARE_FAST 的关键（见 awtMain/cpp/windows/SoftwareRedrawer.cc
+ * 的 `SkSurfaces::WrapPixels`）：Skia 直接画进这块内存，present 时 GDI 直接从同一块
+ * 内存上传 —— 全程零拷贝。以前是 Skia 自己 allocPixels 一个 surface，每帧再
+ * peekPixels + 按行 memcpy 到这块内存（多一次整窗拷贝）。
+ *
+ * 尺寸变化时可能重新分配（返回的指针会变），调用方必须重建包装它的 Skia surface。
+ * 返回 nullptr 表示失败（调用方应回退到 `composekn_win32_present` 路径）。
+ */
+void* composekn_win32_backbuffer_pixels(ComposeKNWin32Window* window, int width, int height);
+
+/** 把当前后备缓冲上传到窗口客户区（StretchDIBits，不再拷贝像素）。 */
+void composekn_win32_present_buffer(ComposeKNWin32Window* window);
+
+/**
+ * 本进程累计 CPU 时间（内核 + 用户），单位纳秒；失败返回 -1。
+ *
+ * 用途：真机上没法方便地读任务管理器时，让 demo 自己把 CPU 占用写进日志
+ * （1000ms/秒 = 满一个逻辑核）。
+ */
+int64_t composekn_win32_process_cpu_nanos(ComposeKNWin32Window* window);
+
+/** 逻辑处理器数量（把进程 CPU 换算成「占整机百分比」用）。 */
+int32_t composekn_win32_processor_count(void);
+
 int composekn_win32_width(ComposeKNWin32Window* window);
 int composekn_win32_height(ComposeKNWin32Window* window);
 

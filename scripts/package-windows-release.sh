@@ -79,8 +79,11 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            干净退出、**性能契约**：静止不空转 / 跨线程刷新能唤醒 / 动画按刷新率节流）
   all    = 两者都跑（95 条断言）
 
-提示：`set COMPOSEKN_RENDER_PROFILE=1` 会让每 120 帧打一行渲染耗时拆解
-（Compose 渲染 vs 回放+呈现），排查性能时很有用。
+性能日志（排查 CPU/帧率时直接拷这个文件）：
+  composekn-startup.log —— exe 同目录，含启动诊断 + 每秒一行 GALLERY-STATS
+  （帧率 / 各作用域重组次数 / 本进程 CPU 占用）+ 每 120 帧一行 profile
+  （update / replay / present 耗时拆解、呈现路径 direct 还是 copy）。
+  想复现「静止」对照：再加 `--no-animate` 跑一遍（预期 frames/s=+0、cpu≈0ms/s）。
 
 日志：composekn-startup.log（exe 同目录，含启动诊断与事件日志）。
 EOF

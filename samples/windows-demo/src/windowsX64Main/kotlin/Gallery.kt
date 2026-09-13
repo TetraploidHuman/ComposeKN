@@ -70,6 +70,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.composekn.windows.WindowsComposeWindow
+import kotlin.concurrent.Volatile
 
 /**
  * 组件画廊的「观测点」。
@@ -99,8 +100,45 @@ class GalleryProbe {
     var frames by mutableStateOf(0)
     var clipboardText by mutableStateOf("")
 
+    /**
+     * 「重组到底发生在哪个作用域」的诊断计数（性能日志用）。
+     *
+     * 全部是普通字段（**不是** Compose state）：计数器本身绝不能触发失效，否则测量
+     * 就自我污染了。用 `@Volatile` 是因为性能日志可能从别的线程读。
+     *
+     * 动画每帧 `frames++` 时，预期只有**最内层**那个读了 `frames` 的作用域重组：
+     *
+     *  - [galleryComposes]：`ComponentGallery` 根作用域（**不该涨**）
+     *  - [hudComposes]：`DiagnosticsHud` 函数体（**不该涨** —— 说明失效没有往上冒）
+     *  - [hudInnerComposes]：HUD 里 `BoxWithConstraints` 的 content lambda
+     *    （真正读 `frames` 的最小作用域，按帧率增长）
+     *  - [summaryCalls]：`summary()` 被调用的次数（和 hudInner 同步增长时，
+     *    说明每帧重算的确实只有那一行文本）
+     *
+     * 这四个数放在一起就能回答「是不是全局重组」：如果 gallery/hud 跟着涨，才是真出问题。
+     */
+    @Volatile
+    var galleryComposes = 0
+
+    @Volatile
+    var hudComposes = 0
+
+    @Volatile
+    var hudInnerComposes = 0
+
+    @Volatile
+    var summaryCalls = 0
+
+    @Volatile
+    var animTicks = 0
+
     /** 供 HUD 显示的一行摘要，也是像素无关的断言点。 */
-    fun summary(): String =
+    fun summary(): String {
+        summaryCalls++
+        return summaryImpl()
+    }
+
+    private fun summaryImpl(): String =
         "clicks=$clickCount text='$text' check=$checkbox switch=$switchOn " +
             "slider=${(slider * 100).toInt()} radio=$radio theme=${if (darkTheme) "dark" else "light"} " +
             "scroll=$scrollY lazy=$lazyScrollY frames=$frames"
@@ -125,6 +163,7 @@ class GalleryProbe {
  */
 @Composable
 fun ComponentGallery(probe: GalleryProbe, window: WindowsComposeWindow) {
+    probe.galleryComposes++
     MaterialTheme(
         colorScheme = if (probe.darkTheme) darkColorScheme() else lightColorScheme(),
     ) {
@@ -145,12 +184,15 @@ fun ComponentGallery(probe: GalleryProbe, window: WindowsComposeWindow) {
 
 @Composable
 private fun DiagnosticsHud(probe: GalleryProbe, window: WindowsComposeWindow) {
+    probe.hudComposes++
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(12.dp),
     ) {
+        // 这个 lambda 是「读 frames 的最小作用域」——每帧重组的就是它（性能日志里的 hudInner）。
+        probe.hudInnerComposes++
         // 注意：LazyColumn 的 item 主轴约束是**无界**的，所以这里只用宽（有限），
         // 高度打印出来会是 Infinity.dp，徒增困惑。
         val availableWidth = maxWidth
