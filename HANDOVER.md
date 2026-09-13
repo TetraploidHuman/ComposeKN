@@ -1279,3 +1279,101 @@ profile: 120 帧  update=1.5ms  replay=4.9ms  present=1.2ms  draw+present=6.2ms 
    的性能上限。**不做自研脏矩形/局部重绘**（那是渲染器的事，上游软件路径也没有）。
 4. **高刷屏**：`refreshHz` 只在启动时读一次；120/144Hz 屏上会按 144 次/秒整窗重绘
    （CPU 同比上升）。需要动态重读 + 可配置上限。
+
+---
+
+## 17. GPU 后端对齐：阶段 0 可行性验证（2026-09-14，已完成）
+
+### 17.1 先厘清「对齐什么」
+
+真机第二轮反馈（§16）之后确认：我们不是在「CPU vs GPU」之间做过选择，而是**缺了上游
+本来就有的那一档**。上游各目标的默认后端（仓库内证据）：
+
+| 目标 | 上游默认后端 | 证据 |
+|---|---|---|
+| JVM 桌面 Windows | ANGLE 或 **DIRECT3D** | `jvmMain/.../SkikoProperties.kt:174` |
+| JVM 桌面回退链 | `[DIRECT3D, SOFTWARE_FAST, SOFTWARE_COMPAT]` | `SkikoProperties.kt:180-198` |
+| macOS native (K/N) | **METAL**（唯一允许值） | `macosMain/SkiaLayer.macos.kt:16,28` |
+| Linux native (K/N) | **OPENGL**（Wayland + EGL） | `linuxMain/SkiaLayer.linux.kt:8,12,15` |
+| Windows native (K/N) | **上游没有这个端口**；我们目前 = CPU 软件光栅 + GDI | 本文档 §15/§16 |
+
+→ 软件路径是上游的**回退**（`SOFTWARE_FAST`），不是主路线。我们之所以落在 CPU 上：
+① 上游 Windows GPU redrawer 是 MSVC-ABI + JNI（`awtMain/cpp/windows/directXRedrawer.cc`），
+K/N 的 mingwX64 是 GNU/Itanium ABI，链不上；
+② 自建的 GNU-ABI Skia 当初是**纯 CPU 构建**（`gn_args.txt` 里
+`skia_use_gl/vulkan/direct3d/angle/metal` 全 false，`libskia.a` 无任何 GPU 符号）。
+
+### 17.2 阶段 0 做了什么（本轮）
+
+| 文件 | 作用 |
+|---|---|
+| `skia-mingw/gn_args_gl.txt` | 在 CPU 参数基础上**只改两行**：`skia_use_gl = true`、`skia_enable_ganesh = true`（注意 `gn/skia.gni:193`：`skia_use_gl = skia_use_gl && skia_enable_ganesh`） |
+| `skia-mingw/build-skia-mingw-gl.sh` | 输出到 `out/mingw-gl`，**不覆盖** CPU 预编译包；幂等复用同一份 skia 源码/补丁/依赖 |
+| `skia-mingw/package-prebuilt.sh` | 新增 `SKIA_OUT_DIR` / `PKG_SUFFIX` 两个环境变量覆盖点，用来把 GL 变体打成独立预编译包 |
+| `skia-mingw/gl-smoke/gl_smoke.cpp` | **冒烟测试**：隐藏 Win32 窗口 + WGL 上下文 → `GrGLInterfaces::MakeWin()` → `GrDirectContexts::MakeGL()` → 用默认 FBO 包 `SkSurface` → `clear(红)` + `flushAndSubmit` + `readPixels` 断言 |
+| `skia-mingw/gl-smoke/run-gl-smoke.sh` | 用 mingw-g++ 编译（静态链接）并可选自动起 Xvfb + wine 跑一遍 |
+
+### 17.3 实测结果
+
+| 项 | 结果 |
+|---|---|
+| `gn gen` + `ninja` | 108 targets / **1862 个编译单元**；32 逻辑核机器上 `-j12` 约 **10 分钟** |
+| `libskia.a` | 33.30MB → **44.58MB**（Ganesh + GL 多 11.3MB） |
+| GPU 符号 | `GrDirectContexts::MakeGL` ×4、`GrGLInterfaces::MakeWin` ×1；`src/gpu/ganesh/gl/win/GrGLMakeWinInterface.cpp` 已编入 |
+| 预编译包 | `skia-mingw-m150-b8e40a7c49-gl.tar.zst` **42.8MB**（CPU 版 40.4MB） |
+| 冒烟（Wine + Mesa） | `GL_VERSION=4.6 (Compatibility Profile)` / `MakeGL OK` / `SkSurface(GPU) OK` / `readPixels=rgba(255,0,0,255)` → **PASS**（退出码 0） |
+| **K/N 链接** | 用 GL 版预编译包直接构建 demo：成功，exe 30.30MB（CPU 版 30.07MB）。**未引用的 GL 目标文件不会被拉进来**，所以软件路径**不需要新增任何链接选项** |
+| 回归 | logic 73 ✓ / window 22 ✓ / screenshot 59.8 fps ✓ —— 与 CPU 版 Skia 完全一致 |
+
+**结论：阶段 0 通过。** GPU（Ganesh + OpenGL/WGL）这条上游路线，在我们这套
+GNU-ABI 自建 Skia + K/N mingwX64 宿主上是**可行**的。
+
+### 17.4 阶段 0 的坑（都记下来，省得阶段 1 再踩）
+
+| 坑 | 症状 | 修法 |
+|---|---|---|
+| mingw 工具链要用 wrapper | 直接用 store 里的 `x86_64-w64-mingw32-g++` 绝对路径编译 → `mcfgthread/gthr.h: 没有那个文件或目录` | 用 `nix-shell ./shell.nix` 里的 `x86_64-w64-mingw32-g++`（wrapper 会注入 mcfgthread 的 `-isystem`） |
+| mcfgthread 运行库 | 冒烟 exe 导入 `libmcfgthread-2.dll` → Wine 里直接退出码 **53**（连 `main` 都没进） | 链接加 `-static`（K/N 侧则由预编译包的 `runtime/` 提供静态库） |
+| m150 的 API 变更 | `GrDirectContext::kSyncCpu_FlushType` 已不存在 | 改成 `ctx->flushAndSubmit(GrSyncCpu::kYes)` |
+| `SkColorSpace`/`SkCanvas` 前向声明 | 编译报「不完整类型」 | 显式 include `SkColorSpace.h` / `SkCanvas.h` |
+| **又一次「先怀疑度量」** | `readPixels` 回读得到「蓝」，一度以为 GPU 光栅化不对 | `SkImageInfo::MakeN32Premul` 在小端就是 **BGRA**，第一版按 RGBA 解读 → 修正解读后是标准红 |
+| Wine 的 GL 是软件 GL | `GL_RENDERER=llvmpipe` | 只能证明**链路通**；性能结论必须真机（且阶段 1 要有软件回退） |
+
+### 17.5 阶段 1 计划（照上游 K/N 的形状写，不发明新东西）
+
+上游 K/N 的 GL 蓝本就在仓库里（linuxMain）：
+
+* `cpp/wayland/wayland_egl_gl.cc`：`composekn_create_egl_direct_context()` 返回
+  `ctx.release()`（`void*`）+ `composekn_gl_viewport` / `composekn_gl_get_draw_framebuffer_binding`
+* `LinuxWaylandOpenGLContextHandler`：`DirectContext(ptr)` →
+  `BackendRenderTarget.makeGL(w,h,0,8,fbId,GR_GL_RGBA8)` →
+  `Surface.makeFromBackendRenderTarget(..., BOTTOM_LEFT, RGBA_8888, sRGB, SurfaceProps)`；
+  `flush()` 里 `surface.flushAndSubmit()`
+* `LinuxWaylandOpenGLRedrawer`：`make_current` + `swap_buffers`（+ `requestFrame`）
+
+Windows 侧对应物（**同一形状，只换平台调用**）：
+
+1. 新 C 桥 `windowsMain/cpp/win32/win32_gl.cc`：
+   `composekn_win32_gl_create_context(window)`（DC + `ChoosePixelFormat` + `wglCreateContext`，
+   有 `WGL_ARB_create_context` 时用 core 3.3 profile）→ `GrGLInterfaces::MakeWin()` →
+   `GrDirectContexts::MakeGL()` → 返回 `ctx.release()`；
+   外加 `..._make_current` / `..._viewport` / `..._get_draw_framebuffer_binding` /
+   `..._set_swap_interval(1)` / `..._swap_buffers`（`SwapBuffers`）/ `..._destroy`
+2. Kotlin：`WindowsGLContextHandler`（照 `LinuxWaylandOpenGLContextHandler` 抄结构；
+   K/N 的 skia binding 里 `DirectContext` / `BackendRenderTarget.makeGL` /
+   `Surface.makeFromBackendRenderTarget` 都已存在，linuxMain 正在用）
+3. `WindowsGLRedrawer : Redrawer`：语义与现有 `WindowsSoftwareRedrawer` 完全一致
+   （`needRender`/`renderIfRequested`/`renderImmediately` + 帧节流），present = `SwapBuffers`
+4. **回退链**：GL 创建失败（虚拟机/远程桌面/老驱动只有 GL 1.1）→ `RenderException` →
+   自动落到现有软件路径；用 `COMPOSEKN_RENDER_API=gl|software` 切换，CI 仍跑软件
+   （Wine 的 llvmpipe 性能无意义）
+5. 链接：K/N 侧 windows target 加 `opengl32`（只有真引用 GL 符号时才需要）
+6. 验证：CI 增加「GL 后端能创建、能出一帧」的断言（Wine 里有 Mesa GL）；
+   真机再做 CPU/帧率 A/B（用 §16.5 的日志格式即可）
+
+### 17.6 阶段 1 之后仍未做
+
+* **Graphite + D3D12**（上游桌面 Windows 的默认路线）：需要
+  `skia_enable_graphite=true` + `skia_use_direct3d=true`，mingw 下还要解决着色器编译链
+  （DXC），属于另一轮工程。
+* 高刷屏 / 动态刷新（§16.6）、真正的 vsync 对齐（§15.6）。

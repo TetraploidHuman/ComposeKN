@@ -17,13 +17,15 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${SKIA_MINGW_WORK:?请设置 SKIA_MINGW_WORK}"
-SKIA_OUT="$WORK/skia/out/mingw"
+# 默认打包纯 CPU 版；想打包别的变体（例如 GPU/GL 版 out/mingw-gl）时用环境变量覆盖：
+#   SKIA_OUT_DIR=$WORK/skia/out/mingw-gl PKG_SUFFIX=-gl ./package-prebuilt.sh
+SKIA_OUT="${SKIA_OUT_DIR:-$WORK/skia/out/mingw}"
 SHIM_DIR="$WORK/shim"
 PREPARED="$SHIM_DIR/patched-libs"
 SKIA_TAG="$(cat "$HERE/SKIA_TAG")"
 OUT_ROOT="$WORK/prebuilt"
 STAGE="$OUT_ROOT/stage"
-PKG_NAME="skia-mingw-$SKIA_TAG"
+PKG_NAME="skia-mingw-$SKIA_TAG${PKG_SUFFIX:-}"
 PKG_DIR="$STAGE/$PKG_NAME"
 
 info() { printf '\033[36m==>\033[0m %s\n' "$1"; }
