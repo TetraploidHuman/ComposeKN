@@ -21,6 +21,19 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.size
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 
 /**
  * Client-side title bar with minimize / maximize / close buttons.
@@ -60,12 +73,12 @@ fun WindowsWindowChrome(
             )
 
             // Window control buttons
-            WindowControlButton(label = "−", onClick = window::minimize)
+            WindowControlButton(WindowButton.Minimize, window::minimize)
             WindowControlButton(
-                label = if (window.isMaximized) "❐" else "□",
-                onClick = window::toggleMaximized,
+                if (window.isMaximized) WindowButton.Restore else WindowButton.Maximize,
+                window::toggleMaximized,
             )
-            WindowControlButton(label = "×", onClick = window::requestClose)
+            WindowControlButton(WindowButton.Close, window::requestClose)
         }
 
         // Content area
@@ -75,12 +88,53 @@ fun WindowsWindowChrome(
     }
 }
 
+private enum class WindowButton { Minimize, Maximize, Restore, Close }
+
+/**
+ * 标题栏按钮。
+ *
+ * 不用 Material3 的 TextButton + 字形文本（如 "−"/"□"/"×"）：
+ * TextButton 自带 58x40dp 最小尺寸与 12dp 内边距，塞进 46x32 的框里会被裁切；
+ * 而且这些 Unicode 字形在部分 Windows 字体下会缺字/回退成别的符号。
+ * 这里直接用 Canvas 画矢线，尺寸与形状完全可控，并补上 hover 高亮。
+ */
 @Composable
-private fun WindowControlButton(label: String, onClick: () -> Unit) {
-    TextButton(
-        onClick = onClick,
-        modifier = Modifier.width(44.dp).height(32.dp),
+private fun WindowControlButton(kind: WindowButton, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val hovered by interactionSource.collectIsHoveredAsState()
+    Box(
+        modifier = Modifier
+            .width(46.dp)
+            .height(32.dp)
+            .background(if (hovered) Color(0xFF3F3F46) else Color.Transparent)
+            .hoverable(interactionSource)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
     ) {
-        Text(label, style = MaterialTheme.typography.titleMedium, color = Color.White)
+        Canvas(Modifier.size(10.dp)) {
+            val stroke = 1.1.dp.toPx()
+            val w = size.width
+            val h = size.height
+            when (kind) {
+                WindowButton.Minimize ->
+                    drawLine(Color.White, Offset(0f, h), Offset(w, h), stroke)
+                WindowButton.Maximize ->
+                    drawRect(Color.White, topLeft = Offset.Zero, size = Size(w, h), style = Stroke(stroke))
+                WindowButton.Restore -> {
+                    drawRect(
+                        Color.White,
+                        topLeft = Offset(0f, h * 0.25f),
+                        size = Size(w * 0.75f, h * 0.75f),
+                        style = Stroke(stroke),
+                    )
+                    drawLine(Color.White, Offset(w * 0.25f, 0f), Offset(w, 0f), stroke)
+                    drawLine(Color.White, Offset(w, 0f), Offset(w, h * 0.75f), stroke)
+                }
+                WindowButton.Close -> {
+                    drawLine(Color.White, Offset.Zero, Offset(w, h), stroke)
+                    drawLine(Color.White, Offset(w, 0f), Offset(0f, h), stroke)
+                }
+            }
+        }
     }
 }

@@ -60,6 +60,10 @@ class WindowsComposeApplication(
         window.layer.renderDelegate = object : SkikoRenderDelegate {
             override fun onRender(canvas: Canvas, width: Int, height: Int, nanoTime: Long) {
                 val sizeInPx = IntSize(width, height)
+                // 每帧同步 density：初始 scene.density 是默认值(1.0)，
+                // 只在收到 ResizeEvent 时才设，会导致第一帧（HiDPI 下）UI 特别小，
+                // 直到窗口被缩放触发重组才恢复。
+                scene.density = Density(window.layer.contentScale)
                 scene.size = sizeInPx
                 with(sceneRenderingScope) {
                     scene.render(frameRecomposer, canvas.asComposeCanvas(), nanoTime)

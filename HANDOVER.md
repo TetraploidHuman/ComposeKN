@@ -702,3 +702,25 @@ Wine 下没有窗口管理器，从 X 侧（xdotool）缩放无法转成 Win32 �
 4. **缩放后重绘**
    由第 2 条的帧缓存 + `blitFrame()` 覆盖：缩放/重绘期间窗口显示上一帧（拉伸），
    不再出现白屏空窗。
+
+### 13.5 首帧尺寸/密度 + CSD 标题栏按钮（真机第二轮反馈）
+
+1. **刚启动时 UI 特别小，缩放一次才恢复正常**
+   根因：`scene.density` 只在收到 `ResizeEvent` 时才设置，而首帧渲染早于该事件，
+   于是首帧用默认 density(1.0) 布局 —— HiDPI 下画布是物理像素、density 却是 1，
+   UI 就挤在左上角。
+   修复：`SkikoRenderDelegate.onRender()` 里每帧同步 `scene.density = Density(contentScale)`。
+
+2. **标题栏按钮显示不全/图标变形、悬浮无反馈**
+   根因：按钮用 Material3 `TextButton` + 字形文本（`−` `□` `×`）。
+   `TextButton` 自带 58x40dp 最小尺寸与 12dp 内边距，塞进 44x32 的框里会被裁切；
+   这些 Unicode 字形在部分 Windows 字体下还会缺字回退（真机截图里 × 变成了 ∨）。
+   修复：改为 `Canvas` 直接画矢线（− □ ×，最大化时画双矩形表示还原），
+   尺寸完全可控；并用 `hoverable` + `collectIsHoveredAsState` 补上 hover 高亮。
+   （注意：本工程 CMP 版本没有 `pointerMoveFilter`，用 `hoverable` 实现。）
+
+3. **已知未修**：拖拽缩放过程中画面是被"拉伸/压缩"的旧帧，松手后才重绘正确。
+   原因是 Windows 的模态缩放循环运行在 wndproc 内，Kotlin 侧渲染循环在该期间
+   完全得不到执行；当前靠 `blitFrame()` 拉伸缓存帧来避免白屏。
+   彻底解决需要新增 C++ -> Kotlin 的渲染回调（`staticCFunction`），
+   在 WM_SIZE/WM_ENTERSIZEMOVE 里同步调用一次 `renderImmediately()`。
