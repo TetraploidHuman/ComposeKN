@@ -649,3 +649,29 @@ Kotlin `main` 已能执行、窗口创建成功（`WM_CREATE`/首次 `WM_PAINT`�
 
 修复后（Wine，带 `icudtl.dat`）：`main: entry` 日志正常、窗口标题正确
 `title="ComposeKN Windows Demo"`、连续运行 60 秒无崩溃。
+
+### 13.2 追加修复：Compose 界面全白（present 从未被调用）
+
+修完指针语义后 exe 能稳定运行，但**窗口客户区整片空白**（Wine 截图确认）。
+加了临时日志后一次定位：
+
+```
+swctx.initCanvas: 952x606 changed=true      <- surface/canvas 都建好了
+swctx.flush #1: grab=false ... size=0x0     <- surfaceWidth/Height 一直是 0
+```
+
+`WindowsSoftwareContextHandler.initCanvas()` 创建 raster `Surface` 时**漏了记录尺寸**：
+`surfaceWidth/surfaceHeight` 恒为 0 → `grabPixels()` 里 `if (w <= 0) return false`
+→ `pixels` 永远为空 → `present()` 静默 return → 一帧都没 blit。
+（副作用：`isSizeChanged()` 恒为 true，每帧都白白重建一次 surface。）
+
+修复：创建 surface 后记录 `surfaceWidth = w; surfaceHeight = h`。
+验证（Wine + icudtl.dat + 截图）：窗口完整渲染出
+CSD 标题栏（含三个按钮）、标题文字、输入框、按钮 —— 与设计一致。
+
+### 13.3 待验证：窗口缩放后的重绘
+Wine 下没有窗口管理器，从 X 侧（xdotool）缩放无法转成 Win32 的 `WM_SIZE`，
+因此「缩放后内容是否跟随重绘」这条路径**只能在真机验证**。
+`Win32Native.kt`/`WindowsSoftwareContextHandler` 已加轻量日志：
+- `event: resize WxH`（应用层收到 WM_SIZE）
+- `swctx.present: surface=WxH window=WxH`（每次 surface 尺寸变化时记录一次）

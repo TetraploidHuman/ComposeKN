@@ -16,6 +16,7 @@ import org.jetbrains.skiko.SkikoDispatchers
 import org.jetbrains.skia.Canvas
 import org.jetbrains.skiko.SkikoRenderDelegate
 import org.jetbrains.skiko.win32Log
+import com.composekn.windows.internal.winlog
 
 /**
  * Windows host for real Compose UI ([CanvasLayersComposeScene] + [FrameRecomposer]).
@@ -101,6 +102,7 @@ class WindowsComposeApplication(
                 scene.dispatchWindowsMouseWheelEvent(event, inputState)
             }
             is WindowsEvent.ResizeEvent -> {
+                winlog("event: resize ${event.width}x${event.height}")
                 scene.density = Density(window.layer.contentScale)
                 window.layer.needRender()
             }

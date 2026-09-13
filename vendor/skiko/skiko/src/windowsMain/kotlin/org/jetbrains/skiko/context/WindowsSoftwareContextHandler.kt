@@ -17,6 +17,8 @@ internal class WindowsSoftwareContextHandler(layer: SkiaLayer) : ContextHandler(
     private var surfaceWidth = 0
     private var surfaceHeight = 0
     private var pixels = ByteArray(0)
+    private var loggedW = -1
+    private var loggedH = -1
 
     override fun initContext(): Boolean = true // raster needs no GPU context
 
@@ -24,8 +26,14 @@ internal class WindowsSoftwareContextHandler(layer: SkiaLayer) : ContextHandler(
         ImageInfo.makeN32(w, h, ColorAlphaType.PREMUL, ColorSpace.sRGB)
 
     private fun present() {
-        val win = (layer.component as? Win32Window)?.native ?: return
+        val w32 = layer.component as? Win32Window
+        val win = w32?.native ?: return
         if (pixels.isEmpty()) return
+        if (surfaceWidth != loggedW || surfaceHeight != loggedH) {
+            loggedW = surfaceWidth
+            loggedH = surfaceHeight
+            win32Log("swctx.present: surface=${surfaceWidth}x$surfaceHeight window=${w32.width}x${w32.height}")
+        }
         pixels.usePinned { pinned ->
             composekn_win32_present(
                 win,
@@ -78,6 +86,11 @@ internal class WindowsSoftwareContextHandler(layer: SkiaLayer) : ContextHandler(
             surface = Surface.makeRaster(info, info.minRowBytes, null)
                 ?: throw RenderException("Cannot create Windows raster surface ${w}x$h")
             canvas = surface?.canvas ?: error("Could not obtain Canvas from Surface")
+            // 必须记录尺寸：grabPixels()/present() 都依赖 surfaceWidth/Height，
+            // 漏掉这里会让 pixels 永远为空、present() 静默 return（窗口全白），
+            // 而且 isSizeChanged() 恒为 true，每帧都白白重建一次 surface。
+            surfaceWidth = w
+            surfaceHeight = h
         }
     }
 
