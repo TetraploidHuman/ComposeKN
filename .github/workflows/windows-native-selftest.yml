@@ -1,0 +1,187 @@
+name: windows-native-selftest
+
+# 在 ubuntu runner 上「构建 HEAD 的 Windows 原生 exe，然后跑 exe 内置的自检」。
+#
+# 为什么 Linux 上能跑 Windows exe：
+#   * mingwX64 本来就是交叉编译目标 —— konan 的 Windows 工具链就是「在 Linux/macOS
+#     上跑的 msys2 版 clang + lld」，所以整条构建链路在 Linux 上是原生的；
+#   * exe 是纯 Win32（软件光栅 + GDI，不依赖任何 DLL），Wine 完全跑得动；
+#   * window 阶段需要 X → scripts/test-windows-native.sh 自己起 Xvfb。
+#
+# 为什么不会每次重编 Skia（从源码要半小时+、15GB 磁盘）：
+#   vendor/skiko/skia-mingw 的**预编译包**（约 40MB）把 22 个 Skia 静态库 +
+#   运行期库 + shim 一起发布在 Release 资产里，链接期只需要 konan 自带的 lld。
+#   下载见 scripts/fetch-skia-mingw.sh（带 sha256 校验），细节见
+#   vendor/skiko/skia-mingw/README-prebuilt.md。
+#
+# 为什么必须 pin nixpkgs：
+#   预编译包里的静态库是用 nixpkgs 交叉工具链（GCC 15 / UCRT / mcfgthread）构建的，
+#   宿主工具链换一个 ABI 家族就会链接失败。pin 到和本地构建时同一个 commit。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_skia:
+        description: "先从源码构建 mingw-Skia（约 40 分钟；仅在预编译资产不可用时用）"
+        type: boolean
+        default: false
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/windows-native-selftest.yml"
+      - "compose-kn-windows/**"
+      - "compose-kn-ui/**"
+      - "samples/windows-demo/**"
+      - "vendor/skiko/**"
+      - "vendor/compose-core/**"
+      - "vendor/compose-core.local/**"
+      - "build-logic/**"
+      - "scripts/**"
+      - "shell.nix"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+  pull_request:
+    paths:
+      - "compose-kn-windows/**"
+      - "samples/windows-demo/**"
+      - "vendor/skiko/**"
+      - "scripts/**"
+      - "build-logic/**"
+
+concurrency:
+  group: windows-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 本地构建预编译包时用的 nixpkgs commit（见 package-prebuilt.sh 写进 manifest.json 的值）
+  NIXPKGS_REV: c25784012c9982bca5b3e0de87e90bbdac8927d3
+  NIXPKGS_URL: https://github.com/NixOS/nixpkgs/archive/c25784012c9982bca5b3e0de87e90bbdac8927d3.tar.gz
+  SKIA_DIR: ${{ github.workspace }}/.skia-mingw
+
+jobs:
+  build-and-selftest:
+    name: 构建 exe + 原生自检
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # ⚠️ 首次上线先不阻断流水线（这套链路第一次在 CI 上跑，可能有 runner 环境差异）。
+    #    跑绿一次之后把下面这行删掉，让它成为真正的门禁。
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Print pinned nixpkgs version
+        run: nix-instantiate --eval -I nixpkgs=$NIXPKGS_URL --expr '(import <nixpkgs> {}).lib.version'
+
+      # konan 工具链 + 宿主依赖（2~3GB），命中缓存时省掉这几分钟
+      - name: Cache Kotlin/Native toolchain (~/.konan)
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('vendor/skiko/dependencies.toml', 'gradle.properties') }}
+
+      - name: Cache mingw-Skia prebuilt package
+        id: skia-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SKIA_DIR }}
+          key: skia-mingw-${{ hashFiles('vendor/skiko/skia-mingw/prebuilt.sha256', 'vendor/skiko/skia-mingw/SKIA_TAG') }}
+
+      - name: Fetch mingw-Skia prebuilt package
+        if: steps.skia-cache.outputs.cache-hit != 'true'
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd
+          ./scripts/fetch-skia-mingw.sh "$SKIA_DIR"
+          cat "$SKIA_DIR"/skia-mingw-*/manifest.json
+
+      # 从源码构建 Skia 的兜底路径（workflow_dispatch + 勾选 build_skia）
+      - name: Build mingw-Skia from source (fallback)
+        if: github.event_name == 'workflow_dispatch' && inputs.build_skia
+        run: |
+          nix-shell -p gn ninja python3 git zstd --run "
+            export SKIA_MINGW_WORK='$SKIA_DIR/src'
+            nix-shell ./shell.nix -I nixpkgs=$NIXPKGS_URL --run ./vendor/skiko/skia-mingw/build-skia-mingw.sh
+            nix-shell ./shell.nix -I nixpkgs=$NIXPKGS_URL --run ./vendor/skiko/skia-mingw/package-prebuilt.sh
+          "
+          ls -la "$SKIA_DIR"/src/prebuilt/
+
+      - name: Resolve prebuilt dir
+        id: prebuilt
+        run: |
+          if [ -f "$SKIA_DIR/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)/manifest.json" ]; then
+              dir="$SKIA_DIR/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)"
+          else
+              dir="$(find "$SKIA_DIR" -maxdepth 2 -name manifest.json -printf '%h\n' | head -1)"
+          fi
+          [ -n "$dir" ] || { echo "找不到预编译包（$SKIA_DIR）"; ls -la "$SKIA_DIR"; exit 1; }
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "使用预编译包: $dir"
+
+      - name: Build windows-demo.exe (mingwX64)
+        run: |
+          nix-shell ./shell.nix -I nixpkgs=$NIXPKGS_URL --run \
+            "SKIA_MINGW_PREBUILT='${{ steps.prebuilt.outputs.dir }}' ./vendor/skiko/skia-mingw/build-windows-native-demo.sh"
+          ls -la samples/windows-demo/build/bin/mingwX64/releaseExecutable/
+
+      # 窗口阶段（logic/window）需要 X；xwininfo/import 用于外部截图像素校验
+      - name: Install Wine + X tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth x11-utils imagemagick zstd
+          # wine 的包名在 ubuntu 20/22/24 之间变过（wine64 -> wine）
+          sudo apt-get install -y --no-install-recommends wine64 \
+            || sudo apt-get install -y --no-install-recommends wine
+          (wine --version || wine64 --version) 2>&1 | head -3
+
+      # 先把 wineprefix 建出来：第一次跑 wine 会自动创建 prefix，
+      # 而「没有 DISPLAY 时创建 prefix」在 CI 上不稳定（logic 阶段是不带 X 跑的）。
+      - name: Create Wine prefix
+        env:
+          WINEPREFIX: ${{ runner.temp }}/wineprefix
+          WINEDEBUG: -all
+        run: |
+          xvfb-run -a wineboot -u || true
+          ls "$WINEPREFIX" | head -5
+
+      - name: Run native selftest (logic + window + screenshot)
+        id: selftest
+        env:
+          SKIA_MINGW_PREBUILT: ${{ steps.prebuilt.outputs.dir }}
+          WINEPREFIX: ${{ runner.temp }}/wineprefix
+          COMPOSEKN_WINTEST_DIR: ${{ runner.temp }}/composekn-wintest
+        run: |
+          set +e
+          ./scripts/test-windows-native.sh --skip-build 2>&1 | tee "$RUNNER_TEMP/selftest.out"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Windows 原生自检（Wine + Xvfb）'
+            echo '```'
+            grep -E '^SELFTEST' "$RUNNER_TEMP/selftest.out" | tail -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Upload artifacts (exe / 日志 / 截图)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-selftest
+          if-no-files-found: warn
+          path: |
+            samples/windows-demo/build/bin/mingwX64/releaseExecutable/windows-demo.exe
+            ${{ runner.temp }}/composekn-wintest/*.log
+            ${{ runner.temp }}/composekn-wintest/*.out
+            ${{ runner.temp }}/composekn-wintest/*.png

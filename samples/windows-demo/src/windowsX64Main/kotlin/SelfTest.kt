@@ -4,6 +4,12 @@
     kotlinx.cinterop.ExperimentalForeignApi::class,
 )
 
+// LocalClipboardManager/ClipboardManager 在新版 Compose 里被标记为 deprecated
+// （推荐用 suspend 的 Clipboard 接口），但文本字段的复制/剪切/粘贴仍然会走它，
+// 而我们的 Windows 桥接正是通过 `createPlatformClipboardManager()` 装上去的 ——
+// 自检要断言的就是这条真实路径。
+@file:Suppress("DEPRECATION")
+
 package main
 
 import androidx.compose.foundation.background
@@ -13,24 +19,31 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -40,7 +53,17 @@ import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.isPrimaryPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
+import androidx.compose.ui.platform.ClipboardManager
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import com.composekn.windows.MouseButton
 import com.composekn.windows.WindowsComposeApplication
 import com.composekn.windows.WindowsEvent
@@ -78,12 +101,39 @@ private const val TEST_BG_ARGB = 0xFF102030.toInt()
 private const val TEST_MARKER_ARGB = 0xFFE53935.toInt()
 private const val TEST_IDLE_ARGB = 0xFFFF9800.toInt()
 private const val TEST_ACTIVE_ARGB = 0xFF00C853.toInt()
-private const val CHROME_ARGB = 0xFF2D2D30.toInt()
+
+/** 弹层（Popup）内容的颜色：整个界面上只有弹层用这个颜色，于是
+ *  「画面里有几个这种像素」就等于「弹层画没画、画了多大」。
+ *  故意选一个与主题无关的亮紫色，避免和 Material 主题色撞色。 */
+private const val TEST_POPUP_ARGB = 0xFFB000FF.toInt()
 
 private val TEST_BG = Color(TEST_BG_ARGB)
 private val TEST_MARKER = Color(TEST_MARKER_ARGB)
 private val TEST_IDLE = Color(TEST_IDLE_ARGB)
 private val TEST_ACTIVE = Color(TEST_ACTIVE_ARGB)
+private val TEST_POPUP = Color(TEST_POPUP_ARGB)
+
+/** 弹层内容尺寸（dp）。 */
+private const val POPUP_W_DP = 60
+private const val POPUP_H_DP = 40
+
+/** 弹层锚点在窗口内的位置（dp）；popup 的 content 从锚点左上角开始画。 */
+private const val POPUP_ANCHOR_X_DP = 400
+private const val POPUP_ANCHOR_Y_DP = 200
+
+/** 下拉菜单锚点（dp）。选在空白区域，便于断言「菜单出现前这里就是背景色」。 */
+private const val MENU_ANCHOR_X_DP = 520
+private const val MENU_ANCHOR_Y_DP = 300
+
+/** 焦点对照用的一对空输入框（左：会被点击获得焦点；右：保持未聚焦作对照）。 */
+private const val FIELD_W_DP = 220
+private const val FIELD_H_DP = 56
+private const val FIELD_TOP_DP = 170
+private const val FIELD_LEFT_X_DP = 16
+private const val FIELD_RIGHT_X_DP = 250
+
+/** CSD 标题栏颜色（见 WindowsWindowChrome）。 */
+private const val CHROME_ARGB = 0xFF2D2D30.toInt()
 
 /** CSD 标题栏高度（见 WindowsWindowChrome）。 */
 private const val CHROME_DP = 32f
@@ -91,7 +141,35 @@ private const val CHROME_DP = 32f
 class InteractionProbe {
     var clicked by mutableStateOf(false)
     var clickCount by mutableStateOf(0)
-    var text by mutableStateOf("")
+
+    /** 主输入框的内容 + 选区（选区用来断言「点击定位光标」「Ctrl+A 全选」）。 */
+    var value by mutableStateOf(TextFieldValue(""))
+
+    /** 左/右对照输入框的焦点状态（由 onFocusChanged 回填）。 */
+    var leftFocused by mutableStateOf(false)
+    var rightFocused by mutableStateOf(false)
+
+    /** 弹层开关（由自检代码直接切换，模拟「按钮点开菜单/对话框」）。 */
+    var popupOpen by mutableStateOf(false)
+    var menuOpen by mutableStateOf(false)
+    var dialogOpen by mutableStateOf(false)
+
+    /** 界面里拿到的 Compose 剪贴板管理器（窗口阶段用它做往返断言）。 */
+    var clipboardManager: ClipboardManager? = null
+
+    /**
+     * `LocalWindowInfo.current.containerSize`。
+     *
+     * 这条不是「顺手也测一下」：Popup/Dialog 的定位与裁剪完全依赖它，
+     * 宿主忘了喂尺寸时弹层会全部塌到窗口左上角（见 WindowsWindowInfo 的注释）。
+     */
+    var windowContainerSize by mutableStateOf(IntSize.Zero)
+
+    val text: String get() = value.text
+
+    fun setText(text: String) {
+        value = TextFieldValue(text, TextRange(text.length))
+    }
 }
 
 @Composable
@@ -99,12 +177,23 @@ private fun DeterministicTestScreen(
     probe: InteractionProbe,
     scrollState: ScrollState,
 ) {
+    // 拿一份 Compose 剪贴板管理器交给探针：窗口阶段要用它做「Compose API -> skiko
+    // 里的 Windows 桥接 -> Win32 剪贴板 -> 再读回来」的端到端断言。
+    val clipboard = LocalClipboardManager.current
+    SideEffect { probe.clipboardManager = clipboard }
+
+    // 容器尺寸（Popup/Dialog 的定位依据）
+    val windowInfo = LocalWindowInfo.current
+    SideEffect { probe.windowContainerSize = windowInfo.containerSize }
+
     MaterialTheme {
         Box(Modifier.fillMaxSize().background(TEST_BG)) {
-            // 单行输入框：顶部，留 16dp 边距，占满剩余宽度
+            // 单行输入框：顶部，留 16dp 边距，占满剩余宽度。
+            // 用 TextFieldValue（而不是 String）是为了能断言**选区/光标位置**
+            // —— 点击定位、Ctrl+A 全选、Ctrl+C 复制都靠它来验证。
             OutlinedTextField(
-                value = probe.text,
-                onValueChange = { probe.text = it },
+                value = probe.value,
+                onValueChange = { probe.value = it },
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(16.dp)
@@ -141,6 +230,62 @@ private fun DeterministicTestScreen(
                     },
             )
 
+            // 一对**内容为空**的输入框：只被用来观察「聚焦」这一件事。
+            // 空框 → 里面没有文字干扰，聚焦导致的像素变化只可能来自
+            // 边框颜色（primary vs outline）和光标。
+            // 两个框别的都一样，所以「左边有焦点、右边没焦点」时
+            // 「左框区域像素变了、右框区域像素一点没变」是最干净的断言。
+            FocusProbeField(
+                focused = { probe.leftFocused = it },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = FIELD_LEFT_X_DP.dp, y = FIELD_TOP_DP.dp)
+                    .size(FIELD_W_DP.dp, FIELD_H_DP.dp),
+            )
+            FocusProbeField(
+                focused = { probe.rightFocused = it },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = FIELD_RIGHT_X_DP.dp, y = FIELD_TOP_DP.dp)
+                    .size(FIELD_W_DP.dp, FIELD_H_DP.dp),
+            )
+
+            // 弹层锚点：一个零尺寸的 Box。Popup 的内容从锚点左上角开始画，
+            // 于是「亮紫色像素的包围盒」就等于弹层位置 + 尺寸 —— 位置和尺寸都能断言。
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = POPUP_ANCHOR_X_DP.dp, y = POPUP_ANCHOR_Y_DP.dp),
+            ) {
+                if (probe.popupOpen) {
+                    Popup(
+                        onDismissRequest = { probe.popupOpen = false },
+                        offset = IntOffset(0, 0),
+                        properties = PopupProperties(
+                            focusable = false,
+                            dismissOnClickOutside = false,
+                        ),
+                    ) {
+                        Box(Modifier.size(POPUP_W_DP.dp, POPUP_H_DP.dp).background(TEST_POPUP))
+                    }
+                }
+            }
+
+            // 下拉菜单（Material 的真实弹层 + 自己的背景/阴影）
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = MENU_ANCHOR_X_DP.dp, y = MENU_ANCHOR_Y_DP.dp),
+            ) {
+                DropdownMenu(
+                    expanded = probe.menuOpen,
+                    onDismissRequest = { probe.menuOpen = false },
+                ) {
+                    DropdownMenuItem(text = { Text("menu item A") }, onClick = {})
+                    DropdownMenuItem(text = { Text("menu item B") }, onClick = {})
+                }
+            }
+
             // 底部滚动区（滚轮测试）。
             // ScrollState 由调用方注入：断言时直接读 `scrollState.value`，
             // 不依赖 snapshotFlow/launched-effect 的调度时机。
@@ -160,8 +305,34 @@ private fun DeterministicTestScreen(
                     )
                 }
             }
+
+            // 对话框（比弹层更重的一层：带遮罩 + 自己的窗口/图层）
+            if (probe.dialogOpen) {
+                AlertDialog(
+                    onDismissRequest = { probe.dialogOpen = false },
+                    title = { Text("selftest dialog") },
+                    text = { Text("对话框图层的内容") },
+                    confirmButton = { TextButton(onClick = { probe.dialogOpen = false }) { Text("OK") } },
+                )
+            }
         }
     }
+}
+
+/** 只用来观测焦点的空输入框（内容永远是空串，不接受输入）。 */
+@Composable
+private fun FocusProbeField(
+    focused: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var text by remember { mutableStateOf("") }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { text = it },
+        modifier = modifier.onFocusChanged { focused(it.isFocused) },
+        singleLine = true,
+        label = { Text("focus probe") },
+    )
 }
 
 /**
@@ -400,7 +571,111 @@ private fun renderChecks(report: SelfTestReport) {
         "down=$scrolledDown afterUp=${scrollState.value}",
     )
 
-    // 2.7 画廊本身必须能渲染（组件覆盖面最大的那条路径）
+    // 2.7 焦点 / 光标 / 选区
+    //
+    // 一对内容为空的输入框：左边点击后必须有焦点、右边必须没有；而且
+    // 「左框区域的像素变了、右框区域一点没变」—— 说明焦点是**可见**的
+    // （Material 的聚焦边框 + 光标），而不是只更新了内部状态。
+    val beforeFocus = driver.render(800, 600, density = d, frames = 6)
+    // 宿主必须把窗口尺寸喂给 LocalWindowInfo（弹层定位全依赖它）
+    report.checkEquals("window-info/container-size", IntSize(800, 600), probe.windowContainerSize)
+    report.check(
+        "focus/initially-unfocused",
+        !probe.leftFocused && !probe.rightFocused,
+        "left=${probe.leftFocused} right=${probe.rightFocused}",
+    )
+    click(app, FIELD_LEFT_X_DP + FIELD_W_DP / 2, contentTop + FIELD_TOP_DP + FIELD_H_DP / 2)
+    // 边框颜色有 ~150ms 过渡动画：多跑几帧等它走完，像素断言才是确定的
+    val afterFocus = driver.render(800, 600, density = d, frames = 24)
+    report.check(
+        "focus/click-focuses-left-field",
+        probe.leftFocused,
+        "left=${probe.leftFocused} right=${probe.rightFocused}",
+    )
+    report.check("focus/click-leaves-right-field", !probe.rightFocused)
+    val leftX0 = FIELD_LEFT_X_DP
+    val leftX1 = FIELD_LEFT_X_DP + FIELD_W_DP
+    val rightX0 = FIELD_RIGHT_X_DP
+    val rightX1 = FIELD_RIGHT_X_DP + FIELD_W_DP
+    val fieldY0 = contentTop + FIELD_TOP_DP
+    val fieldY1 = contentTop + FIELD_TOP_DP + FIELD_H_DP
+    val leftChanged = afterFocus.regionDiff(beforeFocus, leftX0, fieldY0, leftX1, fieldY1)
+    val rightChanged = afterFocus.regionDiff(beforeFocus, rightX0, fieldY0, rightX1, fieldY1)
+    report.check("focus/focused-field-visible-change", leftChanged > 0, "左框变化像素=$leftChanged")
+    report.check("focus/unfocused-field-unchanged", rightChanged == 0, "右框变化像素=$rightChanged")
+
+    // 光标定位：主输入框里已经打过 "CK"（见 2.5）。点最右端 -> 光标到末尾；
+    // 点文字左侧 -> 光标回到开头。这条断言走的是
+    // 「文本排版 -> 命中测试 -> 选区」整条链路。
+    click(app, 700, contentTop + 44)
+    driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals("caret/click-right-end", 2, probe.value.selection.start)
+    click(app, 20, contentTop + 44)
+    driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals("caret/click-left-start", 0, probe.value.selection.start)
+    report.check("caret/selection-collapsed", probe.value.selection.collapsed)
+
+    // 选区 + 编辑命令（不需要窗口、也就能在离屏阶段测的部分）
+    click(app, 700, contentTop + 44)
+    ctrlKey(app, 0x41) // Ctrl+A 全选
+    driver.render(800, 600, density = d, frames = 3)
+    report.checkEquals("selection/ctrl-a-selects-all", TextRange(0, 2), probe.value.selection)
+    typeChar(app, 'Z') // 输入应当**替换**选区
+    driver.render(800, 600, density = d, frames = 3)
+    report.checkEquals("selection/typing-replaces-selection", "Z", probe.text)
+    ctrlKey(app, 0x41)
+    keyPress(app, 0x08) // VK_BACK：删除选区
+    driver.render(800, 600, density = d, frames = 3)
+    report.checkEquals("selection/backspace-deletes-selection", "", probe.text)
+
+    // 2.8 弹层（Popup）：独立图层必须画在同一张 surface 上，位置和尺寸都要对得上。
+    // 弹层内容是唯一的亮紫色，於是「包围盒」就等于「弹层的位置 + 尺寸」。
+    val noPopup = driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals(
+        "popup/closed-no-pixels",
+        0,
+        noPopup.countColor(TEST_POPUP_ARGB, tolerance = 2),
+    )
+    probe.popupOpen = true
+    val popupFrame = driver.render(800, 600, density = d, frames = 8)
+    val popupPixels = popupFrame.countColor(TEST_POPUP_ARGB, tolerance = 2)
+    report.checkNear("popup/open-pixel-count", POPUP_W_DP * POPUP_H_DP, popupPixels, 80)
+    val popupBounds = popupFrame.boundsOf(TEST_POPUP_ARGB, tolerance = 2)
+    report.check(
+        "popup/open-bounds",
+        popupBounds != null &&
+            popupBounds.width in (POPUP_W_DP - 2)..(POPUP_W_DP + 2) &&
+            popupBounds.height in (POPUP_H_DP - 2)..(POPUP_H_DP + 2),
+        "bounds=$popupBounds",
+    )
+    report.check(
+        "popup/anchored-at-offset",
+        popupBounds != null &&
+            abs(popupBounds.minX - POPUP_ANCHOR_X_DP) <= 4 &&
+            abs(popupBounds.minY - (POPUP_ANCHOR_Y_DP + contentTop)) <= 4,
+        "expected=($POPUP_ANCHOR_X_DP,${POPUP_ANCHOR_Y_DP + contentTop}) actual=$popupBounds",
+    )
+    probe.popupOpen = false
+
+    // 2.9 下拉菜单（Material 的真实弹层：带自己的背景/阴影/间距）
+    val menuX0 = MENU_ANCHOR_X_DP
+    val menuY0 = MENU_ANCHOR_Y_DP + contentTop
+    val menuX1 = MENU_ANCHOR_X_DP + 260
+    val menuY1 = MENU_ANCHOR_Y_DP + contentTop + 130
+    val menuClosed = driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals(
+        "menu/closed-region-is-background",
+        0,
+        menuClosed.nonBackgroundCountInRegion(TEST_BG_ARGB, menuX0, menuY0, menuX1, menuY1),
+    )
+    probe.menuOpen = true
+    val menuFrame = driver.render(800, 600, density = d, frames = 8)
+    val menuPixels = menuFrame.nonBackgroundCountInRegion(TEST_BG_ARGB, menuX0, menuY0, menuX1, menuY1)
+    report.check("menu/open-draws-content", menuPixels > 1000, "区域非背景像素=$menuPixels")
+    probe.menuOpen = false
+    driver.render(800, 600, density = d, frames = 4)
+
+    // 2.10 画廊本身必须能渲染（组件覆盖面最大的那条路径）
     val galleryProbe = GalleryProbe()
     val galleryApp = WindowsComposeApplication(title = "gallery", width = 960, height = 700)
     galleryApp.setContent(withChrome = false) { ComponentGallery(galleryProbe, galleryApp.window) }
@@ -412,7 +687,7 @@ private fun renderChecks(report: SelfTestReport) {
     )
     galleryApp.close()
 
-    // 2.8 回归：首帧渲染之前到达的指针事件不得崩。
+    // 2.11 回归：首帧渲染之前到达的指针事件不得崩。
     // 曾经的 bug：scene.size 还是 0 → measureAndLayout 拿到无界约束 →
     // LazyColumn 抛 "measured with an infinity maximum height constraints" →
     // 真机上窗口刚出现就崩。这里故意在渲染前派一个鼠标事件。
@@ -433,6 +708,34 @@ private fun renderChecks(report: SelfTestReport) {
         earlyError?.let { "${it::class.simpleName}: ${it.message?.take(240)}" } ?: "",
     )
     earlyApp.close()
+
+    // 2.12 对话框：遮罩 + 独立内容层（比 Popup 更重的一层）
+    //
+    // 放在最后：对话框一旦打开会吃掉后续指针事件（点遮罩 = 关闭），
+    // 前面的交互断言必须在它之前全部跑完。
+    val beforeDialog = driver.render(800, 600, density = d, frames = 4)
+    // 角落是 CSD 标题栏（chrome），不是内容背景 —— 断言时别搞混
+    report.checkEquals("dialog/closed-corner-is-chrome", CHROME_ARGB, beforeDialog.colorAt(2, 2))
+    report.checkEquals("dialog/closed-content-is-bg", TEST_BG_ARGB, beforeDialog.colorAt(700, 300))
+    val closedCenterRow = avgLuminanceInRow(beforeDialog, 300, 200, 600)
+    probe.dialogOpen = true
+    val dialogFrame = driver.render(800, 600, density = d, frames = 12)
+    report.check(
+        "dialog/scrim-dims-content",
+        luminance(dialogFrame.colorAt(700, 300)) < luminance(beforeDialog.colorAt(700, 300)),
+        "before=${luminance(beforeDialog.colorAt(700, 300))} after=${luminance(dialogFrame.colorAt(700, 300))}",
+    )
+    val centerRowPixels = dialogFrame.nonBackgroundCountInRow(300, TEST_BG_ARGB)
+    report.check("dialog/visible-content-row", centerRowPixels > 400, "row300 非背景像素=$centerRowPixels")
+    // 对话框必须**居中**：容器尺寸为 0 时它会塌到左上角（真实 bug），
+    // 此时中间这一行仍然是「被遮罩压暗的背景」，亮度不会有明显提升。
+    val openCenterRow = avgLuminanceInRow(dialogFrame, 300, 200, 600)
+    report.check(
+        "dialog/centered-bright-surface",
+        openCenterRow > closedCenterRow + 40,
+        "中间行平均亮度 关闭=$closedCenterRow 打开=$openCenterRow",
+    )
+    probe.dialogOpen = false
 
     app.close()
 }
@@ -458,6 +761,11 @@ private fun runWindowTests(report: SelfTestReport) {
                 "size=${w.logicalWidth}x${w.logicalHeight}",
             )
             report.check("window/dpi-scale", w.dpiScale >= 1.0f, "dpi=${w.dpiScale}")
+            report.check(
+                "window/container-size-nonzero",
+                probe.windowContainerSize.width > 0 && probe.windowContainerSize.height > 0,
+                "container=${probe.windowContainerSize} logical=${w.logicalWidth}x${w.logicalHeight}",
+            )
             val native = w.nativeWindow
             report.check("window/native-handle", native != null)
             if (native != null) {
@@ -491,14 +799,63 @@ private fun runWindowTests(report: SelfTestReport) {
             val scale = app.window.dpiScale
             wheel(app, (450 * scale).toInt(), (540 * scale).toInt(), deltaY = -3)
         }
-        if (frame == 40) {
+        if (frame == 18) {
+            // Compose 层剪贴板（LocalClipboardManager）-> skiko 的 Windows 桥接
+            // -> Win32 剪贴板：三条路径必须看到同一份内容。
+            val cm = probe.clipboardManager
+            report.check("window/compose-clipboard-manager", cm != null)
+            if (cm != null) {
+                cm.setText(AnnotatedString(SELFTEST_CLIPBOARD))
+                report.checkEquals("window/compose-clipboard-readback", SELFTEST_CLIPBOARD, cm.getText()?.text)
+                report.checkEquals(
+                    "window/compose-clipboard-reaches-win32",
+                    SELFTEST_CLIPBOARD,
+                    app.window.nativeWindow?.clipboard,
+                )
+            }
+        }
+        if (frame == 24) {
+            // 把焦点给主输入框（真实点击，坐标含 CSD 标题栏高度）
+            val scale = app.window.dpiScale
+            click(app, (400 * scale).toInt(), ((44 + CHROME_DP) * scale).toInt())
+        }
+        if (frame == 28) {
+            typeChar(app, 'C')
+            typeChar(app, 'K')
+        }
+        if (frame == 36) {
+            // 全选。注意：这一步只是「把 legacy TextFieldValue 的选区改成 (0,2)」，
+            // 新老文本状态之间的同步是按帧走的 —— 同一个事件突发里紧接着发 Ctrl+C，
+            // 复制会看到还没同步过去的（折叠的）选区而被丢弃。真实用户按键之间隔着
+            // 几帧，所以下面的复制/剪切都和选择操作**分帧**发（见 42/58 帧）。
+            ctrlKey(app, 0x41)
+            report.checkEquals("window/ctrl-a-selects-all", TextRange(0, 2), probe.value.selection)
+        }
+        if (frame == 42) {
+            ctrlKey(app, 0x43) // Ctrl+C
+        }
+        if (frame == 52) {
+            report.checkEquals("window/ctrl-c-keeps-text", "CK", probe.text)
+            report.checkEquals("window/ctrl-c-copies-to-win32", "CK", app.window.nativeWindow?.clipboard)
+            ctrlKey(app, 0x41)
+        }
+        if (frame == 58) {
+            ctrlKey(app, 0x58) // Ctrl+X（剪切）
+        }
+        if (frame == 68) {
+            report.checkEquals("window/ctrl-x-clears-field", "", probe.text)
+            report.checkEquals("window/ctrl-x-copies", "CK", app.window.nativeWindow?.clipboard)
+            ctrlKey(app, 0x56) // Ctrl+V（粘贴）
+        }
+        if (frame == 78) {
+            report.checkEquals("window/ctrl-v-pastes", "CK", probe.text)
             report.checkEquals("window/click-reaches-compose", 1, probe.clickCount)
             report.check(
                 "window/wheel-scroll",
                 scrollState.value > 0,
                 "value=${scrollState.value} maxValue=${scrollState.maxValue}",
             )
-            report.check("window/frame-count", app.window.frameCount >= 40, "frames=${app.window.frameCount}")
+            report.check("window/frame-count", app.window.frameCount >= 78, "frames=${app.window.frameCount}")
             app.window.requestClose()
         }
         if (frame > 200) {
@@ -539,6 +896,36 @@ private fun typeChar(app: WindowsComposeApplication, char: Char) {
     app.pumpDispatchers()
 }
 
+/**
+ * 合成一次「按住 Ctrl 再按某个键」（真实的四条消息：Ctrl↓ 键↓ 键↑ Ctrl↑）。
+ *
+ * 键位信息走 [WindowsEvent.KeyEvent.isCtrlPressed]，与消息泵里的
+ * `GetKeyState(VK_CONTROL)` 结果一致。
+ */
+private fun ctrlKey(app: WindowsComposeApplication, vk: Int) {
+    val ctrlVk = 0x11
+    app.dispatchEvent(
+        WindowsEvent.KeyEvent(virtualKeyCode = ctrlVk, scanCode = 0, isKeyDown = true, isCtrlPressed = true),
+    )
+    app.dispatchEvent(
+        WindowsEvent.KeyEvent(virtualKeyCode = vk, scanCode = 0, isKeyDown = true, isCtrlPressed = true),
+    )
+    app.dispatchEvent(
+        WindowsEvent.KeyEvent(virtualKeyCode = vk, scanCode = 0, isKeyDown = false, isCtrlPressed = true),
+    )
+    app.dispatchEvent(
+        WindowsEvent.KeyEvent(virtualKeyCode = ctrlVk, scanCode = 0, isKeyDown = false),
+    )
+    app.pumpDispatchers()
+}
+
+/** 合成一次普通按键（按下 + 抬起），不带修饰键。 */
+private fun keyPress(app: WindowsComposeApplication, vk: Int) {
+    app.dispatchEvent(WindowsEvent.KeyEvent(virtualKeyCode = vk, scanCode = 0, isKeyDown = true))
+    app.dispatchEvent(WindowsEvent.KeyEvent(virtualKeyCode = vk, scanCode = 0, isKeyDown = false))
+    app.pumpDispatchers()
+}
+
 /** 统计两帧在 [y0, y1] 行范围内的不同像素数（用于「内容确实滚动了」这类断言）。 */
 private fun diffPixels(a: FrameSnapshot, b: FrameSnapshot, y0: Int, y1: Int): Int {
     if (a.width != b.width || a.height != b.height) return Int.MAX_VALUE
@@ -549,6 +936,25 @@ private fun diffPixels(a: FrameSnapshot, b: FrameSnapshot, y0: Int, y1: Int): In
         }
     }
     return n
+}
+
+/** 感知亮度（0..255），用于「遮罩让画面变暗了」这类断言。 */
+private fun luminance(argb: Int): Int {
+    val r = (argb shr 16) and 0xFF
+    val g = (argb shr 8) and 0xFF
+    val b = argb and 0xFF
+    return (r * 299 + g * 587 + b * 114) / 1000
+}
+
+/** 某一行的平均亮度（用于「这一行整体变亮了 = 中间画了浅色东西」）。 */
+private fun avgLuminanceInRow(a: FrameSnapshot, y: Int, x0: Int, x1: Int): Int {
+    var sum = 0L
+    var n = 0
+    for (x in x0..x1) {
+        sum += luminance(a.colorAt(x, y))
+        n++
+    }
+    return if (n == 0) 0 else (sum / n).toInt()
 }
 
 private fun wheel(app: WindowsComposeApplication, x: Int, y: Int, deltaY: Int) {

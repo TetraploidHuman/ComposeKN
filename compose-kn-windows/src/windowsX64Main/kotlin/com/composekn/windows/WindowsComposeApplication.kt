@@ -95,8 +95,11 @@ class WindowsComposeApplication(
         //   IllegalStateException: Vertically scrollable component was measured with
         //   an infinity maximum height constraints ...
         // （真机上窗口创建后消息泵里通常已经排着鼠标 Enter/Move，因此表现为启动即崩。）
-        scene.size = initialSceneSize()
+        val initialSize = initialSceneSize()
+        scene.size = initialSize
         scene.density = effectiveDensity()
+        // 第一次组合之前就要有正确的容器尺寸（Popup/Dialog 可能首帧就存在）
+        platformContext.updateContainerSize(initialSize, scene.density)
         scene.setContent {
             if (withChrome) {
                 WindowsWindowChrome(title = title, window = window, content = content)
@@ -123,7 +126,12 @@ class WindowsComposeApplication(
         // 每帧同步 density：初始 scene.density 是默认值(1.0)，
         // 只在收到 ResizeEvent 时才设，会导致第一帧（HiDPI 下）UI 特别小，
         // 直到窗口被缩放触发重组才恢复。
-        scene.density = effectiveDensity()
+        val density = effectiveDensity()
+        // 容器尺寸必须在 scene.size / measure **之前**同步：Popup/Dialog 的
+        // measure policy 直接读 `LocalWindowInfo.current.containerSize` 来定位和裁剪，
+        // 缺了它弹层会被夹到 (0,0)（见 WindowsWindowInfo 的注释）。
+        platformContext.updateContainerSize(IntSize(width, height), density)
+        scene.density = density
         scene.size = IntSize(width, height)
         with(sceneRenderingScope) {
             scene.render(frameRecomposer, canvas.asComposeCanvas(), nanoTime)

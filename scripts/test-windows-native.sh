@@ -12,15 +12,28 @@
 #   nix-shell -p wine64 xvfb xauth imagemagick xwininfo \
 #       --run ./scripts/test-windows-native.sh
 #
-#   --skip-build   不重新链接，直接用现有的 exe
+#   --skip-build    不重新链接，直接用现有的 exe
+#   --exe=PATH      用指定的 exe（隐含 --skip-build；CI 从构建产物里取）
 #   --no-screenshot 跳过截图阶段（没有 X 时）
-#   --only=<phase> 只跑某个阶段: logic|window|screenshot
+#   --only=<phase>  只跑某个阶段: logic|window|screenshot
+#
+# 环境变量：
+#   SKIA_MINGW_PREBUILT=<dir>  预编译 mingw-Skia 包（跳过 Skia 构建，icudtl.dat 从这里取）
+#   SKIA_MINGW_WORK=<dir>      从源码构建时的 Skia 工作目录
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXE="$REPO/samples/windows-demo/build/bin/mingwX64/releaseExecutable/windows-demo.exe"
+EXE_OVERRIDE=""
 SKIA_WORK="${SKIA_MINGW_WORK:-/mnt/hdd2/KtLLM/skia-mingw}"
-ICUDTL="$SKIA_WORK/skia/out/mingw/icudtl.dat"
+# 预编译包模式（CI 用，见 vendor/skiko/skia-mingw/README-prebuilt.md）：
+# 不构建 Skia，直接用下载好的静态库；icudtl.dat 也在包里。
+PREBUILT="${SKIA_MINGW_PREBUILT:-}"
+if [ -n "$PREBUILT" ]; then
+    ICUDTL="$PREBUILT/icudtl.dat"
+else
+    ICUDTL="$SKIA_WORK/skia/out/mingw/icudtl.dat"
+fi
 RUN_DIR="${COMPOSEKN_WINTEST_DIR:-/tmp/composekn-wintest}"
 export WINEPREFIX="${WINEPREFIX:-/mnt/hdd2/KtLLM/wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"
@@ -34,6 +47,7 @@ for arg in "$@"; do
         --skip-build) SKIP_BUILD=1 ;;
         --no-screenshot) DO_SCREENSHOT=0 ;;
         --only=*) ONLY="${arg#--only=}" ;;
+        --exe=*) EXE_OVERRIDE="${arg#--exe=}"; SKIP_BUILD=1 ;;
         -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
         *) echo "未知参数: $arg" >&2; exit 2 ;;
     esac
@@ -48,11 +62,18 @@ info() { printf '\033[36m==>\033[0m %s\n' "$1"; }
 
 # ---------------------------------------------------------------- 0. 构建
 if [ "$SKIP_BUILD" = "0" ]; then
-    info "构建 windows-demo.exe（mingw-Skia，约 7 分钟）"
-    SKIA_MINGW_WORK="$SKIA_WORK" \
-        nix-shell "$REPO/shell.nix" --run "$REPO/vendor/skiko/skia-mingw/build-windows-native-demo.sh"
+    if [ -n "$PREBUILT" ]; then
+        info "构建 windows-demo.exe（预编译 mingw-Skia：$PREBUILT）"
+        nix-shell "$REPO/shell.nix" \
+            --run "SKIA_MINGW_PREBUILT='$PREBUILT' '$REPO/vendor/skiko/skia-mingw/build-windows-native-demo.sh'"
+    else
+        info "构建 windows-demo.exe（mingw-Skia，约 7 分钟）"
+        SKIA_MINGW_WORK="$SKIA_WORK" \
+            nix-shell "$REPO/shell.nix" --run "$REPO/vendor/skiko/skia-mingw/build-windows-native-demo.sh"
+    fi
 fi
-[ -f "$EXE" ] || { echo "找不到 $EXE（先用 build-windows-native-demo.sh 构建）" >&2; exit 1; }
+[ -n "$EXE_OVERRIDE" ] && EXE="$EXE_OVERRIDE"
+[ -f "$EXE" ] || { echo "找不到 $EXE（先用 build-windows-native-demo.sh 构建，或用 --exe= 指定）" >&2; exit 1; }
 
 # exe 必须和 icudtl.dat 同目录（SkLoadICU 找不到数据文件会导致文本排版失败）
 mkdir -p "$RUN_DIR"

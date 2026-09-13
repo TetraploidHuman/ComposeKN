@@ -889,28 +889,27 @@ WHEELLOGIC: onMouseWheel delta=Offset(0.0, 18.0) reversed=Offset(0.0, -18.0) can
 
 ### 14.6 后续项（尚未做）
 
-1. **CI 上跑 Windows 原生自检**：需要在 runner 里构建 mingw-Skia
-   （把 `build-skia-mingw.sh` 从 nix 迁到 MSYS2 mingw-w64 + CIPD 的 `gn`，约 30–60 分钟，
-   可缓存 `skia/out/mingw`），之后 `windows-native-selftest` job 只需
-   `COMPOSEKN_SELFTEST=all` + 断言退出码。当前 CI 只跑 §14.3 的纯逻辑单测。
-2. 弹层（`DropdownMenu`/`AlertDialog`）目前只验证「能编译、画廊能渲染」，
-   还没有「点开菜单 → 断言弹层像素」的自检用例。
-3. 文本编辑器能力（选区/光标/`Ctrl+A`/`Ctrl+C`）还没有自动化断言；
-   Compose 层的剪贴板（`PlatformContext.clipboard`）仍是 `Empty()`，
-   目前只有 `Win32Window.clipboard` 走通了桥接往返。
-4. Wayland 侧滚轮方向需要真机/合成器复验（本次只在 Windows 路径上做了端到端断言）。
+> **2026-09-13 第二轮更新**：下面第 1/2/3 项已完成（见 §14.8 补充断言、§14.9 第 5 个真 bug、
+> §14.10 CI）；第 4 项（Wayland 滚轮方向真机复验）仍待办，另新增第 5 项。
+
+1. ~~CI 上跑 Windows 原生自检~~ ✅ 见 §14.10（`windows-native-selftest.yml`）
+2. ~~弹层（`DropdownMenu`/`AlertDialog`）像素断言~~ ✅ 见 §14.8
+3. ~~选区/光标/`Ctrl+A`/`Ctrl+C` 断言~~ ✅ 见 §14.8 —— 补断言过程本身抓出了第 5 个真 bug（§14.9）
+4. Wayland 侧滚轮方向需要真机/合成器复验（目前只在 Windows 路径上做了端到端断言）。
+5. CI job 首次跑绿之后，把 `.github/workflows/windows-native-selftest.yml` 里的
+   `continue-on-error: true` 删掉，让它变成真正的门禁（保留 `build_skia` 兜底入口）。
 
 ### 14.7 本次自检结果（Wine + Xvfb，Linux 主机）
 
 ```
 $ nix-shell -p wine64 xvfb xauth imagemagick xwininfo \
-      --run ./scripts/test-windows-native.sh
+      --run ./scripts/test-windows-native.sh --skip-build
 ==> 阶段 logic (COMPOSEKN_SELFTEST=logic)
-✓ logic: RESULT PASS (50 checks)
+✓ logic: RESULT PASS (73 checks)
 ==> 阶段 window (COMPOSEKN_SELFTEST=window)
-✓ window: RESULT PASS (8 checks)
+✓ window: RESULT PASS (18 checks)
 ==> 阶段 screenshot（抓真实窗口 PNG 并检查像素）
-✓ screenshot: 窗口已抓取（74093 bytes）
+✓ screenshot: 窗口已抓取（74072 bytes）
 ✓ screenshot: 标题栏颜色 = srgb(45,45,48)
 ✓ screenshot: 颜色数 1261（界面确实画出了内容，不是空白窗口）
 全部通过 ✅
@@ -919,3 +918,109 @@ $ nix-shell -p wine64 xvfb xauth imagemagick xwininfo \
 ```
 $ ./gradlew :compose-kn-tests:linuxX64Test       # 20 个用例全绿
 ```
+
+### 14.8 补充断言：弹层 / 焦点 / 选区 / 剪贴板（第二轮）
+
+`logic` 阶段 **50 → 73** 条，`window` 阶段 **8 → 18** 条。
+
+**`logic`（离屏光栅化 + 像素/状态断言）新增 23 条：**
+
+| 断言 | 断言的是什么 |
+|---|---|
+| `window-info/container-size` | 宿主把窗口尺寸喂给了 `LocalWindowInfo`（第 5 个 bug 的护栏，见 §14.9） |
+| `focus/initially-unfocused` … `focus/unfocused-field-identical` | 点击让**左**输入框获得焦点；聚焦后左框区域像素发生变化，而右边那个一模一样的对照框**一个像素都没变** —— 证明「焦点可见」（边框 + 光标），不只是内部状态 |
+| `caret/click-right-end` / `caret/click-left-start` | 点击定位光标：点最右端 → 选区到末尾，点文字左侧 → 回到开头（走「文本排版 → 命中测试 → 选区」全链路） |
+| `selection/ctrl-a-selects-all` | Ctrl+A 全选 = `TextRange(0, 2)` |
+| `selection/typing-replaces-selection` | 有选区时输入**替换**选区而不是插入 |
+| `selection/backspace-deletes-selection` | 有选区时退格删除整段 |
+| `popup/closed-no-pixels` / `open-pixel-count` / `open-bounds` / `anchored-at-offset` | `Popup` 图层：关闭时画面上一个弹层色像素都没有；打开后包围盒恰好 60×40，且左上角落在锚点 `(400, 200 + chrome)` 上 |
+| `menu/closed-region-is-background` / `menu/open-draws-content` | `DropdownMenu`：关闭时那块区域是纯背景；打开后出现大量非背景像素 |
+| `dialog/closed-corner-is-chrome` / `closed-content-is-bg` / `scrim-dims-content` / `visible-content-row` / `centered-bright-surface` | `AlertDialog`：遮罩把内容区压暗、中间一行整体变亮 —— 也就是对话框真的在**窗口中间**，而不是塌在左上角 |
+
+**`window`（真实 Win32 窗口 + 合成按键）新增 10 条：**
+
+| 断言 | 断言的是什么 |
+|---|---|
+| `window/container-size-nonzero` | 真实窗口里容器尺寸也非 0 |
+| `window/compose-clipboard-manager` / `-readback` / `-reaches-win32` | Compose 层 `LocalClipboardManager` → skiko 的 Windows 桥接 → **Win32 剪贴板**，三条路径看到同一份内容 |
+| `window/ctrl-a-selects-all` | 合成 Ctrl+A 真的让文本字段全选 |
+| `window/ctrl-c-keeps-text` / `window/ctrl-c-copies-to-win32` | Ctrl+C 把选中的 `CK` 写进 Win32 剪贴板，且不改动文本 |
+| `window/ctrl-x-clears-field` / `window/ctrl-x-copies` | Ctrl+X 剪切：文本框清空 + 剪贴板拿到内容 |
+| `window/ctrl-v-pastes` | Ctrl+V 从剪贴板粘回来 |
+
+> ⚠️ **实测踩到的时序坑（很重要）**：`TextFieldValue`（legacy API）和 `TextFieldState`
+> （新 API）之间的**选区同步是按帧走的**。如果在同一个事件突发里「Ctrl+A 紧接着
+> Ctrl+C」，复制会看到还没同步过去的**折叠**选区 → `copyWithResult()` 直接 `return`，
+> 剪贴板不变。症状极具迷惑性：**第一次 Ctrl+C 毫无反应，第二次（选区已同步）就正常**。
+> 所以自检里把「选择」和「复制 / 剪切」分到不同的帧（36 / 42 / 58 帧），这也和真实用户
+> 按键之间的间隔一致。排查记录：单帧突发版本是 `1 failed`（`ctrl-c-copies-to-win32`），
+> 而紧接着的第二次复制断言是绿的 —— 这就是定位到「同步按帧走」的线索。
+
+### 14.9 补断言抓到的第 5 个真 bug：弹层全部塌到窗口左上角
+
+**症状**：新加的三条弹层断言全红 —— 弹层色像素的包围盒是 `(0,0)-(59,39)`（位置错），
+下拉菜单在目标区域里**一个像素都没有**，对话框把左上角盖成白色。
+
+**根因**：宿主从来没把窗口尺寸喂给 `LocalWindowInfo`。
+`WindowsPlatformContext` 用的是 `PlatformContext by PlatformContext.Empty()`，而
+`PlatformContext.Empty()` 自带的 `WindowInfoImpl` 里 `containerSize` 恒为 `IntSize.Zero`，
+没有任何人改过它。而 Popup/Dialog 的定位完全依赖它：
+
+- `Popup.skiko.kt` 的 `rememberPopupMeasurePolicy` 会把算出来的位置过一遍
+  `clipPosition(position, contentSize, containerSize)`：
+  `position.x.coerceIn(0, containerSize.width - contentSize.width)`
+  —— `containerSize` 为 0 时区间是 `coerceIn(0, 负数)`，**任何坐标都被夹到 `(0,0)`**；
+- `Dialog.skiko.kt` 用 `containerSize` 把对话框摆到窗口中央 —— 为 0 就摆在 `(0,0)`。
+
+对照组（都是宿主负责喂）：
+`ImageComposeScene.skiko.kt` 里 `containerSize = imageSize`；
+compose-desktop 的 `PlatformWindowContext.desktop.kt` 里
+`_windowInfo.containerSize = component.sizeInPx.roundToIntSize()`。
+
+**修法**：
+
+- `WindowsPlatformContext` 自己实现 `WindowInfo`（三个属性用 `mutableStateOf` 包起来 ——
+  弹层在 measure 阶段读它，尺寸变化必须触发重新测量），并暴露
+  `updateContainerSize(size, density)`；
+- `WindowsComposeApplication.setContent()` / `renderFrame()` 在 `scene.size` 与
+  measure **之前**调用它。
+
+**为什么以前的断言发现不了**：弹层照旧能渲染、能点击、能交互，**只是位置错**。
+「画廊能画出东西、颜色数够多」这类断言完全看不见这个 bug —— 必须断言
+**位置和尺寸**。补这几条断言的收益直接就体现在这里。
+
+### 14.10 CI：`windows-native-selftest`（构建 HEAD 的 exe + 跑原生自检）
+
+新增 `.github/workflows/windows-native-selftest.yml`，跑在 `ubuntu-latest`：
+
+```
+checkout → JDK 21 → Nix（pin nixpkgs）→ 取预编译 mingw-Skia（缓存）
+        → 链接 windows-demo.exe（约 7 分钟）
+        → apt 装 wine/xvfb/imageMagick → xvfb-run wineboot 建 prefix
+        → ./scripts/test-windows-native.sh --skip-build    # logic + window + screenshot，退出码断言
+        → 上传 exe / 日志 / 截图
+```
+
+三个关键设计：
+
+1. **预编译 mingw-Skia 包**（Release 资产，约 40MB）。从源码构建 Skia 需要
+   「nixpkgs mingw 交叉工具链 + 15GB 磁盘 + 半小时以上」，CI 上不现实。包里是
+   22 个静态库 + 运行期/导入库 + shim，**全部是静态归档**，链接只需要 konan 自带的 lld。
+   生成见 `vendor/skiko/skia-mingw/package-prebuilt.sh`，下载校验见
+   `scripts/fetch-skia-mingw.sh`（sha256 不匹配直接拒绝解包），细节与踩过的坑见
+   `vendor/skiko/skia-mingw/README-prebuilt.md`。
+2. **pin nixpkgs**（`env.NIXPKGS_REV`）。预编译包是用 nixpkgs 交叉工具链
+   （GCC 15 / UCRT / mcfgthread）构建的，宿主工具链换一个 ABI 家族就会链接失败
+   （或者更糟：链接过了但运行时崩），所以 `-I nixpkgs=<pin 的 commit>`。
+3. **CI 里不构建 Skia，但保留兜底**：`workflow_dispatch` 勾选 `build_skia` 时，
+   会走 `build-skia-mingw.sh` 从源码重建并重新打包（约 40 分钟）。
+
+配套新增的开关：
+
+- `scripts/fetch-skia-mingw.sh [目标目录]` —— 下载/校验/解包预编译包
+- `SKIA_MINGW_PREBUILT=<dir>` —— `build-windows-native-demo.sh` 的预编译模式：
+  不需要 nix、不需要 mingw 交叉编译器（`x86_64-w64-mingw32-*` 只在复核 `_onexit` 时用一下）
+- `scripts/test-windows-native.sh --exe=<path>` —— 直接用指定 exe（CI 从构建产物里取）
+
+> 首次上线时这个 job 带 `continue-on-error: true`（不阻断流水线）；跑绿一次之后
+> 按 §14.6 第 5 项删掉即可。

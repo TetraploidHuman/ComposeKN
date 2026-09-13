@@ -68,11 +68,12 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (58 checks, 0 failures)
+      SELFTEST: RESULT PASS (91 checks, 0 failures)
 
-  logic  = 纯逻辑断言（键位映射表、消息参数解码、输入状态机），不开窗口
-  window = 真实窗口（剪贴板往返、逐帧渲染、合成点击/滚轮、干净退出）
-  all    = 两者都跑
+  logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
+           滚轮滚动、焦点/光标/选区、弹层与对话框的位置和像素），不开窗口
+  window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、干净退出）
+  all    = 两者都跑（91 条断言）
 
 日志：composekn-startup.log（exe 同目录，含启动诊断与事件日志）。
 EOF

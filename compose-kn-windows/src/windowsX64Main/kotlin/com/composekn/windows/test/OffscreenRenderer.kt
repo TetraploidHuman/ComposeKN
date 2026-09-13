@@ -85,6 +85,72 @@ class FrameSnapshot(
         return n
     }
 
+    /**
+     * 某个矩形区域内 [color] 的像素数。
+     *
+     * 用途：判断「这块区域里画了东西没有」。例如弹层关闭时该区域应当是纯背景，
+     * 打开后必须出现大量非背景像素 —— 这样断言不依赖任何绝对颜色。
+     */
+    fun countColorInRegion(
+        color: Int,
+        x0: Int,
+        y0: Int,
+        x1: Int,
+        y1: Int,
+        tolerance: Int = 4,
+    ): Int {
+        var n = 0
+        for (y in y0.coerceAtLeast(0)..y1.coerceAtMost(height - 1)) {
+            for (x in x0.coerceAtLeast(0)..x1.coerceAtMost(width - 1)) {
+                if (close(colorAt(x, y), color, tolerance)) n++
+            }
+        }
+        return n
+    }
+
+    /** 矩形区域内非 [background] 的像素数。 */
+    fun nonBackgroundCountInRegion(background: Int, x0: Int, y0: Int, x1: Int, y1: Int, tolerance: Int = 4): Int {
+        var n = 0
+        for (y in y0.coerceAtLeast(0)..y1.coerceAtMost(height - 1)) {
+            for (x in x0.coerceAtLeast(0)..x1.coerceAtMost(width - 1)) {
+                if (!close(colorAt(x, y), background, tolerance)) n++
+            }
+        }
+        return n
+    }
+
+    /** 与另一帧在矩形区域内不同的像素数（用于定位「哪一块变了」）。 */
+    fun regionDiff(other: FrameSnapshot, x0: Int, y0: Int, x1: Int, y1: Int): Int {
+        if (width != other.width || height != other.height) return Int.MAX_VALUE
+        var n = 0
+        for (y in y0.coerceAtLeast(0)..y1.coerceAtMost(height - 1)) {
+            for (x in x0.coerceAtLeast(0)..x1.coerceAtMost(width - 1)) {
+                if (colorAt(x, y) != other.colorAt(x, y)) n++
+            }
+        }
+        return n
+    }
+
+    /** 与 [color] 相近的像素的包围盒（找不到返回 null）。 */
+    fun boundsOf(color: Int, tolerance: Int = 2): ColorBounds? {
+        var minX = Int.MAX_VALUE
+        var minY = Int.MAX_VALUE
+        var maxX = Int.MIN_VALUE
+        var maxY = Int.MIN_VALUE
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                if (close(colorAt(x, y), color, tolerance)) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        if (minX == Int.MAX_VALUE) return null
+        return ColorBounds(minX, minY, maxX, maxY)
+    }
+
     override fun toString(): String =
         "FrameSnapshot(${width}x$height, distinct=${distinctColorCount()})"
 
@@ -96,6 +162,12 @@ class FrameSnapshot(
         val db = kotlin.math.abs((a and 0xFF) - (b and 0xFF))
         return da <= tolerance && dr <= tolerance && dg <= tolerance && db <= tolerance
     }
+}
+
+/** 某种颜色的像素包围盒（闭区间，单位：像素）。 */
+data class ColorBounds(val minX: Int, val minY: Int, val maxX: Int, val maxY: Int) {
+    val width: Int get() = maxX - minX + 1
+    val height: Int get() = maxY - minY + 1
 }
 
 /**
