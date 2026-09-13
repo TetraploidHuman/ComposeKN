@@ -9,7 +9,13 @@ on:
       - "compose-kn-windows/**"
       - "compose-kn-tests/**"
       - "compose-kn-linux/**"
+      - "build-logic/**"
+      - "vendor/skiko/**"
+      - "vendor/compose-core*/**"
       - "scripts/**"
+      - "shell.nix"
+      - "settings.gradle.kts"
+      - "gradle.properties"
   pull_request:
     paths:
       - "compose-kn-windows/**"

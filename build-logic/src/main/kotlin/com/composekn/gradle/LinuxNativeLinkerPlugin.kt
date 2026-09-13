@@ -38,6 +38,15 @@ class LinuxNativeLinkerPlugin : Plugin<Project> {
         linux.binaries.all {
             linkerOpts.addAll(pkgOpts)
             linkerOpts.add("-ldl")
+            // 宿主发行版的 .so 可能引用比 konan 自带 sysroot 更新的 glibc 符号
+            // （ubuntu 24.04 的 libxkbcommon.so 就要 __isoc23_strtoul@GLIBC_2.38 /
+            //  stat64@GLIBC_2.33），而 konan 的 lld 默认带
+            // `--no-allow-shlib-undefined`，会直接把这当成链接错误：
+            //   ld.lld: error: undefined reference: __isoc23_strtoul@GLIBC_2.38
+            //   >>> referenced by /usr/lib/x86_64-linux-gnu/libxkbcommon.so
+            // 这些符号运行时由宿主的 glibc 解析（二进制只在同一台机器上跑），
+            // 所以这里放开这条限制 —— 否则「在 ubuntu 上编译、链接系统 .so」这条路走不通。
+            linkerOpts.add("-Wl,--allow-shlib-undefined")
             rpathDirs.forEach { dir ->
                 linkerOpts.add("-Wl,-rpath,$dir")
             }
