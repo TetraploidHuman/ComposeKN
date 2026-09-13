@@ -192,6 +192,40 @@ static void blitFrame(ComposeKNWin32Window* window) {
     ReleaseDC(window->hwnd, dc);
 }
 
+// ---------------------------------------------------------------------------
+// C++ -> Kotlin 渲染回调
+//
+// 拖拽缩放时 Windows 会进入模态循环（在 DefWindowProc 内部），Kotlin 侧的渲染
+// 循环在这期间完全得不到执行，窗口只能显示上一帧被拉伸的结果。这里在 WM_SIZE
+// 里同步回调一次 Kotlin 的 renderImmediately()，让内容按新尺寸逐帧重组。
+typedef void (*ComposeKNRenderTickFn)(void* user);
+static ComposeKNRenderTickFn g_renderTick = nullptr;
+static void* g_renderTickUser = nullptr;
+static bool g_inRenderTick = false;  // 防重入
+
+extern "C" void composekn_win32_set_render_tick(ComposeKNRenderTickFn fn, void* user) {
+    g_renderTick = fn;
+    g_renderTickUser = user;
+}
+
+static void fireRenderTick() {
+    if (g_renderTick == nullptr || g_inRenderTick) return;
+    g_inRenderTick = true;
+    g_renderTick(g_renderTickUser);
+    g_inRenderTick = false;
+}
+
+// 调试钩子：COMPOSEKN_TEST_RESIZE=1 时自动模拟若干次窗口缩放。
+// Wine/Xvfb 下没有窗口管理器，无法从外部触发 WM_SIZE，用它验证上面这条链路。
+static const UINT_PTR kTestResizeTimerId = 0xC011;
+
+static void maybeStartTestResize(ComposeKNWin32Window* window) {
+    const char* env = getenv("COMPOSEKN_TEST_RESIZE");
+    if (env == nullptr || env[0] == '\0' || env[0] == '0') return;
+    composeknLog("test: COMPOSEKN_TEST_RESIZE=1 -> 自动模拟 6 次窗口缩放");
+    SetTimer(window->hwnd, kTestResizeTimerId, 700, nullptr);
+}
+
 static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     auto* window = reinterpret_cast<ComposeKNWin32Window*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (window == nullptr && message != WM_NCCREATE) {
@@ -252,6 +286,8 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 e.a = w;
                 e.b = h;
                 pushEvent(window, e);
+                // 同步渲染一帧（模态缩放循环期间 Kotlin 循环跑不到）
+                fireRenderTick();
             }
             break;
         }
@@ -290,6 +326,27 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             EndPaint(hwnd, &ps);
             blitFrame(window);
             return 0;
+        }
+        case WM_TIMER: {
+            if (wParam == kTestResizeTimerId && window != nullptr) {
+                static int step = 0;
+                ++step;
+                if (step > 6) {
+                    KillTimer(hwnd, kTestResizeTimerId);
+                    composeknLog("test: 模拟缩放结束");
+                    break;
+                }
+                RECT rc;
+                GetWindowRect(hwnd, &rc);
+                int dw = (step % 2 == 1) ? 120 : -120;
+                int dh = (step % 2 == 1) ? 90 : -90;
+                int nw = (rc.right - rc.left) + dw;
+                int nh = (rc.bottom - rc.top) + dh;
+                composeknLog("test: SetWindowPos -> %dx%d", nw, nh);
+                SetWindowPos(hwnd, nullptr, 0, 0, nw, nh,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            break;
         }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
@@ -456,6 +513,7 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
     window->dpi = queryWindowDpi(window->hwnd);
     ShowWindow(window->hwnd, SW_SHOWNORMAL);
     UpdateWindow(window->hwnd);
+    maybeStartTestResize(window);
     return window;
 }
 

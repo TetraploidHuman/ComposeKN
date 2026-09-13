@@ -42,6 +42,10 @@ void composekn_win32_log(const char* message);
 /** 物理像素 / 逻辑像素（= dpi / 96.0）。 */
 float composekn_win32_dpi_scale(ComposeKNWin32Window* window);
 
+/** 注册 C 侧（wndproc/WM_SIZE 内）同步回调，用于缩放期间逐帧重组。 */
+typedef void (*ComposeKNRenderTickFn)(void* user);
+void composekn_win32_set_render_tick(ComposeKNRenderTickFn fn, void* user);
+
 /** Begin native move drag (ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION). */
 void composekn_win32_begin_move(ComposeKNWin32Window* window);
 

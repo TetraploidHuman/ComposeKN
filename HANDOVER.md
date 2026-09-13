@@ -724,3 +724,24 @@ Wine 下没有窗口管理器，从 X 侧（xdotool）缩放无法转成 Win32 �
    完全得不到执行；当前靠 `blitFrame()` 拉伸缓存帧来避免白屏。
    彻底解决需要新增 C++ -> Kotlin 的渲染回调（`staticCFunction`），
    在 WM_SIZE/WM_ENTERSIZEMOVE 里同步调用一次 `renderImmediately()`。
+
+### 13.6 拖拽缩放逐帧重组（C++ -> Kotlin 渲染回调）
+
+问题：拖拽缩放时窗口显示的是**上一帧被拉伸**的结果，松手后才重绘正确。
+原因：Windows 的模态缩放循环运行在 `DefWindowProc` 内部，这期间 Kotlin 侧渲染
+循环完全得不到执行（消息泵被模态循环占住）。
+
+修复：
+1. C++ 新增 `composekn_win32_set_render_tick(fn, user)`，保存 Kotlin 传来的
+   函数指针；`WM_SIZE` 更新完 `window->width/height` 后同步调用 `fireRenderTick()`
+   （带 `g_inRenderTick` 防重入）。
+2. Kotlin 侧 `Win32Native.kt` 用 `staticCFunction<COpaquePointer?, Unit>` 做回调，
+   经 `setWindowsRenderTick { ... }` 注册；`WindowsSoftwareRedrawer.init` 里注册
+   `renderImmediately()`，`dispose` 里注销。
+
+验证（Wine + 调试钩子）：每次 `SetWindowPos` 都立刻出现
+`swctx.present: surface=WxH window=WxH`（尺寸已跟上新窗口），随后才是
+`event: resize WxH`，说明内容确实按新尺寸逐帧重组，而不是拉伸旧帧。
+
+调试钩子：设 `COMPOSEKN_TEST_RESIZE=1` 时，窗口创建后会自动 `SetWindowPos`
+来回缩放 6 次（Wine/Xvfb 下没有窗口管理器，无法从外部触发 WM_SIZE）。

@@ -5,6 +5,7 @@ package org.jetbrains.skiko
 import kotlinx.cinterop.*
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
+import kotlinx.cinterop.staticCFunction
 
 /**
  * Kotlin/Native Windows (mingw) Win32 bridge bindings — mirrors the Wayland
@@ -177,6 +178,27 @@ internal external fun composekn_win32_begin_move(window: COpaquePointer?)
 
 @SymbolName("composekn_win32_dpi_scale")
 internal external fun composekn_win32_dpi_scale(window: COpaquePointer?): Float
+
+@SymbolName("composekn_win32_set_render_tick")
+private external fun composekn_win32_set_render_tick(callback: COpaquePointer?, user: COpaquePointer?)
+
+private var renderTickAction: (() -> Unit)? = null
+
+private val renderTickCallback = staticCFunction<COpaquePointer?, Unit> { _ ->
+    renderTickAction?.invoke()
+}
+
+/**
+ * 注册「C 侧同步渲染」回调：wndproc 处理 WM_SIZE 时会回调它。
+ *
+ * 拖拽缩放期间 Windows 的模态循环占住了消息泵，Kotlin 渲染循环跑不到，
+ * 窗口只能显示被拉伸的旧帧；靠这个回调在 WM_SIZE 里同步渲染一帧，
+ * 内容就能按新尺寸逐帧重组。传 null 注销。
+ */
+fun setWindowsRenderTick(action: (() -> Unit)?) {
+    renderTickAction = action
+    composekn_win32_set_render_tick(if (action == null) null else renderTickCallback, null)
+}
 
 @SymbolName("composekn_win32_log")
 internal external fun composekn_win32_log(message: CPointer<ByteVar>)

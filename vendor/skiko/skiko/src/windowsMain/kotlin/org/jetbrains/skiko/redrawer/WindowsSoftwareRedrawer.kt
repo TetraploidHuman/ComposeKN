@@ -4,6 +4,7 @@ import org.jetbrains.skiko.SkiaLayer
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.context.WindowsSoftwareContextHandler
 import org.jetbrains.skiko.currentNanoTime
+import org.jetbrains.skiko.setWindowsRenderTick
 import org.jetbrains.skiko.initWindowsMainThread
 
 internal class WindowsSoftwareRedrawer(
@@ -16,11 +17,14 @@ internal class WindowsSoftwareRedrawer(
 
     init {
         initWindowsMainThread()
+        // 缩放期间（模态循环）也能逐帧重组：见 setWindowsRenderTick 注释
+        setWindowsRenderTick { renderImmediately() }
     }
 
     override fun dispose() {
         if (disposed) return
         disposed = true
+        setWindowsRenderTick(null)
         contextHandler.dispose()
     }
 
