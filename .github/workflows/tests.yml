@@ -28,11 +28,12 @@ jobs:
   # 内置在 exe 里，用退出码汇报：
   #     COMPOSEKN_SELFTEST=1   windows-demo.exe     # logic + 离屏渲染
   #     COMPOSEKN_SELFTEST=all windows-demo.exe     # 再加真实窗口
-  # 本地由 scripts/test-windows-native.sh 驱动（Wine 或真机）。CI 里要跑它，
-  # 前提是能在 runner 上构建 mingw-Skia —— 见 HANDOVER §14「后续项」。
+  # 本地由 scripts/test-windows-native.sh 驱动（Wine 或真机）；
+  # CI 里那条完整链路（构建 HEAD 的 exe + Wine + Xvfb 跑三层自检）在
+  # .github/workflows/windows-native-selftest.yml，已于 2026-09-13 跑绿。
+  # 本 job 只跑与平台无关的那部分纯逻辑单测（快、秒级）。
   linux-unit-tests:
     runs-on: ubuntu-latest
-    continue-on-error: true # 首次在 CI 上做 K/N 原生链接，先不阻断流水线
     steps:
       - name: Checkout
         uses: actions/checkout@v4

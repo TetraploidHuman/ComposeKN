@@ -896,8 +896,8 @@ WHEELLOGIC: onMouseWheel delta=Offset(0.0, 18.0) reversed=Offset(0.0, -18.0) can
 2. ~~弹层（`DropdownMenu`/`AlertDialog`）像素断言~~ ✅ 见 §14.8
 3. ~~选区/光标/`Ctrl+A`/`Ctrl+C` 断言~~ ✅ 见 §14.8 —— 补断言过程本身抓出了第 5 个真 bug（§14.9）
 4. Wayland 侧滚轮方向需要真机/合成器复验（目前只在 Windows 路径上做了端到端断言）。
-5. CI job 首次跑绿之后，把 `.github/workflows/windows-native-selftest.yml` 里的
-   `continue-on-error: true` 删掉，让它变成真正的门禁（保留 `build_skia` 兜底入口）。
+5. ~~CI job 首次跑绿之后把 `continue-on-error` 删掉~~ ✅ 2026-09-13 已跑绿并删掉
+   （`build_skia` 兜底入口保留）。
 
 ### 14.7 本次自检结果（Wine + Xvfb，Linux 主机）
 
@@ -1024,3 +1024,30 @@ checkout → JDK 21 → Nix（pin nixpkgs）→ 取预编译 mingw-Skia（缓存
 
 > 首次上线时这个 job 带 `continue-on-error: true`（不阻断流水线）；跑绿一次之后
 > 按 §14.6 第 5 项删掉即可。
+
+**首次跑绿：2026-09-13，run [34750507633](https://github.com/TetraploidHuman/ComposeKN/actions/runs/34750507633)**
+
+```
+==> 阶段 logic (COMPOSEKN_SELFTEST=logic)      ✓ logic: RESULT PASS (73 checks)
+==> 阶段 window (COMPOSEKN_SELFTEST=window)    ✓ window: RESULT PASS (18 checks)
+==> 阶段 screenshot                            ✓ 标题栏 srgb(45,45,48)、颜色数 1152
+全部通过 ✅
+```
+
+runner 上的开销：链接 exe 约 **16 分钟**（4 核，比本地 32 核慢一倍多）、
+三段自检 + 截图约 **15 秒**、整条 job 约 **19 分钟**。
+
+#### 把这条链路跑通踩的坑（每一轮 CI 一个，都写进 workflow 注释了）
+
+| 坑 | 症状 | 修法 |
+|---|---|---|
+| 私有仓库的 Release 资产 | `curl` 直链 404（**带上 token 也是 404**） | 改走 `gh release download`，没 gh 就用 Releases API + `Accept: application/octet-stream` |
+| `env: SKIA_DIR=<预编译包>` | skiko 的 `skia.dir` **恰好读环境变量 `SKIA_DIR`**（properties.kt:214），于是把只有 `.a` 的预编译目录当成 Skia 源码树 → `SkCanvas.h: No such file or directory` | 改名为 `COMPOSEKN_SKIA_MINGW_DIR` |
+| ubuntu 24.04 的 `wine64` 包 | `wine: command not found`（它只装 `/usr/lib/wine/wine64`，不在 PATH；`/usr/bin/wine` 在 `wine` 包里） | 装 `wine`；脚本里也加了 `/usr/lib/wine/{wine64,wine}` 回退 |
+| `--no-install-recommends` + `wine` | Wine 里**字体数为 0** → Compose `IllegalStateException: Could not load font`，logic 阶段只能过 26 条断言 | 装 **`fonts-wine`** —— Debian/Ubuntu 把 Wine 自带的 56 个字体（tahoma/marlett/wingding…）拆成了独立包，只是 Recommends。本地 nixpkgs 的 wine 把它们打包在 wine64 里，所以「本地绿、CI 红」 |
+| 截图脚本结尾的裸 `wait` | job 挂死 **23 分钟**（wine 里的进程不理会 SIGTERM） | 改成「5 秒宽限期 + `kill -9`」，不再 `wait` |
+| 自检没有任何超时护栏 | 挂住 = 耗到 job 超时，日志里连「跑到哪一条断言」都没有（K/N 的 stdout 接管道时是块缓冲） | 每阶段 `timeout`、exe 内置看门狗（420s）、每行 `fflush`、阶段边界 + 窗口每 20 帧一行进度 |
+
+> 顺带一个诊断技巧：CI 上「挂住」和「失败」要能一眼分开。现在
+> `scripts/test-windows-native.sh` 在阶段超时时会直接判失败并打印最后几条
+> `SELFTEST` 行；exe 里的看门狗则用退出码 2 表示「我挂住了」，与断言失败的 1 区分。

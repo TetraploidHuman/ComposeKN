@@ -66,9 +66,10 @@ jobs:
     name: 构建 exe + 原生自检
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # ⚠️ 首次上线先不阻断流水线（这套链路第一次在 CI 上跑，可能有 runner 环境差异）。
-    #    跑绿一次之后把下面这行删掉，让它成为真正的门禁。
-    continue-on-error: true
+    # 已于 2026-09-13 跑绿（run 34750507633：73 + 18 + 3 条断言全过），
+    # 因此它是真正的门禁，不再是 continue-on-error。
+    # 如果将来 runner 环境变化导致它红了，先看 job 摘要里的 SELFTEST 行与
+    # 上传的 artifacts（exe / *.log / *.png）——常见坑见文件内注释与 HANDOVER §14.10。
     steps:
       - name: Checkout
         uses: actions/checkout@v4
