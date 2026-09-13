@@ -207,6 +207,41 @@ fun SkikoProjectContext.compileNativeBridgesTask(
 }
 
 
+/**
+ * 把 `src/linuxMain/cinterop/composekn_wayland.def` 里的相对路径（相对 module 根）
+ * 解析成绝对路径，写到 `build/composekn-wayland/` 下。
+ *
+ * 背景见调用处：绝对路径不能进仓库，但 cinterop 解析 `headers =` 时又是按
+ * **进程工作目录**（不是 .def 所在目录）来的，所以在构建期做这一次解析最稳。
+ */
+private fun resolveWaylandDefFile(project: Project): File {
+    val template = project.projectDir.resolve("src/linuxMain/cinterop/composekn_wayland.def")
+    val out = project.layout.buildDirectory.file("composekn-wayland/composekn_wayland.def").get().asFile
+    out.parentFile.mkdirs()
+    out.writeText(
+        template.readLines().joinToString("\n") { line ->
+            val trimmed = line.trim()
+            when {
+                trimmed.startsWith("headers = ") ->
+                    "headers = " + project.projectDir.resolve(trimmed.removePrefix("headers = ").trim()).absolutePath
+                trimmed.startsWith("compilerOpts = ") ->
+                    "compilerOpts = " + trimmed.removePrefix("compilerOpts = ").trim()
+                        .split(" ")
+                        .filter { it.isNotEmpty() }
+                        .joinToString(" ") { opt ->
+                            if (opt.startsWith("-I") && !opt.startsWith("-I/")) {
+                                "-I" + project.projectDir.resolve(opt.removePrefix("-I")).absolutePath
+                            } else {
+                                opt
+                            }
+                        }
+                else -> line
+            }
+        } + "\n"
+    )
+    return out
+}
+
 fun configureCinterop(
     cinteropName: String,
     os: OS,
@@ -331,7 +366,13 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
         }
         OS.Linux -> {
             // Configure cinterop with the original .def file that includes headers and compilerOpts
-            val originalDefFile = projectDir.resolve("src/linuxMain/cinterop/composekn_wayland.def")
+            //
+            // ComposeKN: 仓库里的 .def 用的是**相对 module 根**的路径，不能把开发机的
+            // 绝对路径提交进去（CI 在别的目录 checkout 后，cinterop 会报
+            //   wayland_bridge.h file not found
+            // 而且这个错只在 CI 上出现，本地永远是绿的）。这里把相对路径解析成
+            // 绝对路径、写一份到 build/ 再交给 cinterop。
+            val originalDefFile = resolveWaylandDefFile(project)
             configureCinterop(cinteropName, os, arch, target, targetString, emptyList(), originalDefFile)
             
             val options = mutableListOf(

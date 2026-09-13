@@ -1,5 +1,5 @@
-headers = /home/miaox99/ComposeKN/vendor/skiko/skiko/src/linuxMain/cpp/wayland/wayland_bridge.h
-compilerOpts = -I/home/miaox99/ComposeKN/vendor/skiko/skiko/src/linuxMain/cpp/wayland
+headers = src/linuxMain/cpp/wayland/wayland_bridge.h
+compilerOpts = -Isrc/linuxMain/cpp/wayland
 linkerOpts = -lwayland-client -lwayland-egl -lEGL -lGLESv2 -lxkbcommon -ldl
 
 ---
