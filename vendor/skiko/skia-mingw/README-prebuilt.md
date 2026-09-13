@@ -54,6 +54,19 @@ SKIA_MINGW_PREBUILT=/tmp/.../skia-mingw-m150-b8e40a7c49 \
 （tag `skia-mingw-<SKIA_TAG>`）；可用 `COMPOSEKN_SKIA_PREBUILT_URL=` 覆盖，
 也支持 `file://` 与本地路径。校验哈希在 `prebuilt.sha256`，不匹配直接拒绝解包。
 
+> **仓库是私有的**，所以下载必须带 token：
+>
+> ```bash
+> export GH_TOKEN=$(gh auth token)      # 或 GITHUB_TOKEN / COMPOSEKN_GH_TOKEN
+> ./scripts/fetch-skia-mingw.sh /tmp/composekn-skia-mingw
+> ```
+>
+> 脚本会自动改走 `gh release download`（有 gh 时）或 Releases API
+> （`Accept: application/octet-stream`）。**注意**：私有仓库下
+> `https://github.com/<owner>/<repo>/releases/download/...` 这个浏览器地址
+> 即使带上 token 也会返回 404 —— 别用它当 curl 直链。
+> `COMPOSEKN_FORCE_API_DOWNLOAD=1` 可以强制走 curl+API 那条分支（调试用）。
+
 ## 重新生成
 
 ```bash

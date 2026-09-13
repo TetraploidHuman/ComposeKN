@@ -56,7 +56,10 @@ env:
   # 本地构建预编译包时用的 nixpkgs commit（见 package-prebuilt.sh 写进 manifest.json 的值）
   NIXPKGS_REV: c25784012c9982bca5b3e0de87e90bbdac8927d3
   NIXPKGS_URL: https://github.com/NixOS/nixpkgs/archive/c25784012c9982bca5b3e0de87e90bbdac8927d3.tar.gz
-  SKIA_DIR: ${{ github.workspace }}/.skia-mingw
+  # ⚠️ 不要叫 SKIA_DIR：那是 skiko 自己的约定（skiko 的 `skia.dir` 读环境变量 SKIA_DIR），
+  # 指过去之后它会把预编译包目录当成 Skia 源码树，-I 全部指向不存在的 include/ →
+  # :skiko:compileNativeBridgesWindowsX64 报 "SkCanvas.h: No such file or directory"。
+  COMPOSEKN_SKIA_MINGW_DIR: ${{ github.workspace }}/.skia-mingw
 
 jobs:
   build-and-selftest:
@@ -95,7 +98,7 @@ jobs:
         id: skia-cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.SKIA_DIR }}
+          path: ${{ env.COMPOSEKN_SKIA_MINGW_DIR }}
           key: skia-mingw-${{ hashFiles('vendor/skiko/skia-mingw/prebuilt.sha256', 'vendor/skiko/skia-mingw/SKIA_TAG') }}
 
       - name: Fetch mingw-Skia prebuilt package
@@ -106,29 +109,29 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd
-          ./scripts/fetch-skia-mingw.sh "$SKIA_DIR"
-          cat "$SKIA_DIR"/skia-mingw-*/manifest.json
+          ./scripts/fetch-skia-mingw.sh "$COMPOSEKN_SKIA_MINGW_DIR"
+          cat "$COMPOSEKN_SKIA_MINGW_DIR"/skia-mingw-*/manifest.json
 
       # 从源码构建 Skia 的兜底路径（workflow_dispatch + 勾选 build_skia）
       - name: Build mingw-Skia from source (fallback)
         if: github.event_name == 'workflow_dispatch' && inputs.build_skia
         run: |
           nix-shell -p gn ninja python3 git zstd --run "
-            export SKIA_MINGW_WORK='$SKIA_DIR/src'
+            export SKIA_MINGW_WORK='$COMPOSEKN_SKIA_MINGW_DIR/src'
             nix-shell ./shell.nix -I nixpkgs=$NIXPKGS_URL --run ./vendor/skiko/skia-mingw/build-skia-mingw.sh
             nix-shell ./shell.nix -I nixpkgs=$NIXPKGS_URL --run ./vendor/skiko/skia-mingw/package-prebuilt.sh
           "
-          ls -la "$SKIA_DIR"/src/prebuilt/
+          ls -la "$COMPOSEKN_SKIA_MINGW_DIR"/src/prebuilt/
 
       - name: Resolve prebuilt dir
         id: prebuilt
         run: |
-          if [ -f "$SKIA_DIR/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)/manifest.json" ]; then
-              dir="$SKIA_DIR/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)"
+          if [ -f "$COMPOSEKN_SKIA_MINGW_DIR/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)/manifest.json" ]; then
+              dir="$COMPOSEKN_SKIA_MINGW_DIR/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)"
           else
-              dir="$(find "$SKIA_DIR" -maxdepth 2 -name manifest.json -printf '%h\n' | head -1)"
+              dir="$(find "$COMPOSEKN_SKIA_MINGW_DIR" -maxdepth 2 -name manifest.json -printf '%h\n' | head -1)"
           fi
-          [ -n "$dir" ] || { echo "找不到预编译包（$SKIA_DIR）"; ls -la "$SKIA_DIR"; exit 1; }
+          [ -n "$dir" ] || { echo "找不到预编译包（$COMPOSEKN_SKIA_MINGW_DIR）"; ls -la "$COMPOSEKN_SKIA_MINGW_DIR"; exit 1; }
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
           echo "使用预编译包: $dir"
 
