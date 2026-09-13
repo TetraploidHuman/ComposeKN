@@ -1,0 +1,64 @@
+name: tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - ".github/workflows/tests.yml"
+      - "compose-kn-windows/**"
+      - "compose-kn-tests/**"
+      - "compose-kn-linux/**"
+      - "scripts/**"
+  pull_request:
+    paths:
+      - "compose-kn-windows/**"
+      - "compose-kn-tests/**"
+
+jobs:
+  # ComposeKN 平台无关逻辑的单元测试
+  # （VK→Key 映射表、Win32 常量与消息参数解码、指针/修饰键状态机）。
+  #
+  # 为什么能在 Linux 上测 Windows 代码：这些文件在
+  # compose-kn-windows/src/windowsCommonMain，不含 cinterop/Win32 调用；
+  # :compose-kn-tests 用 linuxX64 目标把它们编一遍再跑 kotlin.test。
+  # mingwX64 的测试二进制在 Linux runner 上没法执行，但纯逻辑等价。
+  #
+  # Windows 专属的端到端测试（离屏光栅化 + 像素断言 + 合成输入 + 真实窗口剪贴板）
+  # 内置在 exe 里，用退出码汇报：
+  #     COMPOSEKN_SELFTEST=1   windows-demo.exe     # logic + 离屏渲染
+  #     COMPOSEKN_SELFTEST=all windows-demo.exe     # 再加真实窗口
+  # 本地由 scripts/test-windows-native.sh 驱动（Wine 或真机）。CI 里要跑它，
+  # 前提是能在 runner 上构建 mingw-Skia —— 见 HANDOVER §14「后续项」。
+  linux-unit-tests:
+    runs-on: ubuntu-latest
+    continue-on-error: true # 首次在 CI 上做 K/N 原生链接，先不阻断流水线
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install native link deps (Wayland/EGL/xkbcommon for the :ui klib)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev libegl1-mesa-dev libxkbcommon-dev \
+            libgl1-mesa-dev libfontconfig1-dev libcrypt-dev
+
+      - name: Run unit tests
+        env:
+          COMPOSEKN_LIBCRYPT_LIB: /lib/x86_64-linux-gnu
+        run: ./gradlew :compose-kn-tests:linuxX64Test --no-daemon --console=plain
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: composekn-unit-test-report
+          path: compose-kn-tests/build/reports/tests/**
+          if-no-files-found: ignore

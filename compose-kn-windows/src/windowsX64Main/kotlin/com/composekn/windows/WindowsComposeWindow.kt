@@ -8,6 +8,9 @@ import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.win32Log
 import org.jetbrains.skiko.initWindowsMainThread
+import com.composekn.windows.internal.MOD_ALT
+import com.composekn.windows.internal.MOD_CTRL
+import com.composekn.windows.internal.MOD_SHIFT
 
 /**
  * Windows window + SkiaLayer with rendering and input events.
@@ -28,6 +31,26 @@ class WindowsComposeWindow(
         private set
     var isMinimized: Boolean = false
         private set
+
+    /** 当前客户区**逻辑**尺寸（未 attach 时回退到创建参数）。 */
+    val logicalWidth: Int get() = win32Window?.width ?: width
+    val logicalHeight: Int get() = win32Window?.height ?: height
+
+    /** 当前物理像素 / 逻辑像素（未 attach 时为 1.0）。 */
+    val dpiScale: Float get() = layer.contentScale
+
+    /** 底层 Win32 窗口（未 attach 时为 null）。 */
+    val nativeWindow: Win32Window? get() = win32Window
+
+    /** 已渲染帧数（诊断用）。 */
+    var frameCount: Int = 0
+        private set
+
+    /**
+     * 每帧回调（诊断/自动化测试用），参数是当前帧号。
+     * 在 `renderImmediately()` 之后、状态同步之前调用。
+     */
+    var frameHook: ((Int) -> Unit)? = null
 
     private var win32Window: Win32Window? = null
 
@@ -50,6 +73,18 @@ class WindowsComposeWindow(
         layer.attachTo(win)
         win32Log("run: layer attached; entering message loop")
 
+        // 先渲染一帧，再开始分发事件。
+        //
+        // scene.size 是在 renderDelegate.onRender -> renderFrame() 里设定的。如果第一轮
+        // 就先把消息泵里的事件派发进去（Wine/真机上窗口刚建好通常会先来一串鼠标
+        // Enter/Move），`sendPointerEvent` 会在 scene.size 仍是 0 时触发
+        // measureAndLayout —— 根节点此时拿到的是**无界**约束，内容里任何
+        // verticalScroll/LazyColumn 都会当场抛：
+        //   IllegalStateException: Vertically scrollable component was measured with
+        //   an infinity maximum height constraints ...
+        // （画廊就是这么在启动瞬间崩掉的。）
+        layer.renderImmediately()
+
         var frames = 0
         var running = true
         try {
@@ -60,6 +95,8 @@ class WindowsComposeWindow(
                 layer.renderImmediately()
                 if (frames == 0) win32Log("run: first renderImmediately ok")
                 frames++
+                frameCount = frames
+                frameHook?.invoke(frames)
                 isMaximized = win.isMaximized
                 isMinimized = win.isMinimized
             }
@@ -82,9 +119,9 @@ class WindowsComposeWindow(
                     WindowsEvent.MouseMoveEvent(
                         x = raw.x.toInt(),
                         y = raw.y.toInt(),
-                        isShiftPressed = raw.modifiers and 1u != 0u,
-                        isCtrlPressed = raw.modifiers and 2u != 0u,
-                        isAltPressed = raw.modifiers and 4u != 0u,
+                        isShiftPressed = raw.modifiers and MOD_SHIFT != 0u,
+                        isCtrlPressed = raw.modifiers and MOD_CTRL != 0u,
+                        isAltPressed = raw.modifiers and MOD_ALT != 0u,
                     )
                 )
                 Win32Event.MOUSE_BUTTON -> onEvent(
@@ -97,9 +134,11 @@ class WindowsComposeWindow(
                             else -> MouseButton.Middle
                         },
                         isPressed = raw.state == 1u,
-                        isShiftPressed = raw.modifiers and 1u != 0u,
-                        isCtrlPressed = raw.modifiers and 1u != 0u,
-                        isAltPressed = raw.modifiers and 4u != 0u,
+                        isShiftPressed = raw.modifiers and MOD_SHIFT != 0u,
+                        // 原来这里写的是 and 1u（= MOD_SHIFT），于是「按住 Ctrl 点击」
+                        // 会被当成 Shift；改用桥接约定的位。
+                        isCtrlPressed = raw.modifiers and MOD_CTRL != 0u,
+                        isAltPressed = raw.modifiers and MOD_ALT != 0u,
                     )
                 )
                 Win32Event.MOUSE_WHEEL -> onEvent(
@@ -108,9 +147,9 @@ class WindowsComposeWindow(
                         y = raw.y.toInt(),
                         deltaX = 0,
                         deltaY = raw.a / 120,
-                        isShiftPressed = raw.modifiers and 1u != 0u,
-                        isCtrlPressed = raw.modifiers and 2u != 0u,
-                        isAltPressed = raw.modifiers and 4u != 0u,
+                        isShiftPressed = raw.modifiers and MOD_SHIFT != 0u,
+                        isCtrlPressed = raw.modifiers and MOD_CTRL != 0u,
+                        isAltPressed = raw.modifiers and MOD_ALT != 0u,
                     )
                 )
                 Win32Event.KEY -> onEvent(
@@ -118,9 +157,9 @@ class WindowsComposeWindow(
                         virtualKeyCode = raw.button.toInt(),
                         scanCode = raw.b,
                         isKeyDown = raw.state == 1u,
-                        isShiftPressed = raw.modifiers and 1u != 0u,
-                        isCtrlPressed = raw.modifiers and 2u != 0u,
-                        isAltPressed = raw.modifiers and 4u != 0u,
+                        isShiftPressed = raw.modifiers and MOD_SHIFT != 0u,
+                        isCtrlPressed = raw.modifiers and MOD_CTRL != 0u,
+                        isAltPressed = raw.modifiers and MOD_ALT != 0u,
                     )
                 )
                 Win32Event.CHAR -> if (raw.b > 0) {

@@ -745,3 +745,177 @@ Wine 下没有窗口管理器，从 X 侧（xdotool）缩放无法转成 Win32 �
 
 调试钩子：设 `COMPOSEKN_TEST_RESIZE=1` 时，窗口创建后会自动 `SetWindowPos`
 来回缩放 6 次（Wine/Xvfb 下没有窗口管理器，无法从外部触发 WM_SIZE）。
+
+## 14. UI 组件画廊 + 自动化测试（2026-09-13）
+
+### 14.1 组件画廊（`samples/windows-demo`）
+
+原来的 demo 只有 2 个控件，覆盖面太窄。现在拆成三个文件：
+
+| 文件 | 作用 |
+|---|---|
+| `main.kt` | 入口：默认跑画廊；`--selftest` / `COMPOSEKN_SELFTEST` 时跑自检并以退出码汇报 |
+| `Gallery.kt` | 组件画廊（下方清单） |
+| `SelfTest.kt` | 自动化自检（§14.2） |
+
+画廊刻意覆盖**渲染 / 排版 / 输入**的各类路径（每一条都是潜在的后端缺陷面）：
+
+- 文本：标题/正文/标签字号、长文本换行 + `TextOverflow.Ellipsis`、中英混排、28sp 大字号
+- 按钮：`Button` / `FilledTonalButton` / `OutlinedButton` / `TextButton` / `IconButton`（Canvas 画图标）
+- 输入：`OutlinedTextField`（单行 + 多行）、`Checkbox`、`Switch`、`Slider`、`RadioButton` 组
+- 进度：确定性 `LinearProgressIndicator` + 不确定 `CircularProgressIndicator`（无限动画）
+- 容器：`Card`（圆角/直角）、`HorizontalDivider`、hover 高亮的 `Box`
+- 弹层：`DropdownMenu`、`AlertDialog`（验证 Skiko 多层合成）
+- 列表：`LazyRow`（40 项）、`LazyColumn`（60 项，验证虚拟化）；外层 `verticalScroll`
+- 绘制：`Canvas` 矩形/圆/描边/线/`linearGradient`/`radialGradient`/`Path.quadraticBezierTo`/`Modifier.rotate`
+- 主题：`darkColorScheme`/`lightColorScheme` 切换、`primary/secondary/error` 取色
+- 布局：`FlowRow` 自动换行、`BoxWithConstraints` 读取可用尺寸
+- 诊断 HUD：窗口逻辑尺寸、可用尺寸、density、滚轮位置、交互计数、**每帧重组计数**
+  （`LaunchedEffect { while(true) withFrameNanos { frames++ } }`，等于持续压力测试）
+
+HUD 让「拖拽缩放是否逐帧重组」「HiDPI 下 density 是否对」这类问题**肉眼可读**，
+不用再靠猜。
+
+### 14.2 自检：`COMPOSEKN_SELFTEST=1|logic|window|all`
+
+exe 内置三层自检，结果逐行打印 `SELFTEST ok / FAIL`，最后一行 `SELFTEST: RESULT PASS|FAIL`，
+**退出码 0/1**（可直接被 script / CI 断言）：
+
+| 层 | 跑什么 | 需要窗口吗 |
+|---|---|---|
+| `logic` | 纯函数：VK→Key 映射表（含「表内无重复键」断言）、lParam/滚轮增量解码、修饰键位、输入状态机、`GalleryProbe.summary()` | 否 |
+| `render` | **离屏光栅化真实 Compose 场景 + 像素断言** | 否 |
+| `window` | 真实 Win32 窗口：剪贴板往返、逐帧渲染循环、合成点击/滚轮、干净退出 | 是 |
+
+`render` 层的关键断言（`SelfTest.kt`）：
+
+- 像素通道序自检（`N2`(BGRA)→ARGB 转换搞反会让所有颜色断言失效，所以它排第一）
+- 基准帧：背景色、CSD 标题栏颜色与 32dp 高度、标题栏下方是内容区
+- **「拉伸回归」检测**：右下角固定 40dp 红方块，窗口 800x600 → 1200x900 后宽度必须**仍是 40px**；
+  若渲染后端把旧帧拉伸（v0.2.6 的行为），这里会变成 60px
+- HiDPI：`density=1.5` 时同一个方块必须是 60px（验证 逻辑dp→物理px 整条链）
+- 交互：合成 点击 后 `probe.clickCount==1` **且**该处像素由橙变绿（验证 输入→重组→重绘 全链路）
+- 交互：合成 WM_CHAR 后输入框内容 == "CK"（验证焦点 + 文本输入管道）
+- 交互：滚轮后 `ScrollState.value > 0` **且**滚动区域像素发生变化；反向滚一格必须滚回去（锁死方向）
+- 回归：**首帧渲染之前**派发鼠标事件不得崩（`LazyColumn` 在无界约束下会抛异常）
+- 画廊整体能渲染出 > 40 种颜色（不是白屏）
+
+关键实现细节（都踩过坑）：
+
+1. `WindowsComposeApplication` 必须尽早调用 **`initWindowsMainThread()`**。
+   Skiko 的 `WindowsMainDispatcher` 只在 `isWindowsMainThread()` 为真时 inline 执行任务，
+   否则一律入队，而排空队列的 `flushMainUIDispatcher()` 自己也会先检查这个标志 —— 漏掉它，
+   所有 `launch`/`LaunchedEffect`/`snapshotFlow` 静默不执行（滚轮就是被这个坑掉的，
+   见 §14.4）。
+2. 离屏驱动必须用**单调递增**的帧时钟（`OffscreenDriver`）。`renderOffscreen()` 每次从 0 开始，
+   连续调用会让 `withFrameNanos()` 收到倒退的时间戳，动画/惯性滚动会算错。
+3. 像素断言点要避开涟漪（Material indication 是半透明叠加层）。自检界面里
+   `clickable(indication = null)`，这样「点击后颜色」才是确定的纯色。
+4. `ScrollState` 由测试注入并直接读 `.value`，不依赖 `snapshotFlow` 的调度时机。
+
+### 14.3 单元测试：`:compose-kn-tests`（linuxX64 + kotlin.test）
+
+```bash
+./gradlew :compose-kn-tests:linuxX64Test     # 20 个用例，秒级
+```
+
+为什么能在 Linux 上测 Windows 代码：把**平台无关**的那部分从 `compose-kn-windows` 抽到
+`src/windowsCommonMain/kotlin`（`WindowsEvent` / `WindowsInputState` / `WindowsKeyMapper` /
+`WindowsInputMapper` / `internal/Win32Structures`），`mingwX64Main` 与 `:compose-kn-tests`
+的 `linuxX64Main` 各自 `srcDir` 同一份源码。mingwX64 的测试二进制在 Linux 上跑不了，
+但纯逻辑用 linuxX64 编译执行完全等价。
+
+覆盖：映射表无重复键、四类修饰键左右区分、OEM 键码、Unicode 码点、
+`GET_X/Y_LPARAM` 的**符号扩展**、滚轮增量解码、`MK_*` 与桥接位掩码**不是同一套编码**、
+按键按下/抬起（抬起不带码点）、指针状态机。
+
+> 这层测试是有牙齿的：把 `0xDC` 改回 `0x5C`（历史上那个重复键 bug）后，
+> `20 tests completed, 2 failed`。
+
+CI：`.github/workflows/tests.yml`（ubuntu-latest，apt 装 wayland/EGL/xkbcommon 开发包）。
+
+### 14.4 自检抓到的真实 bug（本次）
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1a | **任何滚动容器都不响应鼠标滚轮**（`LazyColumn`/`verticalScroll`/`LazyRow` 全都不动） | `foundation` 的 K/N 原生 `platformScrollConfig()` 返回 `calculateMouseWheelScroll = Offset.Zero`（overlay 里的占位实现），`MouseWheelScrollingLogic` 拿到 0 直接 return。mingwX64 复用 `linuxX64Main` 源集，**Linux 与 Windows 原生一起中招** | 改为真实实现：Windows 按「一格 = 视口高度/20」换算，Wayland 直接透传像素；用 skiko 的 `hostOs` 在运行时区分（见 `vendor/compose-core.local/overlay/foundation/.../LinuxScrollable.linux.kt`） |
+| 1b | 修完 1a 后**滚轮仍然完全不动**（配置已算出非零 delta，见下方诊断输出） | `ComposeScenePointer` 传进来的 `scrollDelta` 被 mapper 取了负号。`scrollable` 内部对 `verticalScroll`/`LazyColumn` 的 `reverseDirection` 默认是 **true**，`canConsumeDelta` 会先 `reverseIfNeeded()`：符号反了 → `canScrollBackward` → 在 `value==0` 处判定「不可消费」→ 事件被丢弃（连 1px 都不滚）。mapper 里那行 `-event.deltaY` 是凭「正数=向下」的直觉写的，和 Compose 的实际约定相反 | `WindowsInputMapper` / `WaylandInputMapper` 都改成**原样透传**（Win32 的 delta/120 与 wl_pointer.axis 的 value 本身就是「负数=向下滚」）。自检新增 `interaction/wheel-up-scrolls-back` 双向锁死方向 |
+| 9 | 真机/画廊**启动瞬间崩溃**：`IllegalStateException: Vertically scrollable component was measured with an infinity maximum height constraints` | `scene.size` 只在 `renderFrame()` 里设置；而窗口消息循环是「先 `translateAndDispatch` 再 `renderImmediately`」，且窗口刚出现时消息泵里通常已经有一串鼠标 `Enter/Move` → `sendPointerEvent` 在 `scene.size == 0` 时触发 `measureAndLayout`，根节点拿到无界约束 → 内容里任何 `LazyColumn`/`verticalScroll` 当场抛异常 | ① `WindowsComposeApplication.setContent()` 先按构造参数估一个初始 `scene.size`；② `WindowsComposeWindow.run()` 在进入循环前先渲染一帧。自检新增 `render/event-before-first-render`（故意渲染前派事件） |
+| 2 | 离屏渲染时**所有协程静默不执行** | `WindowsComposeApplication` 未标记 UI 主线程，`WindowsMainDispatcher` 只入队不执行 | `init` 里调用 `initWindowsMainThread()` |
+| 3 | 右 Win 键被映射成反斜杠、`MetaRight` 永远取不到 | `mapOf` 里 `0x5C` 写了两次（`VK_RWIN` 与「反斜杠」），后者静默覆盖前者。反斜杠应该是 `VK_OEM_5`=0xDC | 修正键码 + 保留 pair 列表，新增 `duplicateVkEntries()` 断言（单测 + 自检都查） |
+| 4 | 「按住 Ctrl 点击」被当成 Shift | `MOUSE_BUTTON` 分支用 `modifiers and 1u`（=Shift 位）判 Ctrl | 改用 `MOD_CTRL`；并新增 `Win32Modifier` 与 `MK_*` 的区分注释与断言 |
+| 5 | 鼠标消息里的修饰键**永远是全 false** | `handleEvent` 里硬编码 `updateModifiersFromMouse(0)`；`updateModifiers(wParam)` 读的是 0x1000/0x2000/0x4000（既不是 MK_* 也不是桥接位） | `updateModifiers` 走桥接位掩码；三个鼠标分支改用事件自带的布尔标志 |
+| 6 | 拖到窗口左上角外时坐标变成 65535 | `GET_X_LPARAM` 用 `and 0xFFFF`（无符号），丢失符号位 | 改成 `(it shl 16) shr 16`（16 位有符号语义） |
+| 7 | 构建脚本 SIGPIPE 自杀（**退出码 141、无任何输出**） | `nm ... \| awk '... exit'`：awk 提前退出 → nm 收 SIGPIPE → `set -o pipefail` + `set -e` 直接干掉脚本 | 先整段收下 `nm` 输出，再让 awk 读完全部输入（不在规则里 `exit`） |
+| 8 | `libmcfgthread.a` 找不到（链接期才炸） | `x86_64-w64-mingw32-g++ -print-file-name=libmcfgthread.a` 找不到时原样返回 basename，`dirname` 得到 `.`，而判断用的是 `[ -d "$MCF_LIB" ]`（`.` 存在 → 走错分支） | 改为判断**文件**是否存在，回退用 `find ... -print -quit`（不用 `\| head -1`） |
+
+### 14.5 一键测试：`scripts/test-windows-native.sh`
+
+```bash
+# 在仓库根目录（会自己起 Xvfb —— NixOS 的 xvfb 包没有 xvfb-run）
+nix-shell -p wine64 xvfb xauth imagemagick xwininfo --run ./scripts/test-windows-native.sh
+```
+
+阶段：`logic` → `window` → `screenshot`（外部验证：抓窗口 PNG，检查标题栏 `#2D2D30`
+与颜色数 ≥ 200，即「不是白窗口」）。可选 `--skip-build`（用现有 exe）、
+`--no-screenshot`、`--only=<phase>`；产物与日志在 `/tmp/composekn-wintest/`。
+
+在真机（Windows 10/11）上等价操作：
+
+```powershell
+$env:COMPOSEKN_SELFTEST = "all"
+.\windows-demo.exe            # 退出码 0 = 全绿；结果在 stdout + composekn-startup.log
+```
+
+### 14.5.1 一次典型的排查过程（滚轮为什么还是不动）
+
+改完 `NativeScrollConfig` 之后滚轮依然纹丝不动。自检只能给出「`value=0`、像素零变化」，
+无法区分「事件没到」/「delta 被算成 0」/「算对了但没应用」，于是临时在三个位置加
+`println`（`WindowsInputMapper` → `LinuxScrollable` 的配置 → 上游
+`MouseWheelScrollingLogic.onMouseWheel`），一轮链接（7 分钟）就定位了：
+
+```
+WHEELMAP: dispatch at (400,540) rawDeltaY=-3 -> scrollDelta=Offset(0.0, 3.0)
+WHEELLOGIC: startReceivingEvents ctx=CoroutineScope(... FlushCoroutineDispatcher ...)
+WHEELLOGIC: receiver coroutine started
+SCROLLCFG: delta=Offset(0.0, 3.0)
+WHEELLOGIC: onMouseWheel delta=Offset(0.0, 18.0) reversed=Offset(0.0, -18.0) canConsume=false
+                                                                 ^^^^^^^^^^^^^^^^
+```
+
+`canConsume=false` 就是全部答案：事件到了、配置算出了 18px、接收协程也起来了，
+但符号反了导致 `canScrollBackward`（value=0 处不可用）。**能观测的信号要直接指向判定点**，
+比反复猜测快得多。
+
+### 14.6 后续项（尚未做）
+
+1. **CI 上跑 Windows 原生自检**：需要在 runner 里构建 mingw-Skia
+   （把 `build-skia-mingw.sh` 从 nix 迁到 MSYS2 mingw-w64 + CIPD 的 `gn`，约 30–60 分钟，
+   可缓存 `skia/out/mingw`），之后 `windows-native-selftest` job 只需
+   `COMPOSEKN_SELFTEST=all` + 断言退出码。当前 CI 只跑 §14.3 的纯逻辑单测。
+2. 弹层（`DropdownMenu`/`AlertDialog`）目前只验证「能编译、画廊能渲染」，
+   还没有「点开菜单 → 断言弹层像素」的自检用例。
+3. 文本编辑器能力（选区/光标/`Ctrl+A`/`Ctrl+C`）还没有自动化断言；
+   Compose 层的剪贴板（`PlatformContext.clipboard`）仍是 `Empty()`，
+   目前只有 `Win32Window.clipboard` 走通了桥接往返。
+4. Wayland 侧滚轮方向需要真机/合成器复验（本次只在 Windows 路径上做了端到端断言）。
+
+### 14.7 本次自检结果（Wine + Xvfb，Linux 主机）
+
+```
+$ nix-shell -p wine64 xvfb xauth imagemagick xwininfo \
+      --run ./scripts/test-windows-native.sh
+==> 阶段 logic (COMPOSEKN_SELFTEST=logic)
+✓ logic: RESULT PASS (50 checks)
+==> 阶段 window (COMPOSEKN_SELFTEST=window)
+✓ window: RESULT PASS (8 checks)
+==> 阶段 screenshot（抓真实窗口 PNG 并检查像素）
+✓ screenshot: 窗口已抓取（74093 bytes）
+✓ screenshot: 标题栏颜色 = srgb(45,45,48)
+✓ screenshot: 颜色数 1261（界面确实画出了内容，不是空白窗口）
+全部通过 ✅
+```
+
+```
+$ ./gradlew :compose-kn-tests:linuxX64Test       # 20 个用例全绿
+```

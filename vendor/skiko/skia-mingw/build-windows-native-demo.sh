@@ -17,8 +17,20 @@ SKIA_OUT="$WORK/skia/out/mingw"
 SHIM_DIR="$WORK/shim"
 MINGW_W64_LIB="$(dirname "$(x86_64-w64-mingw32-g++ -print-file-name=libmsvcrt.a)")"
 GCC_LIB="$(dirname "$(x86_64-w64-mingw32-g++ -print-file-name=libgcc.a)")"
-MCF_LIB="$(x86_64-w64-mingw32-g++ -print-file-name=libmcfgthread.a | xargs dirname 2>/dev/null || true)"
-[ -d "$MCF_LIB" ] || MCF_LIB=$(dirname "$(find /nix/store -maxdepth 4 -name libmcfgthread.a 2>/dev/null | head -1)")
+
+# libmcfgthread.a 来自独立的 nixpkgs 包，`-print-file-name` 通常找不到它
+# （会原样打印 basename，dirname 得到 "." —— 于是 LIBS 里出现 ./libmcfgthread.a
+#   这种不存在的路径，链接期才炸）。这里按「文件是否存在」判断，并且用
+# `find -print -quit` 而不是 `find | head -1`（后者会让 find 吃 SIGPIPE，
+# 在 set -o pipefail 下把整行变成 141）。
+mcf_candidate="$(x86_64-w64-mingw32-g++ -print-file-name=libmcfgthread.a 2>/dev/null || true)"
+if [ -f "$mcf_candidate" ]; then
+    MCF_LIB="$(dirname "$mcf_candidate")"
+else
+    mcf_found="$(find /nix/store -maxdepth 5 -name libmcfgthread.a -print -quit 2>/dev/null || true)"
+    MCF_LIB="$(dirname "${mcf_found:-/nonexistent}")"
+fi
+[ -f "$MCF_LIB/libmcfgthread.a" ] || { echo "!! 找不到 libmcfgthread.a（MCF_LIB=$MCF_LIB）" >&2; exit 1; }
 
 # 1) 构建符号补齐 shim（libstdc++ 15 新增、konan 的 GCC 9.2 里没有的 3 个符号）
 mkdir -p "$SHIM_DIR"
@@ -47,11 +59,17 @@ fi
 PATCHED_DIR="$SHIM_DIR/patched-libs"
 mkdir -p "$PATCHED_DIR"
 patch_ucrt_lib() {   # $1 = 原始归档, $2 = 输出归档名
-    local src="$1" out="$PATCHED_DIR/$2" mem=""
+    local src="$1" out="$PATCHED_DIR/$2" mem="" nm_out=""
     cp --no-preserve=mode -f "$src" "$out"
     chmod u+w "$out"
-    mem="$(x86_64-w64-mingw32-nm -A --defined-only "$src" 2>/dev/null \
-          | awk -v a="$src:" '/ [TtWw] _onexit$/ {sub("^"a, ""); sub(":.*", ""); print; exit}')"
+    # 注意：不要把 `nm` 直接管道给 `awk ... exit`。
+    # awk 一命中就退出 → nm 收到 SIGPIPE → 在 `set -o pipefail` 下整行返回 141，
+    # `set -e` 把脚本当场干掉（症状：脚本无任何输出、退出码 141）。
+    # 所以先完整收下 nm 的输出，再让 awk 读完全部输入（不在规则里提前 exit）。
+    nm_out="$(x86_64-w64-mingw32-nm -A --defined-only "$src" 2>/dev/null || true)"
+    mem="$(printf '%s\n' "$nm_out" | awk -v a="$src:" '
+        !found && / [TtWw] _onexit$/ {sub("^"a, ""); sub(":.*", ""); mem=$0; found=1}
+        END {if (found) print mem}')"
     if [ -n "$mem" ]; then
         x86_64-w64-mingw32-ar d "$out" "$mem"
     fi

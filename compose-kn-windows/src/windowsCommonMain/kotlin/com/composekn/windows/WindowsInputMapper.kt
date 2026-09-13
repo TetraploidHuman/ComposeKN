@@ -91,9 +91,17 @@ internal fun ComposeScene.dispatchWindowsMouseWheelEvent(
     event: WindowsEvent.MouseWheelEvent,
     inputState: WindowsInputState,
 ) {
+    // 符号约定（血泪教训，别改成取负）：
+    //   Win32 WM_MOUSEWHEEL 的 delta/120 > 0 = 滚轮向远离用户方向 = 向上滚（看更早的内容）。
+    //   scrollable 内部 `reverseDirection` 对 verticalScroll/LazyColumn 默认是 true，
+    //   `canConsumeDelta` / `dispatchMouseWheelScroll` 都会先做一次 reverseIfNeeded()：
+    //     scrollDelta.y < 0 → 向上滚；scrollDelta.y > 0 → 向下滚。
+    //   因此这里**原样透传**。曾经写成 -deltaY（以为「正数 = 向下」），结果
+    //   canConsume=false（value=0 时判定「无法向上滚」）→ 滚轮整体失效，
+    //   由自检 interaction/wheel-scroll 抓到（HANDOVER §14.4）。
     val scrollDelta = Offset(
         event.deltaX.toFloat(),
-        -event.deltaY.toFloat(),
+        event.deltaY.toFloat(),
     )
 
     sendPointerEvent(

@@ -130,9 +130,12 @@ internal fun ComposeScene.dispatchWaylandEvent(
             )
         }
         WaylandEventType.PointerAxis -> {
+            // 符号约定与 Windows 一致（见 WindowsInputMapper.dispatchWindowsMouseWheelEvent）：
+            // wl_pointer.axis 的 value 是「沿轴的相对位移向量」，负数 = 向下滚；
+            // scrollable 的 reverseDirection 会再反转一次，所以这里原样透传。
             val scrollDelta = when (event.axis) {
-                0 -> Offset(0f, -event.axisValue * contentScale)
-                1 -> Offset(-event.axisValue * contentScale, 0f)
+                0 -> Offset(0f, event.axisValue * contentScale)
+                1 -> Offset(event.axisValue * contentScale, 0f)
                 else -> Offset.Zero
             }
             sendPointerEvent(

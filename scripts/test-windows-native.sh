@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# ComposeKN Windows 原生 exe 的自动化测试驱动。
+#
+# 三层验证（对应 exe 内置的 `--selftest` 三阶段）：
+#   1. logic  —— 纯逻辑断言（键位映射/消息解码/输入状态），不需要窗口
+#   2. render —— 离屏光栅化真实 Compose 场景 + 像素断言（布局/density/CSD 标题栏/
+#                点击与键盘输入、滚轮滚动），同样不需要窗口
+#   3. window —— 真实 Win32 窗口：剪贴板桥接、逐帧渲染循环、合成点击、干净退出
+#   4. 截图   —— 独立于程序自述的外部验证：抓窗口 PNG，检查标题栏颜色/色彩数量
+#
+# 用法（在仓库根目录）：
+#   nix-shell -p wine64 xvfb xauth imagemagick xwininfo \
+#       --run ./scripts/test-windows-native.sh
+#
+#   --skip-build   不重新链接，直接用现有的 exe
+#   --no-screenshot 跳过截图阶段（没有 X 时）
+#   --only=<phase> 只跑某个阶段: logic|window|screenshot
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EXE="$REPO/samples/windows-demo/build/bin/mingwX64/releaseExecutable/windows-demo.exe"
+SKIA_WORK="${SKIA_MINGW_WORK:-/mnt/hdd2/KtLLM/skia-mingw}"
+ICUDTL="$SKIA_WORK/skia/out/mingw/icudtl.dat"
+RUN_DIR="${COMPOSEKN_WINTEST_DIR:-/tmp/composekn-wintest}"
+export WINEPREFIX="${WINEPREFIX:-/mnt/hdd2/KtLLM/wineprefix}"
+export WINEDEBUG="${WINEDEBUG:--all}"
+
+SKIP_BUILD=0
+DO_SCREENSHOT=1
+ONLY=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --skip-build) SKIP_BUILD=1 ;;
+        --no-screenshot) DO_SCREENSHOT=0 ;;
+        --only=*) ONLY="${arg#--only=}" ;;
+        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        *) echo "未知参数: $arg" >&2; exit 2 ;;
+    esac
+done
+
+FAILED=0
+declare -a SUMMARY=()
+
+pass() { SUMMARY+=("PASS  $1"); printf '\033[32m✓\033[0m %s\n' "$1"; }
+fail() { SUMMARY+=("FAIL  $1"); FAILED=1; printf '\033[31m✗\033[0m %s\n' "$1"; }
+info() { printf '\033[36m==>\033[0m %s\n' "$1"; }
+
+# ---------------------------------------------------------------- 0. 构建
+if [ "$SKIP_BUILD" = "0" ]; then
+    info "构建 windows-demo.exe（mingw-Skia，约 7 分钟）"
+    SKIA_MINGW_WORK="$SKIA_WORK" \
+        nix-shell "$REPO/shell.nix" --run "$REPO/vendor/skiko/skia-mingw/build-windows-native-demo.sh"
+fi
+[ -f "$EXE" ] || { echo "找不到 $EXE（先用 build-windows-native-demo.sh 构建）" >&2; exit 1; }
+
+# exe 必须和 icudtl.dat 同目录（SkLoadICU 找不到数据文件会导致文本排版失败）
+mkdir -p "$RUN_DIR"
+cp -f "$EXE" "$RUN_DIR/windows-demo.exe"
+if [ -f "$ICUDTL" ]; then
+    cp -f "$ICUDTL" "$RUN_DIR/icudtl.dat"
+else
+    info "警告: 找不到 icudtl.dat（$ICUDTL），文本排版可能失败"
+fi
+EXE_RUN="$RUN_DIR/windows-demo.exe"
+
+# 有些环境里 wine 只有 `wine`，没有 `wine64`
+WINECMD="$(command -v wine64 || command -v wine || true)"
+[ -n "$WINECMD" ] || { echo "找不到 wine（nix-shell -p wine64 ...）" >&2; exit 1; }
+
+# 起一个私有 Xvfb（NixOS 的 xvfb 包里**没有** xvfb-run），返回 DISPLAY 号
+XVFB_PID=""
+start_xvfb() {
+    local disp
+    for disp in 99 98 97 96; do
+        if [ ! -e "/tmp/.X${disp}-lock" ]; then break; fi
+        disp=""
+    done
+    [ -n "${disp:-}" ] || { echo "找不到空闲 X display" >&2; return 1; }
+    Xvfb ":$disp" -screen 0 1600x1000x24 -nolisten tcp >"$RUN_DIR/xvfb.log" 2>&1 &
+    XVFB_PID=$!
+    export DISPLAY=":$disp"
+    for _ in $(seq 1 40); do
+        [ -e "/tmp/.X${disp}-lock" ] && break
+        sleep 0.25
+    done
+    # shellcheck disable=SC2064
+    trap "kill $XVFB_PID 2>/dev/null || true" EXIT
+    sleep 1
+}
+
+run_phase() {   # $1 = 阶段名, $2 = COMPOSEKN_SELFTEST 取值, $3 = 是否需要 X
+    local name="$1" mode="$2" need_x="$3" log="$RUN_DIR/$1.log"
+    info "阶段 $name (COMPOSEKN_SELFTEST=$mode)"
+    [ "$need_x" = "1" ] && start_xvfb
+    set +e
+    env COMPOSEKN_SELFTEST="$mode" "$WINECMD" "$EXE_RUN" >"$log" 2>&1
+    local rc=$?
+    set -e
+    local checks failed
+    checks="$(grep -c '^SELFTEST ok' "$log" || true)"
+    failed="$(grep -c '^SELFTEST FAIL' "$log" || true)"
+
+    if grep -q '^SELFTEST: RESULT PASS' "$log"; then
+        pass "$name: RESULT PASS ($checks checks)"
+    elif [ "$rc" = "0" ] && [ "$failed" = "0" ]; then
+        # 没有 SELFTEST 输出但退出码 0 —— 属于异常（说明自检根本没跑）
+        fail "$name: 退出码 0 但没有 SELFTEST 结果行（日志: $log）"
+        tail -20 "$log"
+    else
+        fail "$name: rc=$rc, $checks ok / $failed failed（日志: $log）"
+        grep '^SELFTEST' "$log" | tail -30 || true
+        tail -20 "$log"
+    fi
+}
+
+# ------------------------------------------------- 1+2. logic + 离屏渲染
+if [ -z "$ONLY" ] || [ "$ONLY" = "logic" ]; then
+    run_phase logic logic 0
+fi
+
+# ----------------------------------------------------------- 3. 真实窗口
+if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
+    run_phase window window 1
+fi
+
+# ------------------------------------------------- 4. 截图（外部像素校验）
+if { [ -z "$ONLY" ] && [ "$DO_SCREENSHOT" = "1" ]; } || [ "$ONLY" = "screenshot" ]; then
+    info "阶段 screenshot（抓真实窗口 PNG 并检查像素）"
+    SHOT="$RUN_DIR/gallery.png"
+    LOG="$RUN_DIR/gallery.log"
+    rm -f "$SHOT"
+    cat > "$RUN_DIR/shot.sh" <<'EOSH'
+set -e
+export WINEDEBUG="${WINEDEBUG:--all}"
+"$WINECMD" "$EXE_RUN" >"$LOG" 2>&1 &
+APP_PID=$!
+for _ in $(seq 1 40); do
+    sleep 0.5
+    WID="$(xwininfo -root -tree 2>/dev/null | grep -m1 'ComposeKN Windows Demo' | awk '{print $1}')" || true
+    [ -n "${WID:-}" ] && break
+done
+if [ -z "${WID:-}" ]; then
+    echo "SHOT-NO-WINDOW"
+    kill $APP_PID 2>/dev/null || true
+    exit 1
+fi
+sleep 4
+import -window "$WID" "$SHOT" 2>/dev/null || echo "SHOT-IMPORT-FAILED"
+kill $APP_PID 2>/dev/null || true
+wait $APP_PID 2>/dev/null || true
+echo "SHOT-OK"
+EOSH
+    start_xvfb
+    set +e
+    env WINECMD="$WINECMD" EXE_RUN="$EXE_RUN" LOG="$LOG" SHOT="$SHOT" bash "$RUN_DIR/shot.sh" \
+        > "$RUN_DIR/shot.out" 2>&1
+    set -e
+
+    if grep -q SHOT-OK "$RUN_DIR/shot.out" && [ -s "$SHOT" ]; then
+        pass "screenshot: 窗口已抓取（$(stat -c%s "$SHOT") bytes）"
+        # 标题栏（左上角）应当是 CSD 深色 #2D2D30
+        TITLE_PX="$(convert "$SHOT" -format '%[pixel:p{8,8}]' info: 2>/dev/null || echo '?')"
+        COLORS="$(convert "$SHOT" -format '%k' info: 2>/dev/null || echo 0)"
+        case "$TITLE_PX" in
+            *45,45,48*|*2D2D30*|*srgb\(45,45,48\)*) pass "screenshot: 标题栏颜色 = $TITLE_PX" ;;
+            *) fail "screenshot: 标题栏颜色异常 ($TITLE_PX, 期望 #2D2D30)" ;;
+        esac
+        if [ "$COLORS" -ge 200 ] 2>/dev/null; then
+            pass "screenshot: 颜色数 $COLORS（界面确实画出了内容，不是空白窗口）"
+        else
+            fail "screenshot: 颜色数仅 $COLORS（疑似空白窗口）"
+        fi
+    else
+        fail "screenshot: 未能抓到窗口（见 $RUN_DIR/shot.out）"
+        tail -20 "$RUN_DIR/shot.out" 2>/dev/null || true
+    fi
+fi
+
+echo
+echo "==================== 测试汇总 ===================="
+printf '%s\n' "${SUMMARY[@]}"
+echo "================================================="
+if [ "$FAILED" = "0" ]; then
+    echo "全部通过 ✅"
+else
+    echo "存在失败 ❌"
+fi
+exit "$FAILED"

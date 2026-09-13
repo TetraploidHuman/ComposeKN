@@ -1,6 +1,8 @@
 package com.composekn.windows.internal
 
-import kotlinx.cinterop.*
+// 本文件只放「纯数据 + 纯函数」：不依赖 cinterop / skiko / Win32 系统调用，
+// 因此可以被 :compose-kn-tests 以 linuxX64 目标直接编译并跑单元测试。
+// （平台相关的 winlog 见 windowsX64Main 的 Winlog.kt。）
 
 // Windows message constants
 const val WM_DESTROY = 0x0002
@@ -59,6 +61,18 @@ const val VK_INSERT = 0x2D
 const val VK_DELETE = 0x2E
 const val VK_LWIN = 0x5B
 const val VK_RWIN = 0x5C
+// OEM 键（美式布局）：VK_OEM_5=反斜杠，VK_OEM_2=/ 等
+const val VK_OEM_1 = 0xBA   // ;
+const val VK_OEM_PLUS = 0xBB
+const val VK_OEM_COMMA = 0xBC
+const val VK_OEM_MINUS = 0xBD
+const val VK_OEM_PERIOD = 0xBE
+const val VK_OEM_2 = 0xBF   // /
+const val VK_OEM_3 = 0xC0   // `
+const val VK_OEM_4 = 0xDB   // [
+const val VK_OEM_5_DOC = 0xDC // \
+const val VK_OEM_6 = 0xDD   // ]
+const val VK_OEM_7 = 0xDE   // '
 const val VK_NUMPAD0 = 0x60
 const val VK_NUMPAD9 = 0x69
 const val VK_MULTIPLY = 0x6A
@@ -84,9 +98,29 @@ const val MK_SHIFT = 0x0004
 const val MK_CONTROL = 0x0008
 const val MK_ALT = 0x0020
 
-// Get key state
-val GET_X_LPARAM: (Int) -> Int = { it and 0xFFFF }
-val GET_Y_LPARAM: (Int) -> Int = { (it ushr 16) and 0xFFFF }
+/**
+ * C 桥 (`win32_window.cc` 的 `queryCurrentModifiers`) 输出的修饰键位掩码。
+ *
+ * 与 `MK_*`（鼠标 wParam 用）是两套不同的编码，别混用：
+ * MK_SHIFT=0x0004 而这里 SHIFT=0x0001。
+ */
+object Win32Modifier {
+    const val SHIFT = 0x1
+    const val CTRL = 0x2
+    const val ALT = 0x4
+    const val META = 0x8
+}
+
+// UInt 版本，便于直接和桥接返回的 `modifiers: UInt` 做位与。
+const val MOD_SHIFT: UInt = 0x1u
+const val MOD_CTRL: UInt = 0x2u
+const val MOD_ALT: UInt = 0x4u
+const val MOD_META: UInt = 0x8u
+
+// 从 lParam/wParam 解坐标与滚轮增量（Win32 语义：16 位**有符号**）
+// 旧实现用 `and 0xFFFF`，负数坐标会变成 65535（拖到窗口左上角外时坐标就飞了）。
+val GET_X_LPARAM: (Int) -> Int = { (it shl 16) shr 16 }
+val GET_Y_LPARAM: (Int) -> Int = { it shr 16 }
 val GET_WHEEL_DELTA_WPARAM: (Int) -> Int = { (it shr 16).toShort().toInt() }
 
 // Window class styles
@@ -126,13 +160,3 @@ const val WM_TIMER = 0x0113
 // Custom messages
 const val WM_APP = 0x8000
 const val WM_COMPOSE_INVALIDATE = WM_APP + 1
-
-
-/** 启动诊断日志：写入 exe 同目录的 composekn-startup.log。 */
-fun winlog(message: String) {
-    try {
-        org.jetbrains.skiko.win32Log(message)
-    } catch (t: Throwable) {
-        // 日志失败不影响主流程
-    }
-}
