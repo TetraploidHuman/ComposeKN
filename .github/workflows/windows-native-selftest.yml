@@ -146,10 +146,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb xauth x11-utils imagemagick zstd
-          # wine 的包名在 ubuntu 20/22/24 之间变过（wine64 -> wine）
-          sudo apt-get install -y --no-install-recommends wine64 \
-            || sudo apt-get install -y --no-install-recommends wine
-          (wine --version || wine64 --version) 2>&1 | head -3
+          # ubuntu 24.04 的 `wine64` 包只装 /usr/lib/wine/wine64（不在 PATH 里），
+          # 提供 /usr/bin/wine 启动器的是 `wine` 这个包 —— 两个都装，别只装 wine64。
+          sudo apt-get install -y --no-install-recommends wine
+          sudo apt-get install -y --no-install-recommends wine64 || true
+          (command -v wine64 || command -v wine || ls -la /usr/lib/wine/wine64) 2>&1 | head -5
 
       # 先把 wineprefix 建出来：第一次跑 wine 会自动创建 prefix，
       # 而「没有 DISPLAY 时创建 prefix」在 CI 上不稳定（logic 阶段是不带 X 跑的）。

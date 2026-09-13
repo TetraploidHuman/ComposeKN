@@ -85,9 +85,22 @@ else
 fi
 EXE_RUN="$RUN_DIR/windows-demo.exe"
 
-# 有些环境里 wine 只有 `wine`，没有 `wine64`
+# wine 可执行文件的位置在不同发行版/包名之间来回变：
+#   * NixOS: wine64 / wine 在 PATH 里
+#   * Ubuntu 22.04: wine64 在 PATH 里
+#   * Ubuntu 24.04: `wine` 包给 /usr/bin/wine；只装 `wine64` 包的话可执行文件是
+#                   /usr/lib/wine/wine64（**不在 PATH**）—— CI 上就是这么踩到的
 WINECMD="$(command -v wine64 || command -v wine || true)"
-[ -n "$WINECMD" ] || { echo "找不到 wine（nix-shell -p wine64 ...）" >&2; exit 1; }
+if [ -z "$WINECMD" ]; then
+    for candidate in /usr/lib/wine/wine64 /usr/lib/wine/wine /usr/local/bin/wine; do
+        [ -x "$candidate" ] && { WINECMD="$candidate"; break; }
+    done
+fi
+[ -n "$WINECMD" ] || {
+    echo "找不到 wine（nix-shell -p wine64 ... / apt install wine）" >&2
+    ls -la /usr/lib/wine/ 2>/dev/null | head -5 || true
+    exit 1
+}
 
 # 起一个私有 Xvfb（NixOS 的 xvfb 包里**没有** xvfb-run），返回 DISPLAY 号
 XVFB_PID=""
