@@ -128,10 +128,18 @@ run_phase() {   # $1 = 阶段名, $2 = COMPOSEKN_SELFTEST 取值, $3 = 是否需
     info "阶段 $name (COMPOSEKN_SELFTEST=$mode)"
     [ "$need_x" = "1" ] && start_xvfb
     set +e
-    env COMPOSEKN_SELFTEST="$mode" "$WINECMD" "$EXE_RUN" >"$log" 2>&1
+    # 每个阶段都加硬超时：自检挂住时立刻失败并打出「最后跑到哪一条断言」，
+    # 而不是耗到 CI job 超时、日志里什么线索都没有（这个坑真的踩过）。
+    timeout "${PHASE_TIMEOUT:-600}" env COMPOSEKN_SELFTEST="$mode" "$WINECMD" "$EXE_RUN" >"$log" 2>&1
     local rc=$?
     set -e
     local checks failed
+    if [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
+        fail "$name: 阶段超时（>${PHASE_TIMEOUT:-600}s），疑似挂死（日志: $log）"
+        grep '^SELFTEST' "$log" | tail -15 || true
+        tail -10 "$log"
+        return 1
+    fi
     checks="$(grep -c '^SELFTEST ok' "$log" || true)"
     failed="$(grep -c '^SELFTEST FAIL' "$log" || true)"
 
@@ -181,13 +189,19 @@ if [ -z "${WID:-}" ]; then
 fi
 sleep 4
 import -window "$WID" "$SHOT" 2>/dev/null || echo "SHOT-IMPORT-FAILED"
+# 收尾：**不要**用裸 `wait` —— 如果 wine 里的进程对 SIGTERM 没反应，
+# `wait` 会一直阻塞（CI 上真的把整个 job 挂死了 23 分钟）。这里给 5 秒宽限后强杀。
 kill $APP_PID 2>/dev/null || true
-wait $APP_PID 2>/dev/null || true
+for _ in $(seq 1 20); do
+    kill -0 $APP_PID 2>/dev/null || break
+    sleep 0.25
+done
+kill -9 $APP_PID 2>/dev/null || true
 echo "SHOT-OK"
 EOSH
     start_xvfb
     set +e
-    env WINECMD="$WINECMD" EXE_RUN="$EXE_RUN" LOG="$LOG" SHOT="$SHOT" bash "$RUN_DIR/shot.sh" \
+    timeout 300 env WINECMD="$WINECMD" EXE_RUN="$EXE_RUN" LOG="$LOG" SHOT="$SHOT" bash "$RUN_DIR/shot.sh" \
         > "$RUN_DIR/shot.out" 2>&1
     set -e
 

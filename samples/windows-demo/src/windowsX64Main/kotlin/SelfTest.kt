@@ -368,6 +368,12 @@ class SelfTestReport {
 
     private fun line(text: String) {
         println(text)
+        // Kotlin/Native 的 stdout 接到管道时是块缓冲的：不 flush 的话，
+        // 进程挂住时日志里连「最后跑到哪一条断言」都看不到。
+        try {
+            platform.posix.fflush(platform.posix.stdout)
+        } catch (_: Throwable) {
+        }
     }
 
     fun section(title: String) = line("SELFTEST --- $title ---")
@@ -403,8 +409,16 @@ fun runSelfTest(mode: String): Boolean {
     val report = SelfTestReport()
     println("SELFTEST: mode=$mode")
     try {
-        if (mode == "logic" || mode == "all") runOfflineTests(report)
-        if (mode == "window" || mode == "all") runWindowTests(report)
+        if (mode == "logic" || mode == "all") {
+            report.section("phase: 离屏 logic 开始")
+            runOfflineTests(report)
+            report.section("phase: 离屏 logic 结束")
+        }
+        if (mode == "window" || mode == "all") {
+            report.section("phase: 真实窗口 window 开始")
+            runWindowTests(report)
+            report.section("phase: 真实窗口 window 结束")
+        }
     } catch (t: Throwable) {
         report.check(
             "selftest/unhandled-exception",
@@ -753,6 +767,8 @@ private fun runWindowTests(report: SelfTestReport) {
     var clickedAt = Pair(0, 0)
 
     app.window.frameHook = { frame ->
+        // 进度心跳：窗口阶段以前在 CI 上挂死过，日志里必须能看出「帧有没有在走」
+        if (frame % 20 == 0) report.section("window 进度 frame=$frame")
         if (frame == 10) {
             val w = app.window
             report.check(

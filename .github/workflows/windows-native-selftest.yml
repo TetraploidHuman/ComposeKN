@@ -145,7 +145,13 @@ jobs:
       - name: Install Wine + X tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb xauth x11-utils imagemagick zstd
+          # 字体是必须的：exe 用 Skia 的 Windows 字体管理器，Wine 那边如果
+          # 一个字体都没有，Compose 的 FontFamilyResolver 会直接
+          # `IllegalStateException: Could not load font`（CI 上第一次跑就是这个问题）。
+          sudo apt-get install -y --no-install-recommends \
+            xvfb xauth x11-utils imagemagick zstd fontconfig \
+            fonts-liberation fonts-dejavu-core
+          fc-cache -f >/dev/null 2>&1 || true
           # ubuntu 24.04 的 `wine64` 包只装 /usr/lib/wine/wine64（不在 PATH 里），
           # 提供 /usr/bin/wine 启动器的是 `wine` 这个包 —— 两个都装，别只装 wine64。
           sudo apt-get install -y --no-install-recommends wine
@@ -160,6 +166,13 @@ jobs:
           WINEDEBUG: -all
         run: |
           xvfb-run -a wineboot -u || true
+          # 顺手把系统字体拷进 wineprefix 的 C:\windows\Fonts —— Skia 的 Windows
+          # 字体管理器（DirectWrite）在 Wine 下就是从这儿找字体的，缺字体时
+          # Compose 会 `Could not load font`。
+          mkdir -p "$WINEPREFIX/drive_c/windows/Fonts"
+          cp -n /usr/share/fonts/truetype/liberation/*.ttf "$WINEPREFIX/drive_c/windows/Fonts/" 2>/dev/null || true
+          cp -n /usr/share/fonts/truetype/dejavu/*.ttf "$WINEPREFIX/drive_c/windows/Fonts/" 2>/dev/null || true
+          ls "$WINEPREFIX/drive_c/windows/Fonts" | head -8
           ls "$WINEPREFIX" | head -5
 
       - name: Run native selftest (logic + window + screenshot)
