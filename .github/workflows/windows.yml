@@ -44,27 +44,14 @@ jobs:
             samples/windows-jvm-demo/build/compose/binaries/main/**/*.msi
           if-no-files-found: error
 
-  # Windows/Kotlin-Native: 目前止步于 ABI 边界 (skia MSVC vs K/N mingw Itanium)
-  windows-native-mingw:
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '9.5.0'
-
-      - name: Build windows demo (native)
-        shell: pwsh
-        run: |
-          gradle.bat :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon `
-            "-Porg.gradle.jvmargs=-Xmx6g"
+  # Windows/Kotlin-Native（mingwX64）的构建 + 自检**不在这里**。
+  #
+  # 2026-09-13：这条路线已经打通（自编译 GNU-ABI Skia + konan mingwX64），
+  # 端到端管线在 .github/workflows/windows-native-selftest.yml：
+  #   ubuntu-latest + Nix(pin nixpkgs) + 预编译 mingw-Skia 包
+  #   → 链接 HEAD 的 windows-demo.exe
+  #   → Wine + Xvfb 跑 logic / window / screenshot 三段自检并断言退出码
+  #
+  # 历史上这里有个 `windows-native-mingw` job，只跑 gradle link、必然失败
+  # （skia MSVC ABI 与 K/N mingw Itanium ABI 对不上），靠 continue-on-error 掩盖；
+  # 现在它已经没有意义，删掉以免「绿的 run 里藏着一个一直失败的 job」。

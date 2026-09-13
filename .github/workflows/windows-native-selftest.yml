@@ -100,6 +100,10 @@ jobs:
 
       - name: Fetch mingw-Skia prebuilt package
         if: steps.skia-cache.outputs.cache-hit != 'true'
+        env:
+          # 仓库是私有的：Release 资产必须带 token 才能下载（否则 curl 拿到 404）
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd
           ./scripts/fetch-skia-mingw.sh "$SKIA_DIR"

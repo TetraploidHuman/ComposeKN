@@ -38,10 +38,55 @@ fi
 
 TARBALL="$DEST/$PKG_NAME.tar.zst"
 info "下载 $PKG_NAME.tar.zst"
+
+# 私有仓库的 Release 资产需要带 token（curl 直接请求会 404，不是 403）。
+# 本地可用 `gh auth token`，CI 里用 `GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}`。
+TOKEN="${COMPOSEKN_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+
 case "$URL" in
     file://*|/*) cp -f "${URL#file://}" "$TARBALL" ;;
-    *) curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
-             --connect-timeout 30 -o "$TARBALL" "$URL" ;;
+    *)
+        # 私有仓库的 Release 资产：浏览器下载地址（releases/download/...）带 token 也是 404，
+        # 必须走 API（或 gh）。见下面两个分支。
+        if [ -n "$TOKEN" ] && [ -z "${COMPOSEKN_FORCE_API_DOWNLOAD:-}" ] &&
+           [[ "$URL" =~ ^https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.+)$ ]]; then
+            gh_owner="${BASH_REMATCH[1]}"
+            gh_repo="${BASH_REMATCH[2]}"
+            gh_tag="${BASH_REMATCH[3]}"
+            gh_file="${BASH_REMATCH[4]}"
+            if command -v gh >/dev/null 2>&1; then
+                info "私有仓库：gh release download $gh_tag -R $gh_owner/$gh_repo -p $gh_file"
+                GH_TOKEN="$TOKEN" gh release download "$gh_tag" -R "$gh_owner/$gh_repo" \
+                    -p "$gh_file" -D "$DEST" --clobber || die "gh release download 失败（token 有没有 repo 权限？）"
+                [ "$DEST/$gh_file" = "$TARBALL" ] || mv -f "$DEST/$gh_file" "$TARBALL"
+            else
+                info "私有仓库：走 Releases API 取资产（无 gh，用 curl + python3）"
+                asset_id="$(curl -fsSL -H "Authorization: Bearer $TOKEN" \
+                        -H "Accept: application/vnd.github+json" \
+                        "https://api.github.com/repos/$gh_owner/$gh_repo/releases/tags/$gh_tag" \
+                    | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print(next(a["id"] for a in d["assets"] if a["name"] == sys.argv[1]))' "$gh_file")" \
+                    || die "Releases API 查资产 id 失败"
+                curl -fL -H "Authorization: Bearer $TOKEN" \
+                    -H "Accept: application/octet-stream" \
+                    -o "$TARBALL" \
+                    "https://api.github.com/repos/$gh_owner/$gh_repo/releases/assets/$asset_id" \
+                    || die "下载资产 $asset_id 失败"
+            fi
+        else
+            curl_args=(-fL --retry 5 --retry-all-errors --retry-delay 3
+                       --connect-timeout 30 -o "$TARBALL")
+            if [ -n "$TOKEN" ]; then
+                curl_args+=(-H "Authorization: Bearer $TOKEN")
+            fi
+            if ! curl "${curl_args[@]}" "$URL"; then
+                die "下载失败：$URL
+   私有仓库的 Release 资产需要 token：export GH_TOKEN=\$(gh auth token)
+   （CI 里传 GITHUB_TOKEN；脚本会自动改走 gh / Releases API）"
+            fi
+        fi
+        ;;
 esac
 [ -s "$TARBALL" ] || die "下载失败或文件为空：$URL"
 
