@@ -33,8 +33,12 @@ rm -rf "$STAGE" && mkdir -p "$STAGE"
 cp -f "$EXE" "$STAGE/ComposeKN-Windows-Native.exe"
 cp -f "$ICUDTL" "$STAGE/icudtl.dat"
 
-cat > "$STAGE/README.txt" <<EOF
-ComposeKN Windows 原生组件画廊 v$VERSION
+# 注意：heredoc 必须**带引号**（<<'EOF'）。
+# 不引号时 shell 会吃掉反引号（``cmd`` 会被当命令替换执行、文本直接消失），
+# v0.2.9/v0.3.0 的 README 就是这样丢掉了一整行的命令提示。
+# 版本号只能靠显式占位替换注入，所以下面用 sed 处理 __VERSION__。
+cat > "$STAGE/README.txt" <<'EOF'
+ComposeKN Windows 原生组件画廊 v__VERSION__
 =========================================
 
 免安装：解压后双击 ComposeKN-Windows-Native.exe 即可。
@@ -54,7 +58,7 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · Canvas 绘制（渐变/路径/描边/旋转）、FlowRow 自动换行、主题切换（深/浅色）
   · 渲染：**按需渲染 + 按刷新率节流**（没有内容变化就不重绘，空闲时 CPU ≈ 0；
     这个窗口的标题栏实时显示实测帧率）
-  · 想看空闲行为：`ComposeKN-Windows-Native.exe --no-animate`（关掉每帧动画）
+  · 想看空闲行为：ComposeKN-Windows-Native.exe --no-animate（关掉每帧动画）
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
 
 自检（自动化测试）
@@ -83,10 +87,13 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
   composekn-startup.log —— exe 同目录，含启动诊断 + 每秒一行 GALLERY-STATS
   （帧率 / 各作用域重组次数 / 本进程 CPU 占用）+ 每 120 帧一行 profile
   （update / replay / present 耗时拆解、呈现路径 direct 还是 copy）。
-  想复现「静止」对照：再加 `--no-animate` 跑一遍（预期 frames/s=+0、cpu≈0ms/s）。
+  想复现「静止」对照：再加 --no-animate 跑一遍（预期 frames/s=+0、cpu≈0ms/s）。
 
 日志：composekn-startup.log（exe 同目录，含启动诊断与事件日志）。
 EOF
+
+# 注入版本号（heredoc 带引号后无法做变量替换）
+sed -i "s/__VERSION__/$VERSION/g" "$STAGE/README.txt"
 
 ( cd "$OUT_DIR" && rm -f "$ZIP" && zip -q -r "$ZIP" "ComposeKN-Windows-Native" )
 echo
