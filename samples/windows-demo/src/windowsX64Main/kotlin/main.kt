@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.time.TimeSource
 import com.composekn.windows.WindowsComposeApplication
 import com.composekn.windows.internal.winlog
 import kotlin.system.exitProcess
@@ -38,6 +39,9 @@ fun main(args: Array<String>) {
     println("ComposeKN Windows: Starting component gallery")
     log("main: entry (Kotlin main reached)")
 
+    val animate = resolveGalleryAnimation(args)
+    println("ComposeKN Windows: gallery animation = $animate（--no-animate / COMPOSEKN_GALLERY_ANIMATE=0 可关）")
+
     val probe = GalleryProbe()
     val app = WindowsComposeApplication(
         title = "ComposeKN Windows Demo",
@@ -45,12 +49,38 @@ fun main(args: Array<String>) {
         height = 760,
     )
     app.run {
-        // 每帧 +1：既驱动 HUD 上的帧计数，也让界面持续重组（等价于动画场景的压力）。
-        LaunchedEffect(Unit) {
-            while (true) {
-                withFrameNanos { probe.frames++ }
+        if (animate) {
+            // 每帧 +1：既驱动 HUD 上的帧计数，也让界面持续重组（等价于动画场景的压力）。
+            LaunchedEffect(Unit) {
+                while (true) {
+                    withFrameNanos { probe.frames++ }
+                }
+            }
+        } else {
+            // 关掉动画时的静置画面：HUD 里的 frames 不再增长，窗口应当**完全静止**
+            // （宿主按需渲染 -> 没有失效就不重绘 -> CPU ≈ 0）。用来对比/演示。
+            LaunchedEffect(Unit) {
+                probe.frames = 0
             }
         }
+
+        // 标题里显示实测帧率：人工测试和脚本（xwininfo -root -tree）都能直接读到
+        // 宿主真实的渲染节奏 —— 「按需渲染 + 帧节流」是否生效一眼可见。
+        // 这个协程每秒醒一次（用 delay，不依赖渲染），所以静止时也会把 fps=0 刷出来。
+        LaunchedEffect(Unit) {
+            var lastFrames = 0
+            var lastMark = TimeSource.Monotonic.markNow()
+            while (true) {
+                delay(1000)
+                val elapsed = lastMark.elapsedNow()
+                val total = app.window.frameCount
+                val fps = (total - lastFrames) * 1_000_000_000.0 / elapsed.inWholeNanoseconds
+                lastFrames = total
+                lastMark = TimeSource.Monotonic.markNow()
+                app.window.setTitle("ComposeKN Windows Demo — ${fpsOf(fps)} fps (frames=$total)")
+            }
+        }
+
         ComponentGallery(probe = probe, window = app.window)
     }
     println("ComposeKN Windows: window loop finished")
@@ -75,6 +105,25 @@ private fun normalizeSelfTestMode(value: String): String = when (value.lowercase
     "logic", "offline", "offscreen" -> "logic"
     "window", "win" -> "window"
     else -> "all"
+}
+
+/**
+ * 画廊是否跑「每帧 +1」的动画（默认 true）。
+ *
+ * 关掉它就能观察空闲行为：宿主现在是按需渲染，静止窗口不应该产生任何帧。
+ * 用法：`--no-animate` 或 `COMPOSEKN_GALLERY_ANIMATE=0`。
+ */
+private fun resolveGalleryAnimation(args: Array<String>): Boolean {
+    if (args.any { it == "--no-animate" }) return false
+    val env = getenv("COMPOSEKN_GALLERY_ANIMATE")?.toKString()?.trim()?.lowercase()
+    return !(env == "0" || env == "false" || env == "no" || env == "off")
+}
+
+/** 一位小数（Kotlin/Native 上不依赖 String.format）。 */
+private fun fpsOf(value: Double): String {
+    if (value.isNaN() || value < 0) return "n/a"
+    val ticks = (value * 10.0 + 0.5).toLong()
+    return "${ticks / 10}.${ticks % 10}"
 }
 
 private fun log(message: String) {

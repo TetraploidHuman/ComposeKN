@@ -188,7 +188,35 @@ if [ -z "${WID:-}" ]; then
     exit 1
 fi
 sleep 4
-import -window "$WID" "$SHOT" 2>/dev/null || echo "SHOT-IMPORT-FAILED"
+# demo 每秒把**实测帧率**写进窗口标题（见 main.kt）：读出来作为「按需渲染 + 帧节流」
+# 的外部验证（不依赖程序自述）。
+#   * 读多次取**最大值**：`import` 抓图会让 wine 侧短暂停顿（X 服务端抓图），
+#     偶尔还会赶上应用刚启动的那一秒（帧率天然偏低），单次读会把噪声当成结论。
+#   * 每次都打印原始标题（含 frames=），排查时能看出「是停摆了还是刚起步」。
+read_title() {
+    # 注意 `"\([^"]*\)"`：用 `"\(.*\)"` 的话贪婪匹配会吃到行内最后一个引号，
+    # 把 `": ("windows-demo.exe"` 这类尾巴也带进来（曾经把 59.8 解析成 9.8）。
+    xwininfo -root -tree 2>/dev/null | grep -m1 'ComposeKN Windows Demo' \
+      | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p'
+}
+read_fps() {
+    # 同理：`.*\([0-9]+\.[0-9]+\)` 这种贪婪前缀会把 59.8 捕获成 9.8（少一位数字）。
+    # 用 grep -oE 从最左边开始找 `数字.数字 fps`。
+    printf '%s' "$1" | grep -oE '[0-9][0-9]*\.[0-9]+ fps' | head -1 \
+      | grep -oE '^[0-9][0-9]*\.[0-9]+'
+}
+FPS=""
+for i in 1 2 3 4; do
+    TITLE="$(read_title || true)"
+    echo "SHOT-TITLE-$i=$TITLE"
+    V="$(read_fps "${TITLE:-}" || true)"
+    if [ -n "${V:-}" ] && awk "BEGIN{exit !($V > ${FPS:-0})}"; then FPS="$V"; fi
+    if [ "$i" = 2 ]; then
+        import -window "$WID" "$SHOT" 2>/dev/null || echo "SHOT-IMPORT-FAILED"
+    fi
+    sleep 2
+done
+echo "SHOT-FPS=${FPS:-unknown}"
 # 收尾：**不要**用裸 `wait` —— 如果 wine 里的进程对 SIGTERM 没反应，
 # `wait` 会一直阻塞（CI 上真的把整个 job 挂死了 23 分钟）。这里给 5 秒宽限后强杀。
 kill $APP_PID 2>/dev/null || true
@@ -219,6 +247,20 @@ EOSH
         else
             fail "screenshot: 颜色数仅 $COLORS（疑似空白窗口）"
         fi
+        # 外部帧率验证：画廊在跑「每帧 +1」的动画，标题里的实测 fps 必须
+        #   * > 5   —— 动画确实在跑（不是卡死/停摆）
+        #   * < 90  —— 被节流到刷新率附近（老代码是无节制重绘，这里会是 100+）
+        FPS="$(grep -o 'SHOT-FPS=[0-9.]*' "$RUN_DIR/shot.out" 2>/dev/null | head -1 | cut -d= -f2)"
+        case "${FPS:-unknown}" in
+            ''|unknown) fail "screenshot: 没能从窗口标题读到帧率（见 $RUN_DIR/shot.out）" ;;
+            *)
+                if awk "BEGIN{exit !($FPS > 5 && $FPS < 90)}"; then
+                    pass "screenshot: 画廊实测帧率 $FPS fps（动画在跑，且已被节流）"
+                else
+                    fail "screenshot: 画廊实测帧率 $FPS fps（期望 5..90：太小=动画停摆，太大=没节流）"
+                fi
+                ;;
+        esac
     else
         fail "screenshot: 未能抓到窗口（见 $RUN_DIR/shot.out）"
         tail -20 "$RUN_DIR/shot.out" 2>/dev/null || true

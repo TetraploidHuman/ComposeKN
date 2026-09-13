@@ -219,6 +219,10 @@ static void fireRenderTick() {
 // Wine/Xvfb 下没有窗口管理器，无法从外部触发 WM_SIZE，用它验证上面这条链路。
 static const UINT_PTR kTestResizeTimerId = 0xC011;
 
+// 私有「醒一醒」消息：只用于把阻塞在 composekn_win32_wait_message 的线程叫起来。
+// wndproc 里直接吞掉，绝不进事件队列。
+static const UINT kComposeKNWakeMessage = WM_APP + 1;
+
 static void maybeStartTestResize(ComposeKNWin32Window* window) {
     const char* env = getenv("COMPOSEKN_TEST_RESIZE");
     if (env == nullptr || env[0] == '\0' || env[0] == '0') return;
@@ -425,6 +429,9 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             }
             return 0;
         }
+        case kComposeKNWakeMessage:
+            // 纯粹用来唤醒 MsgWaitForMultipleObjectsEx；没有任何副作用。
+            return 0;
         case WM_DESTROY: {
             if (window) window->quit = true;
             PostQuitMessage(0);
@@ -546,6 +553,27 @@ extern "C" bool composekn_win32_pump(ComposeKNWin32Window* window) {
     return !window->closeRequested;
 }
 
+extern "C" bool composekn_win32_wait_message(ComposeKNWin32Window* window, int32_t timeout_ms) {
+    if (window == nullptr) return false;
+    if (window->quit || window->closeRequested) return false;
+    // MWMO_INPUTAVAILABLE：队列里**已经**有消息（只是还没被 Peek 取走）时立刻返回，
+    // 否则会白等一整个 timeout —— 那样输入就会带着最多一个帧周期的额外延迟。
+    const DWORD timeout = (timeout_ms < 0) ? INFINITE : static_cast<DWORD>(timeout_ms);
+    const DWORD r = MsgWaitForMultipleObjectsEx(
+        0, nullptr, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    if (r == WAIT_FAILED) {
+        composeknLog("wait_message: MsgWaitForMultipleObjectsEx 失败 err=%lu",
+                     (unsigned long)GetLastError());
+        return false;
+    }
+    return !window->quit && !window->closeRequested;
+}
+
+extern "C" void composekn_win32_wake(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    PostMessageW(window->hwnd, kComposeKNWakeMessage, 0, 0);
+}
+
 extern "C" bool composekn_win32_pop_event_flat(
     ComposeKNWin32Window* window,
     int32_t* type,
@@ -584,10 +612,23 @@ extern "C" void composekn_win32_present(
         composeknLog("composekn_win32_present: first frame %dx%d stride=%d pixels=%p",
                      width, height, stride_px, pixels);
     }
-    // 缓存这一帧：WM_PAINT / 缩放过程中用它立刻重绘
-    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
-    window->frame.assign(static_cast<const unsigned char*>(pixels),
-                         static_cast<const unsigned char*>(pixels) + bytes);
+    // 缓存这一帧：WM_PAINT / 缩放过程中用它立刻重绘。
+    // 源像素现在直接来自 Skia raster surface（Kotlin 侧零拷贝），行可能有 padding
+    // （stride_px > width），所以按行拷成紧密排布 —— blitFrame 的 DIB 头写死
+    // biWidth = frameW，也就是紧密跨度。
+    const int strideBytes = (stride_px > 0 ? stride_px : width) * 4;
+    const size_t rowBytes = static_cast<size_t>(width) * 4u;
+    const unsigned char* src = static_cast<const unsigned char*>(pixels);
+    window->frame.resize(rowBytes * static_cast<size_t>(height));
+    if (strideBytes == static_cast<int>(rowBytes)) {
+        std::memcpy(window->frame.data(), src, rowBytes * static_cast<size_t>(height));
+    } else {
+        for (int y = 0; y < height; ++y) {
+            std::memcpy(window->frame.data() + rowBytes * static_cast<size_t>(y),
+                        src + static_cast<size_t>(strideBytes) * static_cast<size_t>(y),
+                        rowBytes);
+        }
+    }
     window->frameW = width;
     window->frameH = height;
     blitFrame(window);
@@ -607,6 +648,17 @@ extern "C" int composekn_win32_height(ComposeKNWin32Window* window) {
 
 extern "C" float composekn_win32_dpi_scale(ComposeKNWin32Window* window) {
     return static_cast<float>(dpiScaleOf(window));
+}
+
+extern "C" int32_t composekn_win32_refresh_hz(ComposeKNWin32Window* window) {
+    (void)window;
+    // 屏幕 DC 上的 VREFRESH 就是主显示器刷新率；虚拟机/RDP/远程桌面上会返回 0 或 1，
+    // 由调用方判断可信区间（拿不到就退回 60Hz）。
+    HDC dc = GetDC(nullptr);
+    if (dc == nullptr) return 0;
+    const int hz = GetDeviceCaps(dc, VREFRESH);
+    ReleaseDC(nullptr, dc);
+    return hz;
 }
 
 extern "C" void composekn_win32_show(ComposeKNWin32Window* window, int cmd) {

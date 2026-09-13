@@ -29,6 +29,12 @@ private object WindowsMainDispatcher : MainCoroutineDispatcher(), Delay {
     @Volatile
     private var flushing = false
 
+    /**
+     * 「有人往队列里放了活」时调用（只在跨线程投递时触发，见 [enqueue]）。
+     * 窗口循环把它接到 `composekn_win32_wake()` 上：把阻塞的消息泵叫醒。
+     */
+    var wakeUpHandler: (() -> Unit)? = null
+
     override val immediate: MainCoroutineDispatcher
         get() = this
 
@@ -67,8 +73,11 @@ private object WindowsMainDispatcher : MainCoroutineDispatcher(), Delay {
     private fun enqueue(block: Runnable) {
         while (true) {
             val old = pending.value
-            if (pending.compareAndSet(old, old + block)) return
+            if (pending.compareAndSet(old, old + block)) break
         }
+        // 跨线程投递：消息循环可能正阻塞在 waitMessage() 上睡着，必须把它叫醒，
+        // 否则「后台线程干活 -> 主线程刷新 UI」要等到下一条无关消息才会发生。
+        wakeUpHandler?.invoke()
     }
 
     fun flush() {
@@ -90,6 +99,16 @@ private object WindowsMainDispatcher : MainCoroutineDispatcher(), Delay {
 /** Drain UI tasks queued on [MainUIDispatcher]. Call from the Win32 message pump loop. */
 fun flushMainUIDispatcher() {
     WindowsMainDispatcher.flush()
+}
+
+/**
+ * 注册「跨线程往 UI 队列投递任务」时的唤醒回调（null = 取消）。
+ *
+ * 窗口循环在进入 `waitMessage()` 阻塞前接上 `Win32Window::wake`，
+ * 这样后台线程完成工作后主线程会立刻醒来刷新 UI，而不用等下一次输入。
+ */
+fun setMainUIDispatcherWakeUpHandler(handler: (() -> Unit)?) {
+    WindowsMainDispatcher.wakeUpHandler = handler
 }
 
 private val threadCounter = atomic(0L)

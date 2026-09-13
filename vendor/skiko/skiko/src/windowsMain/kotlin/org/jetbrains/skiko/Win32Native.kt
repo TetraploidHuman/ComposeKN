@@ -6,6 +6,7 @@ import kotlinx.cinterop.*
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.staticCFunction
+import org.jetbrains.skia.impl.NativePointer
 
 /**
  * Kotlin/Native Windows (mingw) Win32 bridge bindings — mirrors the Wayland
@@ -37,11 +38,25 @@ internal external fun composekn_win32_pop_event_flat(
 @SymbolName("composekn_win32_present")
 internal external fun composekn_win32_present(
     window: COpaquePointer?,
-    pixels: COpaquePointer?,
+    // NativePointer（= konan 的 NativePtr）才能直接接收 Pixmap.addr —— raster surface
+    // 的像素指针是零拷贝交给 GDI 的（见 WindowsSoftwareContextHandler）。
+    pixels: NativePointer,
     width: Int,
     height: Int,
     stridePx: Int,
 )
+
+/** 阻塞等待消息（timeoutMillis < 0 = 无限等待）。false 表示应用应当退出。 */
+@SymbolName("composekn_win32_wait_message")
+internal external fun composekn_win32_wait_message(window: COpaquePointer?, timeoutMillis: Int): Boolean
+
+/** 唤醒阻塞在 [composekn_win32_wait_message] 里的消息循环（可跨线程调用）。 */
+@SymbolName("composekn_win32_wake")
+internal external fun composekn_win32_wake(window: COpaquePointer?)
+
+/** 主显示器刷新率（Hz），拿不到时返回 0。 */
+@SymbolName("composekn_win32_refresh_hz")
+internal external fun composekn_win32_refresh_hz(window: COpaquePointer?): Int
 
 @SymbolName("composekn_win32_width")
 internal external fun composekn_win32_width(window: COpaquePointer?): Int
@@ -121,6 +136,25 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
         }
 
     fun pump(): Boolean = composekn_win32_pump(native)
+
+    /**
+     * 阻塞等待消息队列非空（timeoutMillis < 0 = 无限等待）。
+     *
+     * 没有渲染任务时用它替代忙等循环：线程真正睡着（CPU ≈ 0），消息一到立刻返回。
+     * 注意：调用前必须先排空消息（[pump]），否则已经排在队列里的消息会让它立即返回
+     * —— 不过那也只是多绕一圈循环，不会丢消息。
+     */
+    fun waitMessage(timeoutMillis: Int = -1): Boolean =
+        composekn_win32_wait_message(native, timeoutMillis)
+
+    /** 从渲染回调/其它线程唤醒 [waitMessage] 的阻塞。 */
+    fun wake(): Unit = composekn_win32_wake(native)
+
+    /**
+     * 主显示器刷新率（Hz）。虚拟机/远程桌面上 Win32 常返回 0 或 1，
+     * 调用方应当只在合理区间（24..360）内采信。
+     */
+    val refreshHz: Int get() = composekn_win32_refresh_hz(native)
 
     // 注意：这里必须用 memScoped + alloc<>().ptr 传「真实指针」。
     // Kotlin 的 IntArray/FloatArray/UIntArray 是托管对象，传给 external 函数时

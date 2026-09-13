@@ -52,6 +52,9 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · 下拉菜单、对话框（弹层合成）
   · 横向/纵向 Lazy 列表虚拟化 + **鼠标滚轮滚动**
   · Canvas 绘制（渐变/路径/描边/旋转）、FlowRow 自动换行、主题切换（深/浅色）
+  · 渲染：**按需渲染 + 按刷新率节流**（没有内容变化就不重绘，空闲时 CPU ≈ 0；
+    这个窗口的标题栏实时显示实测帧率）
+  · 想看空闲行为：`ComposeKN-Windows-Native.exe --no-animate`（关掉每帧动画）
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
 
 自检（自动化测试）
@@ -68,12 +71,16 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (91 checks, 0 failures)
+      SELFTEST: RESULT PASS (95 checks, 0 failures)
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、弹层与对话框的位置和像素），不开窗口
-  window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、干净退出）
-  all    = 两者都跑（91 条断言）
+  window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、
+           干净退出、**性能契约**：静止不空转 / 跨线程刷新能唤醒 / 动画按刷新率节流）
+  all    = 两者都跑（95 条断言）
+
+提示：`set COMPOSEKN_RENDER_PROFILE=1` 会让每 120 帧打一行渲染耗时拆解
+（Compose 渲染 vs 回放+呈现），排查性能时很有用。
 
 日志：composekn-startup.log（exe 同目录，含启动诊断与事件日志）。
 EOF

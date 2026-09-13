@@ -42,6 +42,11 @@ void composekn_win32_log(const char* message);
 /** 物理像素 / 逻辑像素（= dpi / 96.0）。 */
 float composekn_win32_dpi_scale(ComposeKNWin32Window* window);
 
+/**
+ * 主显示器刷新率（Hz）。用于把渲染节流到显示器节奏；拿不到/不可信时返回 0。
+ */
+int32_t composekn_win32_refresh_hz(ComposeKNWin32Window* window);
+
 /** 注册 C 侧（wndproc/WM_SIZE 内）同步回调，用于缩放期间逐帧重组。 */
 typedef void (*ComposeKNRenderTickFn)(void* user);
 void composekn_win32_set_render_tick(ComposeKNRenderTickFn fn, void* user);
@@ -55,6 +60,21 @@ void composekn_win32_destroy(ComposeKNWin32Window* window);
 
 /** Pump pending Win32 messages. Returns false when the app should quit. */
 bool composekn_win32_pump(ComposeKNWin32Window* window);
+
+/**
+ * Block until the window's message queue is non-empty, or timeout_ms elapses
+ * (< 0 = wait forever). Returns false when the app should quit.
+ *
+ * 渲染循环用它替代「PeekMessage 忙等」：没有渲染任务时线程真正睡着（CPU ≈ 0），
+ * 消息一到立刻醒来，所以输入延迟不受影响。
+ */
+bool composekn_win32_wait_message(ComposeKNWin32Window* window, int32_t timeout_ms);
+
+/**
+ * Wake a thread blocked in composekn_win32_wait_message: posts a private no-op
+ * message (swallowed by the wndproc, never enters the event queue).
+ */
+void composekn_win32_wake(ComposeKNWin32Window* window);
 
 /** Pop one event, false if queue empty. Flat signature avoids struct-layout issues. */
 bool composekn_win32_pop_event_flat(

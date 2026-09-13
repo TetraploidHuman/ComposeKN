@@ -69,6 +69,31 @@ actual open class SkiaLayer {
         redrawer?.needRender(throttledToVsync)
     }
 
+    /**
+     * 是否有人请求渲染（Compose 内容失效 / 动画帧 / 显式 [needRender]）。
+     *
+     * 窗口循环用它决定「要不要画一帧」——[WindowsSoftwareRedrawer.needRender] 不再是
+     * 空实现，所以静止的窗口不会重绘，空闲时 CPU ≈ 0。
+     */
+    fun hasRenderRequest(): Boolean =
+        (redrawer as? WindowsSoftwareRedrawer)?.renderRequested ?: false
+
+    /**
+     * 有请求时画一帧，返回是否真的画了（见 [hasRenderRequest]）。
+     */
+    fun renderIfRequested(): Boolean =
+        (redrawer as? WindowsSoftwareRedrawer)?.renderIfRequested() ?: false
+
+    /**
+     * 注册「Compose 请求渲染」的回调。
+     *
+     * 渲染请求可能发生在窗口循环阻塞等待消息的时候（动画、后台线程完成工作触发的重组），
+     * 窗口循环把它接到 `Win32Window::wake` 上，保证立刻醒来而不是等到下一条输入消息。
+     */
+    fun setRenderRequestHandler(handler: (() -> Unit)?) {
+        (redrawer as? WindowsSoftwareRedrawer)?.onRenderRequest = handler
+    }
+
     @Deprecated(
         message = "Use needRender() instead",
         replaceWith = ReplaceWith("needRender()")

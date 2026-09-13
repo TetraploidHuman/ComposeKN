@@ -1066,3 +1066,108 @@ runner 上的开销：链接 exe 约 **16 分钟**（4 核，比本地 32 核慢
 > 顺带一个诊断技巧：CI 上「挂住」和「失败」要能一眼分开。现在
 > `scripts/test-windows-native.sh` 在阶段超时时会直接判失败并打印最后几条
 > `SELFTEST` 行；exe 里的看门狗则用退出码 2 表示「我挂住了」，与断言失败的 1 区分。
+
+## 15. 性能：从「忙等重绘」到「按需渲染 + 帧节流」（2026-09-13，真机反馈驱动）
+
+### 15.1 现象
+
+> 真机 Windows 反馈：「性能表现不佳……感觉帧数不太高，CPU 和核显占用偏高（~10%），
+> 这不应该是一个很简单的窗口应该消耗的性能。」
+
+### 15.2 根因（三条叠加，都是结构性错误）
+
+1. **窗口循环是忙等循环。** `WindowsComposeWindow.run()` 原本是
+
+   ```kotlin
+   while (running) { win.pump(); flushMainUIDispatcher(); translateAndDispatch(); layer.renderImmediately() }
+   ```
+
+   而 `composekn_win32_pump()` 是 **非阻塞** 的 `PeekMessage` 泵 —— 于是无论有没有内容
+   变化，每一轮都完整重绘一次。空闲的窗口也能一秒钟跑 100+ 帧，**一颗核心跑满**，
+   同时 GDI 不停往屏幕上送像素（这就是「一个很简单的窗口却占 ~10% CPU + 核显」的来源）。
+
+2. **`needRender()` 是个空实现。** `WindowsSoftwareRedrawer.needRender()` 里写着一句
+   「Windows app loop renders every iteration」，直接丢掉了请求。宿主侧辛苦接好的
+   `FrameRecomposer`（帧时钟 awaiter）与 `SingleComposeSceneRenderingScope`
+   （布局/绘制失效）本已给出「谁还需要下一帧」的完整信号，却没人消费。
+
+3. **每帧 4 次全窗口像素搬运 + 2 次 MB 级分配。** 1100x760 时单次约 3.3MB：
+
+   ```
+   Surface.readPixels(Bitmap) -> Bitmap.readPixels()（新 ByteArray）
+     -> window->frame.assign() -> StretchDIBits
+   ```
+
+   再加上每帧 `Bitmap()` + `allocPixels()`（+ `usePinned` 对大数组做 pin/unpin）。
+   这是 CPU 占用里除渲染本身之外最大的一块。
+
+### 15.3 修法
+
+| 层 | 改动 |
+|---|---|
+| C 桥 | 新增 `composekn_win32_wait_message(window, timeout_ms)`（`MsgWaitForMultipleObjectsEx` + `QS_ALLINPUT` + `MWMO_INPUTAVAILABLE`）、`composekn_win32_wake(window)`（`PostMessage(WM_APP+1)`，wndproc 里直接吞掉、不进事件队列）、`composekn_win32_refresh_hz()`（`GetDeviceCaps(VREFRESH)`） |
+| 渲染请求 | `WindowsSoftwareRedrawer.needRender()` 真正生效：置 `renderRequested` + 回调唤醒宿主；`renderIfRequested()` 只在有请求时画一帧；`renderImmediately()` 保持「无条件渲染」语义（缩放 tick / WM_PAINT / 首帧要用） |
+| 窗口循环 | 改为「排空消息 → 有请求才画 → 没请求就 `waitMessage(-1)` 真睡着」；渲染节流到 `refreshHz`（拿不到/不可信就退回 60Hz）的帧边界；最小化时不渲染、也不消费请求（恢复后立刻补一帧），用 200ms 轮询避免忙等 |
+| 跨线程 | `WindowsMainDispatcher.enqueue()` 增加唤醒钩子：后台线程投递任务时 `PostMessage` 叫醒消息泵，而不是干等到下一条输入消息才上屏 |
+| 像素路径 | `Surface.peekPixels(Pixmap)` 直接把 raster surface 的像素指针交给 C（**Kotlin 侧零拷贝**）；`composekn_win32_present` 改为按 stride 逐行拷贝（surface 行可能有 padding） |
+| 自检 | window 阶段新增 4 条「性能契约」断言；截图阶段从窗口标题读实测 fps 做**外部**验证 |
+| 演示/调试 | 画廊标题实时显示 fps；`--no-animate` 关掉每帧动画以观察空闲行为；`COMPOSEKN_RENDER_PROFILE=1` 每 120 帧打印耗时拆解 |
+
+关键设计点：**渲染请求是唯一触发源**。Compose 的三条失效路径
+（`invalidateLayout`/`invalidateDraw`、`FrameRecomposer.onNewAwaiters`、
+`FrameRecomposer.performFrame` 里的 `frameClock.hasAwaiters`）最后都会调用
+`invalidate()`，而我们把 `invalidate()` 接到了 `layer.needRender()` 上 ——
+所以「动画会不会停」不再取决于循环是否无脑重绘，而取决于这个信号是否被消费。
+
+### 15.4 实测（Wine + Xvfb，1100x760 画廊）
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 画廊（每帧动画）帧率 | 103.9 fps（无节制重绘） | **59.9 fps**（节流到刷新率） |
+| 画廊主线程 CPU | ~100%（跑满一颗核心） | ~60% of one core |
+| Xvfb（扮演显示服务）CPU | 7.5% | 4.4% |
+| 静止窗口（`--no-animate`） | 约 100 fps 的白工 | **0.0 fps，frames=1**；主线程 8 秒内 1 个 tick ≈ **0%** |
+| 空闲时残留 CPU | — | 只剩 Wine 自己的 X11 驱动线程（8 秒 45 ticks）；**主线程 1 tick** |
+
+`COMPOSEKN_RENDER_PROFILE=1` 的每帧拆解（Wine，1100x760，60fps）：
+
+```
+profile: 120 帧  update=1.5ms  draw+present=6.2ms  total=7.7ms  窗口=1100x760
+```
+
+   * `update` —— Compose 的重组/布局/绘制（录成 `Picture`）：**1.5ms**
+   * `draw+present` —— 回放 `Picture` + C 侧 memcpy + `StretchDIBits`：**6.2ms**
+     （Wine 下这段里 DIB→X11 的传输占大头；真机是 GDI 直接写 DWM 表面，会便宜不少）
+   * 对照：修复前是「104 fps × 每帧约 9.6ms」= 主线程 100% 跑满，其中相当一部分
+     是白工（内容没变也重画）。
+
+> 也就是说：**该省的时候真的省了（空闲 ≈ 0），该画的时候画到了刷新率**，
+> 而每帧的真实成本已经接近「Compose 渲染 + 一次 GDI blit」的下限。
+
+### 15.5 踩坑
+
+| 坑 | 症状 | 修法 |
+|---|---|---|
+| 丢唤醒竞态 | 「后台线程写状态 → 界面不刷新」或「动画停了」 | `needRender()` 里**先置标记再 PostMessage**；等待用 `MWMO_INPUTAVAILABLE`，队列里已有消息时立刻返回，不会白等一个 timeout |
+| `GetDeviceCaps(VREFRESH)` 不可信 | 虚拟机/远程桌面上返回 0 或 1 → 帧率被压成 1fps | 只采信 24..360 的取值，其它一律 60Hz |
+| 最小化时的死循环 | 最小化后窗口尺寸为 0，若照旧消费请求就会「有请求 → 画不出 → 没请求」→ 动画永久停摆 | 最小化时**不消费**请求，用 200ms 轮询等待；恢复时的 WM_SIZE 会补一帧 |
+| 自检按帧号推进 | 改成按需渲染后，交互阶段「没有新事件就永远没有下一帧」，自检直接卡住 | frameHook 末尾显式 `layer.needRender()`（等价于老代码的空转）；性能阶段再把它关掉 |
+| 性能断言需要「时间」这一维 | 帧数本身说明不了问题 | 后台协程当节拍器（`delay` 计时 + 写 snapshot 状态），主线程只渲染；测量结果用 `@Volatile` 字段跨线程传递，断言全部在循环退出后单线程做 |
+| `Pixmap.addr` 的类型 | 它是 konan 的 `NativePointer`（`NativePtr`），不是 `COpaquePointer` | `composekn_win32_present` 的 Kotlin 外部声明改成收 `NativePointer` |
+| `peekPixels` 只对 raster surface 有效 | 万一失败会把垃圾像素送出去 | 失败就跳过这一帧（保留上一帧），并写日志 |
+| 帧计数 / `isMaximized` 的更新时机 | 它们在「帧渲染后」更新，而 hook 也在同一个位置 | 保持原语义（hook 在 `renderImmediately()` 之后调用），截图/断言不受影响 |
+| **测量脚本自己会骗人** | 截图阶段一度报告「画廊只有 9.8 fps / 0.3 fps」，看着像动画停摆；实际是 `sed 's/.*\([0-9]\+\.[0-9]\+\) fps.*/\1/p'` 的**贪婪前缀**把 `59.8` 捕获成了 `9.8`、`60.3` 捕获成 `0.3`（标题同理：`"\(.*\)"` 会吃到行内最后一个引号） | 解析改用 `grep -oE '[0-9][0-9]*\.[0-9]+ fps'`、标题用 `"\([^"]*\)"`；并且多读几次取最大值。**先怀疑度量，再怀疑被测对象** |
+
+### 15.6 还没做（下一步候选）
+
+1. **DIB section + 直接渲染**：用 `CreateDIBSection` 申请一块与 GDI 共享的内存，包成
+   Skia raster surface，让 Compose **直接画进去**，然后 `BitBlt` 出来。这样能一次干掉
+   「录 `Picture` → 回放」这一趟，以及 C 侧那次 3.3MB `memcpy`（DIB 本身就是重绘缓存），
+   预计还能再省掉每帧 20~40% 的 CPU。
+2. **真正的 vsync**：现在是按 `VREFRESH` 自己节流（GDI 没有 swap interval）。
+   可以用 `DwmGetCompositionTimingInfo` / `DwmFlush` 跟合成器对齐，顺带消除撕裂。
+3. **GPU 后端**：GDI 软件光栅在 4K/高 DPI 下终究会吃力；真要省 CPU 得走
+   Direct3D/DXGI + Skia GPU 后端（Skiko 的 Windows GPU 路径目前是 MSVC-ABI，与
+   K/N 的 MinGW ABI 不兼容，这也是当年自建 GNU-ABI Skia 的原因）。
+4. **Linux 侧对照**：Linux 循环本来就是 Wayland 驱动（`poll()` 阻塞 + frame callback
+   + `needRender -> requestFrame`），属于**正确实现**；这次只是把 Windows 对齐到同一模型。

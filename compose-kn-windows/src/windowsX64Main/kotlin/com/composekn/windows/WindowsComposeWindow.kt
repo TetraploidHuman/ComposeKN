@@ -8,9 +8,27 @@ import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.win32Log
 import org.jetbrains.skiko.initWindowsMainThread
+import org.jetbrains.skiko.currentNanoTime
+import org.jetbrains.skiko.setMainUIDispatcherWakeUpHandler
 import com.composekn.windows.internal.MOD_ALT
 import com.composekn.windows.internal.MOD_CTRL
 import com.composekn.windows.internal.MOD_SHIFT
+import kotlin.concurrent.Volatile
+
+/** 最小化时的轮询间隔：不渲染，但也不能忙等（5 次/秒的唤醒，CPU ≈ 0）。 */
+private const val MINIMIZED_POLL_MS = 200
+
+/**
+ * 由显示器刷新率推出帧间隔（默认 60Hz）。
+ *
+ * 虚拟机/远程桌面上 `GetDeviceCaps(VREFRESH)` 会返回 0 或 1，这类不可信的值直接
+ * 退回 60Hz —— 不能让它把帧率压成 1fps。
+ */
+private fun frameIntervalNanos(win: Win32Window): Long {
+    val hz = win.refreshHz
+    val usable = if (hz in 24..360) hz else 60
+    return 1_000_000_000L / usable
+}
 
 /**
  * Windows window + SkiaLayer with rendering and input events.
@@ -42,7 +60,12 @@ class WindowsComposeWindow(
     /** 底层 Win32 窗口（未 attach 时为 null）。 */
     val nativeWindow: Win32Window? get() = win32Window
 
-    /** 已渲染帧数（诊断用）。 */
+    /**
+     * 已渲染帧数（诊断用）。
+     *
+     * `@Volatile`：自检的性能测量要从后台线程读它（帧率 = 帧数 / 时间），主线程写。
+     */
+    @Volatile
     var frameCount: Int = 0
         private set
 
@@ -73,6 +96,13 @@ class WindowsComposeWindow(
         layer.attachTo(win)
         win32Log("run: layer attached; entering message loop")
 
+        // 渲染请求（Compose 失效 / 动画帧 / 显式 needRender）与跨线程 UI 任务
+        // 都可能发生在循环正阻塞等消息的时候，必须能把消息泵叫醒：
+        //   - 不接渲染请求  -> 动画停摆（每次循环都在睡觉，没人叫它）
+        //   - 不接 UI 任务  -> 后台线程干完活要等到下一条输入消息才上屏
+        layer.setRenderRequestHandler { win.wake() }
+        setMainUIDispatcherWakeUpHandler { win.wake() }
+
         // 先渲染一帧，再开始分发事件。
         //
         // scene.size 是在 renderDelegate.onRender -> renderFrame() 里设定的。如果第一轮
@@ -85,6 +115,20 @@ class WindowsComposeWindow(
         // （画廊就是这么在启动瞬间崩掉的。）
         layer.renderImmediately()
 
+        val frameInterval = frameIntervalNanos(win)
+        win32Log(
+            "run: frame interval ${frameInterval / 1_000_000} ms " +
+                "(refresh=${win.refreshHz}Hz)"
+        )
+        // 下一帧的最早时间点（帧节流）。0 = 立刻。
+        var nextFrameNanos = 0L
+
+        // 保证消息循环至少渲染一帧：上面那一帧是为了让 scene.size 就位（避免首轮
+        // 事件在 size=0 时触发 measureAndLayout），这一帧才是「进入循环后的第一帧」
+        // —— 帧计数与 frameHook 从它开始。按需渲染下必须显式请求一次，否则内容
+        // 若无失效，循环会立刻睡着、一帧都不出。
+        layer.needRender()
+
         var frames = 0
         var running = true
         try {
@@ -92,8 +136,35 @@ class WindowsComposeWindow(
                 running = win.pump()
                 flushMainUIDispatcher()
                 translateAndDispatch(win, onEvent)
-                layer.renderImmediately()
-                if (frames == 0) win32Log("run: first renderImmediately ok")
+                // 事件处理可能在 UI 队列里排了新任务（输入 -> 状态变更 -> 重组）
+                flushMainUIDispatcher()
+                if (!running) break
+
+                if (!layer.hasRenderRequest()) {
+                    // 内容没变：不重绘。真正睡着等消息/唤醒 —— 静止的窗口在这里
+                    // CPU 占用是 0（以前是无条件每轮重绘，一颗核心跑满）。
+                    if (!win.waitMessage(-1)) break
+                    continue
+                }
+                if (win.isMinimized) {
+                    // 最小化时不渲染（也不消费请求：恢复后立刻补上一帧），但不能忙等。
+                    if (!win.waitMessage(MINIMIZED_POLL_MS)) break
+                    continue
+                }
+                val now = currentNanoTime()
+                if (now < nextFrameNanos) {
+                    // 帧节流：动画/连续失效最多按显示器刷新率重绘。
+                    // 等待期间到达的消息会在下一轮先被处理 —— 输入处理不受节流影响，
+                    // 只是「画出来」落在这个帧边界上（和合成器驱动的桌面应用一致）。
+                    val waitMs = ((nextFrameNanos - now) / 1_000_000L).toInt().coerceAtLeast(1)
+                    if (!win.waitMessage(waitMs)) break
+                    continue
+                }
+                if (!layer.renderIfRequested()) continue
+                if (frames == 0) win32Log("run: first frame rendered")
+                // 按固定节奏推进；落后了就以「现在」为基准重新对齐（不追赶、不堆积）。
+                val after = currentNanoTime()
+                nextFrameNanos = maxOf(nextFrameNanos + frameInterval, after)
                 frames++
                 frameCount = frames
                 frameHook?.invoke(frames)
@@ -106,6 +177,9 @@ class WindowsComposeWindow(
             throw t
         } finally {
             win32Log("run: exiting loop after $frames frames")
+            // 先摘掉回调再拆窗口：它们会 PostMessage（窗口没了就成了野指针）。
+            layer.setRenderRequestHandler(null)
+            setMainUIDispatcherWakeUpHandler(null)
             layer.detach()
             win.close()
         }
@@ -219,6 +293,16 @@ class WindowsComposeWindow(
      */
     fun requestClose() {
         win32Window?.requestClose()
+    }
+
+    /**
+     * 设置 Win32 窗口标题（任务栏 / 窗口管理器可见）。
+     *
+     * 注意 CSD 标题栏上的文字是 Compose 自己画的（取自构造参数），这里改的是
+     * 「原生」标题 —— demo 用它把实测帧率显示出来。
+     */
+    fun setTitle(title: String) {
+        win32Window?.setTitle(title)
     }
 
     /**

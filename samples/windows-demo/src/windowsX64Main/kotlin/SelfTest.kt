@@ -36,11 +36,13 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
@@ -81,7 +83,13 @@ import com.composekn.windows.test.renderOffscreen
 import com.composekn.windows.test.snapshotSolidColor
 import com.composekn.windows.vkPairCount
 import com.composekn.windows.windowsVirtualKeyToComposeKey
+import kotlin.concurrent.Volatile
 import kotlin.math.abs
+import kotlin.time.TimeSource
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 // =====================================================================
 // 自动化自检（`COMPOSEKN_SELFTEST=1` / `--selftest`）
@@ -165,6 +173,15 @@ class InteractionProbe {
      */
     var windowContainerSize by mutableStateOf(IntSize.Zero)
 
+    /** 性能自检：true 时界面进入「一直在动画」的状态（withFrameNanos 每帧 +1）。 */
+    var animate by mutableStateOf(false)
+
+    /** 动画帧计数，同时显示在界面上（于是每帧都会重组/重排，和画廊里的压力循环等价）。 */
+    var animFrames by mutableStateOf(0)
+
+    /** 跨线程刷新探针：后台协程 +1，界面读取它 —— 验证「后台干完活唤醒消息泵」。 */
+    var bgTick by mutableStateOf(0)
+
     val text: String get() = value.text
 
     fun setText(text: String) {
@@ -181,6 +198,17 @@ private fun DeterministicTestScreen(
     // 里的 Windows 桥接 -> Win32 剪贴板 -> 再读回来」的端到端断言。
     val clipboard = LocalClipboardManager.current
     SideEffect { probe.clipboardManager = clipboard }
+
+    // 性能自检用的「动画」：probe.animate = true 时每帧 +1，而 animFrames 显示在
+    // 界面上，于是每一帧都会重组 + 重排 + 重绘（等价于画廊里那个 withFrameNanos 循环）。
+    //
+    // 节奏完全由宿主帧时钟决定（withFrameNanos）：宿主必须自己持续请求下一帧，
+    // 否则动画在第 1 帧之后就会停住 —— 这正是「按需渲染」最容易踩坏的地方。
+    LaunchedEffect(probe.animate) {
+        while (probe.animate) {
+            withFrameNanos { probe.animFrames++ }
+        }
+    }
 
     // 容器尺寸（Popup/Dialog 的定位依据）
     val windowInfo = LocalWindowInfo.current
@@ -305,6 +333,17 @@ private fun DeterministicTestScreen(
                     )
                 }
             }
+
+            // 性能自检的状态显示：动画帧数 + 跨线程刷新计数。
+            // 放在 (16, 240)dp —— 既有的像素断言区域（按钮/输入框/弹层/滚动/对话框
+            // 中心行）都不覆盖这里，不会干扰它们。
+            Text(
+                text = "anim=${probe.animFrames} bg=${probe.bgTick}",
+                color = Color(0xFFB0BEC5),
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = 16.dp, y = 240.dp),
+            )
 
             // 对话框（比弹层更重的一层：带遮罩 + 自己的窗口/图层）
             if (probe.dialogOpen) {
@@ -766,6 +805,27 @@ private fun runWindowTests(report: SelfTestReport) {
     var clipboardValue: String? = null
     var clickedAt = Pair(0, 0)
 
+    // 交互阶段由 frameHook **显式**请求下一帧。
+    //
+    // 窗口循环现在是「按需渲染 + 帧节流」：没有渲染请求时它真的睡着（CPU ≈ 0），
+    // 不会再像以前那样无条件每轮重绘。所以测试想按帧号推进就得自己 requestFrame
+    // —— 这也正是真实内容（动画/状态变更）会做的事。性能测量阶段把它关掉，
+    // 才能真正静置下来。
+    var driveFrames = true
+    val perf = WindowPerfResult()
+    val guard = WindowPhaseGuard()
+
+    // 兜底：交互阶段万一因为「没有任何渲染请求」而卡住，25 秒后强制收敛，
+    // 并给出明确诊断（而不是耗到 CI job 超时）。
+    // 注意性能阶段是靠后台协程 requestClose() 收尾的，它不需要这个兜底。
+    CoroutineScope(Dispatchers.Default).launch {
+        delay(WINDOW_PHASE_GUARD_MS)
+        if (!guard.finished) {
+            guard.timedOut = true
+            app.window.requestClose()
+        }
+    }
+
     app.window.frameHook = { frame ->
         // 进度心跳：窗口阶段以前在 CI 上挂死过，日志里必须能看出「帧有没有在走」
         if (frame % 20 == 0) report.section("window 进度 frame=$frame")
@@ -872,16 +932,159 @@ private fun runWindowTests(report: SelfTestReport) {
                 "value=${scrollState.value} maxValue=${scrollState.maxValue}",
             )
             report.check("window/frame-count", app.window.frameCount >= 78, "frames=${app.window.frameCount}")
-            app.window.requestClose()
+            // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
+            // 并且**停止**自己请求帧：这样界面真正静止下来。
+            driveFrames = false
+            startWindowPerfPhase(app, probe, perf)
         }
-        if (frame > 200) {
+        // 只在自己驱动帧的阶段检查帧号上限：性能阶段故意让循环「睡着 + 定时醒来」，
+        // 帧号会停住，那不是挂死。
+        if (driveFrames && frame > 200) {
             report.check("window/close-timeout", false, "frameHook 已超过 200 帧仍未退出")
             app.window.requestClose()
         }
+        if (driveFrames) app.window.layer.needRender()
     }
 
     app.run { DeterministicTestScreen(probe, scrollState) }
+    guard.finished = true
     report.check("window/loop-exited", true)
+    assertWindowPerfReport(report, perf, guard)
+}
+
+// ---------------------------------------------------------------------
+// 性能自检（按需渲染 + 帧节流）
+//
+// 背景：窗口循环以前是无条件「每轮都 renderImmediately」的忙等循环 —— 一个完全
+// 静止的窗口也会把一颗核心跑到 100%（~100+ fps 全是白工），动画更是无节制重绘。
+// 现在改成「有渲染请求才画 + 按显示器刷新率节流」，这一节就是它的回归测试：
+//
+//   * 静止 1.2s    -> 渲染帧数应当 ≈ 0（老代码会是 ~150 帧）
+//   * 跨线程刷新   -> 后台写状态必须把睡着的消息泵唤醒，并且只画 1 帧
+//   * 动画 1.5s    -> 帧率应当落在刷新率附近（老代码是无节制重绘）
+// ---------------------------------------------------------------------
+
+/** 交互阶段兜底：超过这个时间还没跑完就强制收敛（避免 CI 上耗到 job 超时）。 */
+private const val WINDOW_PHASE_GUARD_MS = 25_000L
+
+private const val PERF_SETTLE_MS = 300L
+private const val PERF_IDLE_MS = 1_200L
+private const val PERF_WAKE_MS = 400L
+private const val PERF_ANIM_MS = 1_500L
+
+/**
+ * 性能测量结果：后台协程写、主线程读完再断言。
+ *
+ * 字段标 `@Volatile`：后台协程写完后主线程要能看见（跨线程可见性）。
+ */
+private class WindowPerfResult {
+    @Volatile var idleNanos = 0L
+    @Volatile var idleFrames = -1
+    @Volatile var wakeFrames = -1
+    @Volatile var animNanos = 0L
+    @Volatile var animFrames = -1
+
+    fun idleFps(): Double = fpsOf(idleFrames, idleNanos)
+    fun animFps(): Double = fpsOf(animFrames, animNanos)
+
+    private fun fpsOf(frames: Int, nanos: Long): Double =
+        if (nanos > 0L && frames >= 0) frames * 1_000_000_000.0 / nanos else -1.0
+}
+
+/** 窗口阶段兜底状态（后台协程读 finished、写 timedOut）。 */
+private class WindowPhaseGuard {
+    @Volatile var finished = false
+    @Volatile var timedOut = false
+}
+
+/** 一位小数（`String.format` 在 Kotlin/Native 上不一定可用，自己拼）。 */
+private fun fmt1(value: Double): String {
+    if (value.isNaN()) return "n/a"
+    val negative = value < 0
+    val scaled = (if (negative) -value else value) * 10.0 + 0.5
+    val ticks = scaled.toLong()
+    return "${if (negative) "-" else ""}${ticks / 10}.${ticks % 10}"
+}
+
+/**
+ * 性能节拍器：全部在后台线程上按时序推进，主线程只负责渲染。
+ *
+ * 之所以要「时间」这个外部维度：按需渲染之后，帧数与墙钟时间的关系才是我们要断言的
+ * 契约（静止 → 0 帧/秒；动画 → 刷新率附近）。
+ */
+private fun startWindowPerfPhase(
+    app: WindowsComposeApplication,
+    probe: InteractionProbe,
+    perf: WindowPerfResult,
+) {
+    CoroutineScope(Dispatchers.Default).launch {
+        // 1) 静置：消化掉交互阶段残留的失效，然后测量「什么都不发生时」渲染了几帧。
+        delay(PERF_SETTLE_MS)
+        val idleFrames0 = app.window.frameCount
+        val idleMark = TimeSource.Monotonic.markNow()
+        delay(PERF_IDLE_MS)
+        perf.idleFrames = app.window.frameCount - idleFrames0
+        perf.idleNanos = idleMark.elapsedNow().inWholeNanoseconds
+
+        // 2) 跨线程刷新：后台线程写 snapshot 状态 -> 必须唤醒睡着的消息泵 -> 只画一帧。
+        //    （真实场景：后台加载完成、下载进度、定时器刷新……）
+        val wakeFrames0 = app.window.frameCount
+        probe.bgTick++
+        delay(PERF_WAKE_MS)
+        perf.wakeFrames = app.window.frameCount - wakeFrames0
+
+        // 3) 动画：withFrameNanos 持续请求帧，宿主按刷新率节流。
+        val animFrames0 = app.window.frameCount
+        val animMark = TimeSource.Monotonic.markNow()
+        probe.animate = true
+        delay(PERF_ANIM_MS)
+        perf.animFrames = app.window.frameCount - animFrames0
+        perf.animNanos = animMark.elapsedNow().inWholeNanoseconds
+        probe.animate = false
+
+        // 收尾：requestClose 是 PostMessage(WM_CLOSE)，本身也会把睡着的循环唤醒。
+        app.window.requestClose()
+    }
+}
+
+private fun assertWindowPerfReport(
+    report: SelfTestReport,
+    perf: WindowPerfResult,
+    guard: WindowPhaseGuard,
+) {
+    // 无论通过与否都把实测数字打出来：CI 日志里就能看到「静止渲染了几帧 /
+    // 动画跑出多少 fps」，而不是只有一个 ok。
+    report.section(
+        "window 性能: 静止 ${perf.idleNanos / 1_000_000}ms -> ${perf.idleFrames} 帧" +
+            " | 跨线程刷新 -> ${perf.wakeFrames} 帧" +
+            " | 动画 ${perf.animNanos / 1_000_000}ms -> ${perf.animFrames} 帧 = ${fmt1(perf.animFps())} fps"
+    )
+    report.check(
+        "window/perf-phase-completed",
+        !guard.timedOut,
+        if (guard.timedOut) "窗口阶段超时（兜底强制退出）" else "正常完成",
+    )
+    // 静止窗口不应该有任何重绘（留一点余量给「静置瞬间还在路上的那一帧」）。
+    report.check(
+        "window/perf-idle-no-busy-render",
+        perf.idleFrames in 0..5,
+        "静止 ${perf.idleNanos / 1_000_000}ms 渲染了 ${perf.idleFrames} 帧" +
+            "（${fmt1(perf.idleFps())} fps，期望 ≈ 0）",
+    )
+    // 后台线程的一次状态写入必须被画出来（消息泵被唤醒），且只画这一帧。
+    report.check(
+        "window/perf-cross-thread-wake",
+        perf.wakeFrames in 1..5,
+        "跨线程刷新渲染了 ${perf.wakeFrames} 帧（期望 1..5；0 = 没唤醒，过多 = 忙等）",
+    )
+    // 动画必须持续跑（没被节流卡死），又必须被节流（不是无节制重绘）。
+    val animFps = perf.animFps()
+    report.check(
+        "window/perf-animation-fps",
+        animFps >= 20.0 && animFps <= 120.0,
+        "动画 ${perf.animNanos / 1_000_000}ms 渲染 ${perf.animFrames} 帧" +
+            " = ${fmt1(animFps)} fps（期望接近刷新率；老代码是无节制重绘）",
+    )
 }
 
 // ---------------------------------------------------------------------
