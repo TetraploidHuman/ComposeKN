@@ -1025,6 +1025,21 @@ checkout → JDK 21 → Nix（pin nixpkgs）→ 取预编译 mingw-Skia（缓存
 > 首次上线时这个 job 带 `continue-on-error: true`（不阻断流水线）；跑绿一次之后
 > 按 §14.6 第 5 项删掉即可。
 
+#### 附：去掉 `continue-on-error` 之后，又暴露了两个「CI 上从来没真正通过」的问题
+
+`continue-on-error: true` 会把失败伪装成「run success」——`tests.yml` 那个
+linux 单测 job 其实**一直**是失败的（本地却永远绿）。删掉这个开关之后连着修了两处：
+
+| 问题 | 症状 | 修法 |
+|---|---|---|
+| `.def` 里写了开发机绝对路径 | `:skiko:cinteropSkikoLinuxX64` 报 `fatal error: '/home/miaox99/ComposeKN/vendor/.../wayland_bridge.h' file not found`（路径是 4aa4510 那次会话用绝对路径写进仓库的） | 仓库里的 `.def` 改成**相对 module 根**，构建期在 `NativeTasksConfiguration.resolveWaylandDefFile()` 里解析成绝对路径写到 build/ 再交给 cinterop（cinterop 解析 `headers =` 用的是**进程工作目录**，不是 .def 所在目录，所以只能在构建期解析） |
+| 宿主 .so 引用更新的 glibc 符号 | `:compose-kn-tests:linkDebugTestLinuxX64` 报 `ld.lld: error: undefined reference: __isoc23_strtoul@GLIBC_2.38 ... referenced by /usr/lib/x86_64-linux-gnu/libxkbcommon.so (disallowed by --no-allow-shlib-undefined)`，还有 `stat64@GLIBC_2.33` | `LinuxNativeLinkerPlugin` 给 linuxX64 的 binaries 统一加 `-Wl,--allow-shlib-undefined`（这些符号运行时由宿主 glibc 解析，二进制只在同一台机器上跑） |
+
+> 教训：**`continue-on-error` 只应该用在「第一次上线的探索期」，而且必须在跑绿后立刻删掉**
+> —— 否则「绿的流水线」会一直骗人。顺带这也说明：**CI 的路径过滤要跟着改**，
+> 比如 `build-logic/**`、`vendor/**` 这种会直接决定链接成败的目录必须包含在
+> `paths:` 里，否则改了它们根本不触发 job。
+
 **首次跑绿：2026-09-13，run [34750507633](https://github.com/TetraploidHuman/ComposeKN/actions/runs/34750507633)**
 
 ```
