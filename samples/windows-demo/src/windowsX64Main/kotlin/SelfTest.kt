@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.composekn.windows.MouseButton
+import com.composekn.windows.TouchPhase
 import com.composekn.windows.WindowsComposeApplication
 import com.composekn.windows.WindowsEvent
 import com.composekn.windows.WindowsInputState
@@ -624,6 +625,61 @@ private fun renderChecks(report: SelfTestReport) {
         "down=$scrolledDown afterUp=${scrollState.value}",
     )
 
+    // 2.6b 触摸：手指拖动必须能滚动列表（真机反馈「Windows 触摸屏能点击、不能滑动」）
+    //
+    // 根因不是「没接触摸」，而是触摸被 Windows 提升成了**鼠标**：Compose 的
+    // scrollable 明确拒绝鼠标拖拽滚动
+    // （foundation/gestures/AbstractScrollableNode.kt: canDrag = { it != PointerType.Mouse }），
+    // 所以鼠标拖拽不滚是设计行为，触摸必须作为 PointerType.Touch 派发。
+    // 这里用与 C 桥接完全相同的 WindowsEvent.TouchEvent 序列驱动场景，锁死这条链路。
+    // 每一步之间渲染两帧，并把 ScrollState 记进 trace：失败时一眼能看出是
+    // 「完全没响应」还是「响应了但滚错方向/被夹住」。
+    app.debugTouchTrace = true
+
+    // (a) 触摸「点」得动吗？—— 先确认触点能命中并驱动 clickable，
+    //     否则说明问题在命中/分发，而不是 scrollable 的手势识别。
+    val clicksBeforeTouch = probe.clickCount
+    app.dispatchEvent(WindowsEvent.TouchEvent(pointerId = 1L, x = clickX, y = clickY, phase = TouchPhase.Down))
+    app.dispatchEvent(WindowsEvent.TouchEvent(pointerId = 1L, x = clickX, y = clickY, phase = TouchPhase.Up))
+    driver.render(800, 600, density = d, frames = 3)
+    report.checkEquals("interaction/touch-tap-clicks", clicksBeforeTouch + 1, probe.clickCount)
+
+    // (b) 触摸拖动能滚吗？
+    //
+    // 拖动轨迹要**完全落在底部滚动区里**（它的 y 范围是 480..600），并且每一步之间
+    // 渲染两帧：ScrollState 记进 trace，失败时一眼能看出是「完全没响应」还是
+    // 「响应了但被夹住」。实测正常拖动时 TOUCHDBG 里 Move 的 result=7
+    // （派发到控件 + 移动被消费 + 变化被消费）。
+    val beforeTouch = scrollState.value
+    app.dispatchEvent(WindowsEvent.TouchEvent(pointerId = 1L, x = 400, y = 560, phase = TouchPhase.Down))
+    driver.render(800, 600, density = d, frames = 2)
+    val touchTrace = StringBuilder("down:${scrollState.value}")
+    for (yy in intArrayOf(540, 500, 460, 420, 380, 340, 300)) {
+        app.dispatchEvent(WindowsEvent.TouchEvent(pointerId = 1L, x = 400, y = yy, phase = TouchPhase.Move))
+        driver.render(800, 600, density = d, frames = 2)
+        touchTrace.append(",$yy:${scrollState.value}")
+    }
+    app.dispatchEvent(WindowsEvent.TouchEvent(pointerId = 1L, x = 400, y = 300, phase = TouchPhase.Up))
+    driver.render(800, 600, density = d, frames = 4)
+    report.check(
+        "interaction/touch-drag-scrolls",
+        scrollState.value > beforeTouch,
+        "before=$beforeTouch after=${scrollState.value} max=${scrollState.maxValue} trace=$touchTrace",
+    )
+    app.debugTouchTrace = false
+    // 反证：同样轨迹用**鼠标**事件走一遍，不应该滚动（否则说明上面那条测的其实是
+    // 鼠标路径，触摸通道根本没被测到）。
+    val beforeMouseDrag = scrollState.value
+    mouseDrag(app, 400, 560, 300)
+    driver.render(800, 600, density = d, frames = 4)
+    report.check(
+        "interaction/mouse-drag-does-not-scroll",
+        scrollState.value == beforeMouseDrag,
+        "before=$beforeMouseDrag after=${scrollState.value}",
+    )
+    // 触摸抬起后不能留下"卡住"的触点，否则后续滚动会被当成多指手势
+    report.checkEquals("interaction/touch-pointers-released", 0, app.activeTouchCount)
+
     // 2.7 焦点 / 光标 / 选区
     //
     // 一对内容为空的输入框：左边点击后必须有焦点、右边必须没有；而且
@@ -923,6 +979,26 @@ private fun runWindowTests(report: SelfTestReport) {
             report.checkEquals("window/ctrl-x-copies", "CK", app.window.nativeWindow?.clipboard)
             ctrlKey(app, 0x56) // Ctrl+V（粘贴）
         }
+        if (frame == 74) {
+            // 最大化回归（真机 bug）：无边框窗口客户区 = 窗口矩形，而 Windows 最大化
+            // 会把窗口矩形按「不可见缩放边框」扩到屏幕外 → 客户区超出显示器，最右侧的
+            // 关闭按钮被裁掉一半，且**只在最大化时**出现。
+            // toggleMaximized 走 ShowWindow，最大化是异步发生的，隔几帧再断言。
+            app.window.toggleMaximized()
+        }
+        if (frame == 76) {
+            report.check(
+                "window/maximize-client-fits-monitor",
+                (app.window.nativeWindow?.clientOverflowCount ?: -1) == 0,
+                "overflow=${app.window.nativeWindow?.clientOverflowCount} " +
+                    "size=${app.window.nativeWindow?.width}x${app.window.nativeWindow?.height}",
+            )
+            report.check(
+                "window/touch-channel-enabled",
+                app.window.nativeWindow?.touchEnabled == true,
+                "touch=${app.window.nativeWindow?.touchEnabled}",
+            )
+        }
         if (frame == 78) {
             report.checkEquals("window/ctrl-v-pastes", "CK", probe.text)
             report.checkEquals("window/click-reaches-compose", 1, probe.clickCount)
@@ -1179,6 +1255,23 @@ private fun avgLuminanceInRow(a: FrameSnapshot, y: Int, x0: Int, x1: Int): Int {
 private fun wheel(app: WindowsComposeApplication, x: Int, y: Int, deltaY: Int) {
     app.dispatchEvent(
         WindowsEvent.MouseWheelEvent(x = x, y = y, deltaX = 0, deltaY = deltaY),
+    )
+    app.pumpDispatchers()
+}
+
+/** 同样轨迹的鼠标拖拽（对照组：按设计**不应该**滚动）。 */
+private fun mouseDrag(app: WindowsComposeApplication, x: Int, fromY: Int, toY: Int, steps: Int = 6) {
+    app.dispatchEvent(WindowsEvent.MouseMoveEvent(x = x, y = fromY))
+    app.dispatchEvent(
+        WindowsEvent.MouseButtonEvent(x = x, y = fromY, button = MouseButton.Left, isPressed = true),
+    )
+    for (i in 1..steps) {
+        val y = fromY + ((toY - fromY).toFloat() * i / steps).toInt()
+        app.dispatchEvent(WindowsEvent.MouseMoveEvent(x = x, y = y))
+        app.pumpDispatchers()
+    }
+    app.dispatchEvent(
+        WindowsEvent.MouseButtonEvent(x = x, y = toY, button = MouseButton.Left, isPressed = false),
     )
     app.pumpDispatchers()
 }

@@ -1534,3 +1534,53 @@ GALLERY-STATS: fps=59.8 frames/s=60 recompose(...)=+0/+0/+60/+60
   「静止对照」，而进度圈会一直持有帧时钟 awaiter → 宿主按刷新率重绘，表现为
   `frames/s≈60 但 recompose=0`（真机日志里正是这样，浪费了排查时间）。
   实测（Wine）：`--no-animate` → `frames/s=0`、`frames(loop/tick)=+0/+0`、`cpu=0.0ms/s`。
+
+### 17.10 「关闭按钮歪/右侧被裁切」（只在最大化时） + 触摸屏不能滚动（2026-09-14，真机反馈）
+
+用户反馈三条，逐条定位：
+
+1. **关闭图标"歪的，右侧一点画面被裁切"，而且只有最大化时才有** —— 不是图标画错了。
+   * 根因：本窗口是**无边框自绘**（`WM_NCCALCSIZE` 返回 0 ⇒ 客户区 = 窗口矩形），
+     而 Windows 在最大化时会把窗口矩形按「不可见缩放边框」**向屏幕外扩**
+     （96dpi 下 8px，200% 缩放下 16px）。客户区跟着超出屏幕、原点落在 `(-8,-8)`：
+     左/上 8px 落到屏幕外（内容整体左上偏移 = 看起来"歪"），右 8px 也落到屏幕外 ——
+     **最右侧的关闭按钮被裁掉一半**。普通状态下窗口矩形 == 客户区，所以只有最大化才复现。
+   * 旧代码 `nc->rgrc[0].top += 8` 是个只治上边、还写死了 96dpi 的 8px 的补丁，
+     左右下完全没治（所以这个 bug 一直没关掉）。另外 `WM_NCHITTEST` 里那句注释
+     「Overshoot guard: … handled by WM_GETMINMAXINFO」当时**根本没实现**那个分支。
+   * 修复：`WM_GETMINMAXINFO` 把最大化尺寸/位置钉到显示器工作区；`WM_NCCALCSIZE`
+     在最大化时把 `rgrc[0]` 直接夹到 `mi.rcWork`（这条是权威的，客户区尺寸 =
+     屏幕可用区）。日志会打一条 `win32: maximize ok: window=… client=… work=…`，
+     正常不应该出现 `MAXIMIZE-OVERFLOW`。
+   * 可断言的不变量：新增 `clientOverflowCount`（最大化时客户区超出工作区就 +1），
+     自检 `window/maximize-client-fits-monitor` 断言为 0。
+2. **标题栏按钮"要点两次"** —— 用户确认是**鼠标硬件失灵**，不是程序问题（已排除；
+   v0.4.1 那个「模态循环渲染 tick 先 flush 主线程队列」的修复与此无关）。
+3. **Windows 触摸屏能点击、不能滑动** —— 根因很干脆：触摸被 Windows **提升成鼠标消息**，
+   而 Compose 的 scrollable **明确拒绝鼠标拖拽滚动**：
+   `foundation/src/commonMain/kotlin/androidx/compose/foundation/gestures/AbstractScrollableNode.kt`
+   的 `internal val CanDragCalculation: (PointerType) -> Boolean = { type -> type != PointerType.Mouse }`。
+   也就是说「鼠标拖拽不滚动」是上游**设计行为**，触摸必须作为 `PointerType.Touch` 派发。
+   * 实现（对齐 iOS/Android skiko 后端的形状，不发明新东西）：
+     C 侧处理 `WM_POINTERDOWN/UPDATE/UP/CAPTURECHANGED`（`GetPointerInfo` 取屏幕坐标再
+     `ScreenToClient`，比 `lParam` 的语义更可靠；只认 `PT_TOUCH/PT_PEN`，鼠标继续走
+     `WM_MOUSE*`），**不交给 DefWindowProc** 以阻止系统再合成一份鼠标消息；
+     新增事件 `COMPOSEKN_WIN32_EVENT_TOUCH_{DOWN,MOVE,UP} = 11/12/13`（`button` = 指针 id）
+     → `WindowsEvent.TouchEvent` → `ComposeScene.dispatchWindowsTouchEvent`，走
+     **多指 API**（`sendPointerEvent(pointers = List<ComposeScenePointer>)` +
+     `PointerType.Touch`），活动触点表由 `WindowsInputState.updateTouch` 维护
+     （多指 API 要求每次带上全部活动触点，抬起那次 pressed=false 也要带上）。
+     这样手指拖动会被 Compose 的手势识别器接受，**松手后还有甩动惯性**。
+   * 逃生开关：`COMPOSEKN_TOUCH=0` 关掉整条触摸通道，退回「触摸当鼠标」的老行为
+     （万一某台机器上出现「一次触摸变成两套输入」的重复事件）。
+   * 自检：`interaction/touch-drag-scrolls`（触摸拖动必须滚动）、
+     `interaction/mouse-drag-does-not-scroll`（反证：鼠标同样轨迹**不应**滚动，
+     否则说明测的其实是鼠标路径）、`interaction/touch-pointers-released`
+     （抬起后触点表必须清空，否则后续滚动会被当成多指手势）、
+     `window/touch-channel-enabled`。
+
+**事故记录（值得记住）**：这轮编辑 `WindowsWindowChrome.kt` 时文件被写坏成
+**10.5 MB / 206918 行**（只剩 39 行的 Canvas 片段被重复了约 5300 次，package/import
+全没了），Kotlin 编译报的是 `java.lang.StackOverflowError` —— 一度被误判成
+Gradle/daemon 抽风。教训：**每次改完立刻核对行数/字节数**（`wc -l -c`），
+异常增长就先 `git checkout --` 复原再重做；编译报 StackOverflowError 时先怀疑文件本身。

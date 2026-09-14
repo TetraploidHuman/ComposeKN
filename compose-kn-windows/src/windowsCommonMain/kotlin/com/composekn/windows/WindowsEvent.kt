@@ -62,6 +62,22 @@ sealed class WindowsEvent {
     ) : WindowsEvent()
 
     /**
+     * Touch (or pen) event produced by WM_POINTER*.
+     *
+     * 关键点：触摸必须作为 PointerType.Touch 派发，不能当鼠标 —— Compose 的
+     * scrollable 拒绝鼠标拖拽滚动
+     * （foundation/gestures/AbstractScrollableNode.kt: canDrag = { it != PointerType.Mouse }），
+     * 所以「触摸当鼠标」时点击能用、滑动不滚（真机反馈的问题）。
+     */
+    data class TouchEvent(
+        /** Win32 指针 id（WM_POINTER 的 GET_POINTERID_WPARAM），多指时用来区分手指。 */
+        val pointerId: Long,
+        val x: Int,
+        val y: Int,
+        val phase: TouchPhase,
+    ) : WindowsEvent()
+
+    /**
      * Window resize event.
      */
     data class ResizeEvent(
@@ -104,4 +120,13 @@ enum class MouseButton {
     Middle,
     Extra1,
     Extra2,
+}
+
+/**
+ * 触摸触点状态（对应 WM_POINTERDOWN / WM_POINTERUPDATE / WM_POINTERUP）。
+ */
+enum class TouchPhase {
+    Down,
+    Move,
+    Up,
 }

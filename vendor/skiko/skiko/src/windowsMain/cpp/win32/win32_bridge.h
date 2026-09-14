@@ -23,6 +23,17 @@ typedef enum ComposeKNWin32EventType {
     COMPOSEKN_WIN32_EVENT_CLOSE = 8,
     COMPOSEKN_WIN32_EVENT_FOCUS = 9,
     COMPOSEKN_WIN32_EVENT_QUIT = 10,
+    /*
+     * 触摸（WM_POINTER -> Compose PointerType.Touch）。
+     *
+     * 为什么必须单独一条通道：Compose 的 scrollable 明确拒绝鼠标拖拽滚动
+     * （foundation/gestures/AbstractScrollableNode.kt: canDrag = { type != Mouse }），
+     * 所以「把触摸当鼠标」的窗口上，手指拖动永远不会滚动列表。
+     * button = 指针 id，state = 1(按下/移动) / 0(抬起)，x/y = 客户区物理像素。
+     */
+    COMPOSEKN_WIN32_EVENT_TOUCH_DOWN = 11,
+    COMPOSEKN_WIN32_EVENT_TOUCH_MOVE = 12,
+    COMPOSEKN_WIN32_EVENT_TOUCH_UP = 13,
 } ComposeKNWin32EventType;
 
 typedef struct ComposeKNWin32Event {
@@ -151,6 +162,18 @@ void composekn_win32_gl_destroy(ComposeKNWin32Window* window);
 
 int composekn_win32_width(ComposeKNWin32Window* window);
 int composekn_win32_height(ComposeKNWin32Window* window);
+
+/**
+ * 「最大化时客户区超出显示器工作区」的检出次数（正常必须为 0）。
+ *
+ * 真机 bug 的回归断言：无边框窗口（WM_NCCALCSIZE 返回 0，客户区 = 窗口矩形）在最大化
+ * 时会被 Windows 按「不可见缩放边框」扩到屏幕外，客户区跟着超出屏幕，最右侧的控件
+ * （关闭按钮）被裁掉，且**只在最大化时出现**。见 win32_window.cc 的 WM_NCCALCSIZE。
+ */
+int32_t composekn_win32_client_overflow_count(ComposeKNWin32Window* window);
+
+/** 触摸通道是否启用（COMPOSEKN_TOUCH=0 可关掉，退回系统「触摸提升成鼠标」的老行为）。 */
+bool composekn_win32_touch_enabled(ComposeKNWin32Window* window);
 
 /** ShowWindow wrapper: cmd 3=SW_MAXIMIZE 6=SW_MINIMIZE 9=SW_RESTORE 5=SW_SHOW */
 void composekn_win32_show(ComposeKNWin32Window* window, int cmd);

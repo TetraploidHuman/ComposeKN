@@ -1,7 +1,13 @@
+@file:OptIn(androidx.compose.ui.InternalComposeUiApi::class)
+
 package com.composekn.windows
 
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.PointerButtons
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.scene.ComposeScenePointer
 import com.composekn.windows.internal.Win32Modifier
 
 /**
@@ -89,6 +95,42 @@ class WindowsInputState {
         isAltPressed = (wParam and MK_ALT) != 0,
         isMetaPressed = false,
     )
+
+    /**
+     * 当前按下的触摸触点（指针 id -> 位置，物理像素）。
+     *
+     * Compose 的多指 API 要求每次事件都带上**全部**活动触点（抬起的那个
+     * 用 pressed=false 再带最后一次），所以必须自己维护这张表。
+     */
+    private val activeTouches = mutableMapOf<Long, Offset>()
+
+    val activeTouchCount: Int get() = activeTouches.size
+
+    /** 打开后每一条触摸事件都会 println 一行（自检/真机排查触摸问题时用）。 */
+    var debugTouchTrace: Boolean = false
+
+    /**
+     * 更新触点表，返回本次事件应该发给 Compose 的完整触点列表。
+     */
+    fun updateTouch(event: WindowsEvent.TouchEvent): List<ComposeScenePointer> {
+        val position = Offset(event.x.toFloat(), event.y.toFloat())
+        // 抬起事件也要更新位置：Compose 要求 Release 事件带上该触点的最终位置。
+        activeTouches[event.pointerId] = position
+        val pressed = event.phase != TouchPhase.Up
+        val pointers = activeTouches.map { (id, pos) ->
+            ComposeScenePointer(
+                id = PointerId(id),
+                position = pos,
+                pressed = if (id == event.pointerId) pressed else true,
+                type = PointerType.Touch,
+            )
+        }
+        if (event.phase == TouchPhase.Up) {
+            // 抬起之后这个触点就不再是"活动"的了，下一个事件不能再带上它。
+            activeTouches.remove(event.pointerId)
+        }
+        return pointers
+    }
 
     companion object {
         private const val MK_SHIFT = 0x0004

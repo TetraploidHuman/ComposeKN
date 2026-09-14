@@ -240,6 +240,18 @@ class WindowsComposeWindow(
                         isAltPressed = raw.modifiers and MOD_ALT != 0u,
                     )
                 )
+                Win32Event.TOUCH_DOWN, Win32Event.TOUCH_MOVE, Win32Event.TOUCH_UP -> onEvent(
+                    WindowsEvent.TouchEvent(
+                        pointerId = raw.button.toLong(),
+                        x = raw.x.toInt(),
+                        y = raw.y.toInt(),
+                        phase = when (raw.type) {
+                            Win32Event.TOUCH_DOWN -> TouchPhase.Down
+                            Win32Event.TOUCH_UP -> TouchPhase.Up
+                            else -> TouchPhase.Move
+                        },
+                    )
+                )
                 Win32Event.KEY -> onEvent(
                     WindowsEvent.KeyEvent(
                         virtualKeyCode = raw.button.toInt(),

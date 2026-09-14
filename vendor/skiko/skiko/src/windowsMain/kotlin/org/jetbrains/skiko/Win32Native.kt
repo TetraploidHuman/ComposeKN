@@ -88,6 +88,14 @@ internal external fun composekn_win32_process_cpu_nanos(window: COpaquePointer?)
 @SymbolName("composekn_win32_processor_count")
 internal external fun composekn_win32_processor_count(): Int
 
+/** 「最大化时客户区超出显示器工作区」的检出次数（正常为 0）。 */
+@SymbolName("composekn_win32_client_overflow_count")
+internal external fun composekn_win32_client_overflow_count(window: COpaquePointer?): Int
+
+/** 触摸（WM_POINTER）通道是否启用。 */
+@SymbolName("composekn_win32_touch_enabled")
+internal external fun composekn_win32_touch_enabled(window: COpaquePointer?): Boolean
+
 // ---------------------------------------------------------------------------
 // OpenGL / WGL（GPU 后端，对齐上游 linuxMain 的 EGL 版）
 //
@@ -238,6 +246,18 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     /** 本进程累计 CPU 时间（纳秒），失败返回 -1。用于把 CPU 占用写进日志。 */
     fun processCpuNanos(): Long = composekn_win32_process_cpu_nanos(native)
 
+    /**
+     * 「最大化时客户区超出显示器工作区」的检出次数（正常必须为 0）。
+     *
+     * 无边框窗口最大化时 Windows 会按不可见缩放边框把窗口扩到屏幕外，客户区跟着
+     * 超出屏幕，最右侧的关闭按钮就被裁掉一半 —— 而且**只在最大化时出现**。
+     * 自检拿它当回归断言（见 SelfTest 的 window/maximize-* 两条）。
+     */
+    val clientOverflowCount: Int get() = composekn_win32_client_overflow_count(native)
+
+    /** 触摸通道是否启用（COMPOSEKN_TOUCH=0 关闭）。 */
+    val touchEnabled: Boolean get() = composekn_win32_touch_enabled(native)
+
     // ---- OpenGL / WGL（GPU 后端）----
 
     /** 建 WGL 上下文并 make current；失败返回 false（调用方回退软件路径）。 */
@@ -340,7 +360,6 @@ fun setWindowsRenderTick(action: (() -> Unit)?) {
 
 @SymbolName("composekn_win32_log")
 internal external fun composekn_win32_log(message: CPointer<ByteVar>)
-
 /** Append a line to composekn-startup.log (next to the exe). */
 fun win32Log(message: String) = message.useCString { composekn_win32_log(it) }
 
@@ -371,6 +390,13 @@ data class Win32Event(
         const val CLOSE = 8
         const val FOCUS = 9
         const val QUIT = 10
+        /*
+         * 触摸（WM_POINTER）。x/y = 客户区物理像素，button = 指针 id，
+         * state = 1(按下/移动) / 0(抬起)。见 win32_bridge.h 的说明。
+         */
+        const val TOUCH_DOWN = 11
+        const val TOUCH_MOVE = 12
+        const val TOUCH_UP = 13
     }
 }
 

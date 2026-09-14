@@ -119,6 +119,12 @@ struct ComposeKNWin32Window {
     bool paintLogged = false;
     bool sizeLogged = false;
     bool presentLogged = false;
+    // 诊断：最大化时「客户区超出显示器工作区」的检出次数（真机 bug 的回归断言用）
+    int32_t clientOverflowCount = 0;
+    bool maximizeLogged = false;
+    // 触摸（WM_POINTER）通道。COMPOSEKN_TOUCH=0 可整体关掉，退回「系统把触摸提升成鼠标」的老行为。
+    bool touchEnabled = true;
+    int touchLogCount = 0;
     // 最近一帧的像素缓存：缩放/重绘期间用来立刻重绘，避免白屏
     std::vector<unsigned char> frame;
     int frameW = 0;
@@ -226,6 +232,28 @@ static void fireRenderTick() {
     g_inRenderTick = false;
 }
 
+// ---------------------------------------------------------------------------
+// 触摸/笔 API（Win8+）。动态解析而不是静态链接：这些符号不在所有 mingw-w64
+// 导入库里，运行时取能少一个构建期依赖；取不到就退化成「触摸当鼠标」的老行为。
+// ---------------------------------------------------------------------------
+typedef BOOL (WINAPI *GetPointerInfoFn)(UINT32, POINTER_INFO*);
+typedef BOOL (WINAPI *GetPointerTypeFn)(UINT32, POINTER_INPUT_TYPE*);
+
+static GetPointerInfoFn g_getPointerInfo = nullptr;
+static GetPointerTypeFn g_getPointerType = nullptr;
+
+static void resolvePointerApis() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 == nullptr) return;
+    g_getPointerInfo = reinterpret_cast<GetPointerInfoFn>(
+        reinterpret_cast<void*>(GetProcAddress(user32, "GetPointerInfo")));
+    g_getPointerType = reinterpret_cast<GetPointerTypeFn>(
+        reinterpret_cast<void*>(GetProcAddress(user32, "GetPointerType")));
+}
+
 // 调试钩子：COMPOSEKN_TEST_RESIZE=1 时自动模拟若干次窗口缩放。
 // Wine/Xvfb 下没有窗口管理器，无法从外部触发 WM_SIZE，用它验证上面这条链路。
 static const UINT_PTR kTestResizeTimerId = 0xC011;
@@ -279,14 +307,53 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             }
             break;
         }
+        case WM_GETMINMAXINFO: {
+            // 最大化尺寸严格取显示器工作区（客户区夹取的兜底见 WM_NCCALCSIZE）。
+            // 老代码在 WM_NCHITTEST 里写了「Overshoot guard: ... handled by WM_GETMINMAXINFO」，
+            // 但这个分支当时根本没实现 —— 于是最大化时窗口可以被扩大到屏幕外。
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            const int minDim = edgeMargin(window) * 2 + 1;
+            if (mmi->ptMinTrackSize.x < minDim) mmi->ptMinTrackSize.x = minDim;
+            if (mmi->ptMinTrackSize.y < minDim) mmi->ptMinTrackSize.y = minDim;
+            HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi;
+            ZeroMemory(&mi, sizeof(mi));
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(monitor, &mi)) {
+                mmi->ptMaxPosition.x = mi.rcWork.left;
+                mmi->ptMaxPosition.y = mi.rcWork.top;
+                mmi->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
+                mmi->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
+            }
+            return 0;
+        }
         case WM_NCCALCSIZE: {
             // 无系统边框/标题栏：我们自绘标题栏（CSD），缩放靠 WM_NCHITTEST。
             // 注意 wParam == 0（窗口创建/普通查询）也必须返回 0 且不调用
             // DefWindowProc，否则系统标题栏会被画出来（会出现两条标题栏，
             // 而拖拽缩放时 wParam != 0 又变回无边框，看起来像"标题栏消失"）。
+            //
+            // ★ 最大化时客户区必须夹到显示器工作区（真机 bug 的根因）：
+            //   Windows 最大化窗口时会把窗口矩形按「不可见缩放边框」（96dpi 下 8px，
+            //   200% 缩放下 16px）向屏幕外扩，于是 GetWindowRect 比屏幕还大。我们
+            //   WM_NCCALCSIZE 返回 0（客户区 = 窗口矩形），客户区就这样超出屏幕、
+            //   原点落在 (-8,-8)：左/上 8px 落到屏幕外（内容整体左上偏移），右 8px 也
+            //   落到屏幕外 —— **最右侧的关闭按钮被裁掉一半**（真机反馈「关闭图标歪的，
+            //   右侧一点画面被裁切」，而且只有最大化时出现，因为普通状态下窗口矩形
+            //   就是客户区）。老代码 `rgrc[0].top += 8` 是只治上边、还写死了 96dpi 的
+            //   硬编码补丁，左右下完全没治，所以这个 bug 一直没关掉。
             if (wParam != 0 && IsZoomed(hwnd)) {
                 NCCALCSIZE_PARAMS* nc = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
-                nc->rgrc[0].top += 8;
+                HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi;
+                ZeroMemory(&mi, sizeof(mi));
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(monitor, &mi)) {
+                    nc->rgrc[0].left = mi.rcWork.left;
+                    nc->rgrc[0].top = mi.rcWork.top;
+                    nc->rgrc[0].right = mi.rcWork.right;
+                    nc->rgrc[0].bottom = mi.rcWork.bottom;
+                }
             }
             return 0;
         }
@@ -303,6 +370,38 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 pushEvent(window, e);
                 // 同步渲染一帧（模态缩放循环期间 Kotlin 循环跑不到）
                 fireRenderTick();
+            }
+            if (w > 0 && h > 0 && IsZoomed(hwnd)) {
+                // 最大化不变量：客户区不得超出显示器工作区。
+                // 超出 = 窗口被扩到屏幕外（见 WM_NCCALCSIZE 的说明），最右侧/最下侧的
+                // 内容会被裁掉。真机回归断言读的就是 clientOverflowCount。
+                HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi;
+                ZeroMemory(&mi, sizeof(mi));
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(monitor, &mi)) {
+                    const int workW = static_cast<int>(mi.rcWork.right - mi.rcWork.left);
+                    const int workH = static_cast<int>(mi.rcWork.bottom - mi.rcWork.top);
+                    if (w > workW || h > workH) {
+                        ++window->clientOverflowCount;
+                        composeknLog(
+                            "win32: MAXIMIZE-OVERFLOW client=%dx%d work=%dx%d -> 客户区超出工作区，右/下内容会被裁切",
+                            w, h, workW, workH);
+                    } else if (!window->maximizeLogged) {
+                        window->maximizeLogged = true;
+                        RECT wr;
+                        GetWindowRect(hwnd, &wr);
+                        composeknLog(
+                            "win32: maximize ok: window=%d,%d %dx%d client=%dx%d work=%d,%d %dx%d",
+                            static_cast<int>(wr.left), static_cast<int>(wr.top),
+                            static_cast<int>(wr.right - wr.left), static_cast<int>(wr.bottom - wr.top),
+                            w, h,
+                            static_cast<int>(mi.rcWork.left), static_cast<int>(mi.rcWork.top),
+                            workW, workH);
+                    }
+                }
+            } else {
+                window->maximizeLogged = false;
             }
             break;
         }
@@ -431,6 +530,81 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             pushEvent(window, e);
             break;
         }
+        case WM_POINTERDOWN:
+        case WM_POINTERUPDATE:
+        case WM_POINTERUP:
+        case WM_POINTERCAPTURECHANGED: {
+            // ------------------------------------------------------------------
+            // 触摸/笔 -> Compose 的 PointerType.Touch
+            //
+            // 为什么需要这条通道：默认情况下 Windows 会把触摸**提升成鼠标消息**，
+            // 而 Compose 的 scrollable 明确拒绝鼠标拖拽滚动
+            // （foundation/gestures/AbstractScrollableNode.kt:
+            //   internal val CanDragCalculation = { type -> type != PointerType.Mouse }）
+            // 于是「点击能用、滑动不滚」——真机反馈的正是这个现象。
+            // 处理 WM_POINTER* 并**不交给 DefWindowProc**，系统就不再做鼠标提升，
+            // 触摸于是走 Compose 真正的触摸手势（拖动 + 甩动惯性）。
+            // ------------------------------------------------------------------
+            if (window == nullptr || !window->touchEnabled) break;
+            const uint32_t pointerId = static_cast<uint32_t>(GET_POINTERID_WPARAM(wParam));
+            // 只认触摸/笔：鼠标（EnableMouseInPointer 之后也会产生 WM_POINTER）走
+            // WM_MOUSE* 通道，否则一次移动会变成两条事件。
+            if (message != WM_POINTERCAPTURECHANGED && g_getPointerType != nullptr) {
+                POINTER_INPUT_TYPE pointerType = PT_POINTER;
+                if (g_getPointerType(pointerId, &pointerType) &&
+                    pointerType != PT_TOUCH && pointerType != PT_PEN) {
+                    break;
+                }
+            }
+            ComposeKNWin32Event e{};
+            e.button = pointerId;
+            e.modifiers = queryCurrentModifiers();
+            if (message == WM_POINTERCAPTURECHANGED) {
+                // 触点被系统收走（手势识别、其它窗口抢焦点…）：必须补一个抬起，
+                // 否则 Kotlin 侧的活动触点表会永远留着这根手指，后续滚动就"卡死"了。
+                e.type = COMPOSEKN_WIN32_EVENT_TOUCH_UP;
+                e.state = 0;
+            } else {
+                // 坐标语义：lParam 到底是客户区还是屏幕坐标，各版本文档说法不一致，
+                // 这里直接用 GetPointerInfo 的**屏幕**坐标再转客户区，避免把触摸位置搞错。
+                POINT pt{};
+                bool got = false;
+                if (g_getPointerInfo != nullptr) {
+                    POINTER_INFO info{};
+                    if (g_getPointerInfo(pointerId, &info)) {
+                        pt = info.ptPixelLocation;
+                        got = true;
+                    }
+                }
+                if (got) {
+                    ScreenToClient(hwnd, &pt);
+                } else {
+                    // 极少见：user32 里没有 GetPointerInfo（Win8 以下）。按客户区坐标兜底。
+                    pt.x = GET_X_LPARAM(lParam);
+                    pt.y = GET_Y_LPARAM(lParam);
+                    if (window->touchLogCount == 0) {
+                        composeknLog("touch: GetPointerInfo 不可用，回退 lParam 客户区坐标");
+                    }
+                }
+                e.type = message == WM_POINTERDOWN ? COMPOSEKN_WIN32_EVENT_TOUCH_DOWN
+                       : message == WM_POINTERUP   ? COMPOSEKN_WIN32_EVENT_TOUCH_UP
+                                                   : COMPOSEKN_WIN32_EVENT_TOUCH_MOVE;
+                e.state = (message == WM_POINTERUP) ? 0u : 1u;
+                e.x = static_cast<float>(pt.x);
+                e.y = static_cast<float>(pt.y);
+            }
+            pushEvent(window, e);
+            if (window->touchLogCount < 12) {
+                ++window->touchLogCount;
+                composeknLog("touch: type=%d id=%u pos=%.0f,%.0f raw=%.0f",
+                             static_cast<int>(e.type), pointerId,
+                             static_cast<double>(e.x), static_cast<double>(e.y),
+                             static_cast<double>(e.state));
+            }
+            // 明确"我处理了这条指针消息"（不交给 DefWindowProc）：
+            // 否则系统会再合成一份鼠标消息，一次触摸变成两套输入。
+            return 0;
+        }
         case WM_CLOSE: {
             if (window) {
                 ComposeKNWin32Event e{};
@@ -520,6 +694,13 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
     ComposeKNWin32Window* window = new ComposeKNWin32Window();
     window->width = width;
     window->height = height;
+    // 触摸通道默认开；COMPOSEKN_TOUCH=0 关掉（退回系统「触摸提升成鼠标」的老行为）。
+    const char* touchEnv = getenv("COMPOSEKN_TOUCH");
+    window->touchEnabled = !(touchEnv != nullptr && touchEnv[0] == '0');
+    resolvePointerApis();
+    composeknLog("composekn_win32_create: touch=%s pointerApi=%s",
+                 window->touchEnabled ? "on" : "off",
+                 g_getPointerInfo != nullptr ? "ok" : "missing");
     window->hwnd = CreateWindowExW(
         0,
         kWindowClass,
@@ -746,6 +927,16 @@ extern "C" int composekn_win32_height(ComposeKNWin32Window* window) {
 
 extern "C" float composekn_win32_dpi_scale(ComposeKNWin32Window* window) {
     return static_cast<float>(dpiScaleOf(window));
+}
+
+extern "C" int32_t composekn_win32_client_overflow_count(ComposeKNWin32Window* window) {
+    if (window == nullptr) return 0;
+    return window->clientOverflowCount;
+}
+
+extern "C" bool composekn_win32_touch_enabled(ComposeKNWin32Window* window) {
+    if (window == nullptr) return false;
+    return window->touchEnabled;
 }
 
 extern "C" int32_t composekn_win32_refresh_hz(ComposeKNWin32Window* window) {

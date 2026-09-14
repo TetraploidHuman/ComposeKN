@@ -9,6 +9,7 @@ import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerButtons
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.isAltPressed
 import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.isMetaPressed
@@ -82,6 +83,47 @@ internal fun ComposeScene.dispatchWindowsMouseButtonEvent(
         nativeEvent = event,
         button = pointerButton,
     )
+}
+
+/**
+ * Dispatch a Windows touch event to the Compose scene.
+ *
+ * 触摸必须走 [PointerType.Touch] 的多指 API，不能走鼠标那条路：
+ * Compose 的 scrollable 明确拒绝鼠标拖拽滚动，只有 Touch 才会被手势识别器
+ * 接受（拖动滚动 + 松手后的甩动惯性）。真机上的「点击正常、滑动不滚」
+ * 就是「触摸被当成鼠标」造成的。
+ */
+internal fun ComposeScene.dispatchWindowsTouchEvent(
+    event: WindowsEvent.TouchEvent,
+    inputState: WindowsInputState,
+) {
+    // 多指 API 要求每次带上全部活动触点，状态表在 inputState 里维护。
+    val pointers = inputState.updateTouch(event)
+    if (pointers.isEmpty()) return
+
+    val eventType = when (event.phase) {
+        TouchPhase.Down -> PointerEventType.Press
+        TouchPhase.Move -> PointerEventType.Move
+        TouchPhase.Up -> PointerEventType.Release
+    }
+    val result = sendPointerEvent(
+        eventType = eventType,
+        pointers = pointers,
+        buttons = PointerButtons(),
+        keyboardModifiers = inputState.modifiers,
+        nativeEvent = event,
+        button = null,
+    )
+    // 诊断：result 的 bit0 = 派发到了某个 pointerInput 节点，bit1 = 移动被消费，
+    // bit2 = 变化被消费。「能点到但滑不动」时这一行就能区分是「事件没到控件」
+    // （bit0=0）还是「到了但手势没认出来」（bit0=1 而 bit1=0）。
+    // 实测：正常拖动 Move 的 result=7；触摸被当成鼠标时全是 1。
+    if (inputState.debugTouchTrace) {
+        println(
+            "TOUCHDBG phase=${event.phase} id=${event.pointerId} pos=${event.x},${event.y} " +
+                "pointers=${pointers.size} result=$result",
+        )
+    }
 }
 
 /**

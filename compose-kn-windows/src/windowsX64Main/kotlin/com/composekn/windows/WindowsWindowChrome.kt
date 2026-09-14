@@ -112,27 +112,42 @@ private fun WindowControlButton(kind: WindowButton, onClick: () -> Unit) {
         contentAlignment = Alignment.Center,
     ) {
         Canvas(Modifier.size(10.dp)) {
-            val stroke = 1.1.dp.toPx()
-            val w = size.width
-            val h = size.height
+            val stroke = 1.0.dp.toPx()
+            // 关键：Compose 的 drawLine/drawRect 描边是**沿路径居中**的，路径正好压在
+            // 0..size 的边界上时，一半笔宽会被画布裁掉 —— 三个图标就会显得粗细不一、
+            // 方框/叉号发"钝"（真机上用户直接看出"怪怪的"）。
+            // 所以先把几何整体内缩半个笔宽，再用内缩后的 left/top/right/bottom 画。
+            val inset = stroke / 2f
+            val left = inset
+            val top = inset
+            val right = size.width - inset
+            val bottom = size.height - inset
+            val w = right - left
+            val h = bottom - top
             when (kind) {
                 WindowButton.Minimize ->
-                    drawLine(Color.White, Offset(0f, h), Offset(w, h), stroke)
+                    // Windows 风格：减号贴底部中线
+                    drawLine(Color.White, Offset(left, bottom), Offset(right, bottom), stroke)
                 WindowButton.Maximize ->
-                    drawRect(Color.White, topLeft = Offset.Zero, size = Size(w, h), style = Stroke(stroke))
+                    drawRect(
+                        Color.White,
+                        topLeft = Offset(left, top),
+                        size = Size(w, h),
+                        style = Stroke(stroke),
+                    )
                 WindowButton.Restore -> {
                     drawRect(
                         Color.White,
-                        topLeft = Offset(0f, h * 0.25f),
+                        topLeft = Offset(left, top + h * 0.25f),
                         size = Size(w * 0.75f, h * 0.75f),
                         style = Stroke(stroke),
                     )
-                    drawLine(Color.White, Offset(w * 0.25f, 0f), Offset(w, 0f), stroke)
-                    drawLine(Color.White, Offset(w, 0f), Offset(w, h * 0.75f), stroke)
+                    drawLine(Color.White, Offset(left + w * 0.25f, top), Offset(right, top), stroke)
+                    drawLine(Color.White, Offset(right, top), Offset(right, top + h * 0.75f), stroke)
                 }
                 WindowButton.Close -> {
-                    drawLine(Color.White, Offset.Zero, Offset(w, h), stroke)
-                    drawLine(Color.White, Offset(w, 0f), Offset(0f, h), stroke)
+                    drawLine(Color.White, Offset(left, top), Offset(right, bottom), stroke)
+                    drawLine(Color.White, Offset(right, top), Offset(left, bottom), stroke)
                 }
             }
         }

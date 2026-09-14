@@ -38,6 +38,21 @@ class WindowsComposeApplication(
 ) {
     val window: WindowsComposeWindow = WindowsComposeWindow(title, width, height)
     private val inputState = WindowsInputState()
+
+    /**
+     * 当前按下的触摸触点数。
+     *
+     * 自检用：触摸抬起后必须归零 —— 残留触点会让后续拖动被当成多指手势，
+     * 表现为「滚着滚着就不动了」。
+     */
+    val activeTouchCount: Int get() = inputState.activeTouchCount
+
+    /** 打开后每条触摸事件都 println 一行（自检/真机排查触摸问题时用）。 */
+    var debugTouchTrace: Boolean
+        get() = inputState.debugTouchTrace
+        set(value) {
+            inputState.debugTouchTrace = value
+        }
     private val archComponentsOwner = DefaultArchitectureComponentsOwner(enforceMainThread = false)
     private val textInputService = WindowsTextInputService()
     private val platformContext = WindowsPlatformContext(archComponentsOwner, textInputService)
@@ -222,6 +237,9 @@ class WindowsComposeApplication(
                     isAltPressed = event.isAltPressed,
                 )
                 scene.dispatchWindowsMouseWheelEvent(event, inputState)
+            }
+            is WindowsEvent.TouchEvent -> {
+                scene.dispatchWindowsTouchEvent(event, inputState)
             }
             is WindowsEvent.ResizeEvent -> {
                 winlog("event: resize ${event.width}x${event.height}")
