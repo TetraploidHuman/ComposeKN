@@ -538,20 +538,10 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
     }
     composeknLog("composekn_win32_create: hwnd=%p ok", (void*)window->hwnd);
 
-    // 校正：窗口所在显示器的 DPI 可能和系统 DPI 不同（多显示器/缩放不一致）。
-    {
-        const double actual = dpiScaleOf(window);
-        const int want_w = static_cast<int>(width_dp * actual + 0.5);
-        const int want_h = static_cast<int>(height_dp * actual + 0.5);
-        if (want_w > 0 && want_h > 0 && (want_w != window->width || want_h != window->height)) {
-            composeknLog("composekn_win32_create: 按窗口 DPI 校正尺寸 %dx%d -> %dx%d (scale=%.2f)",
-                         window->width, window->height, want_w, want_h, actual);
-            window->width = want_w;
-            window->height = want_h;
-            SetWindowPos(window->hwnd, nullptr, 0, 0, want_w, want_h,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
+    // 注意：**不要**在窗口刚建好时用 GetDpiForWindow/WM_DPICHANGED 去"校正"尺寸 ——
+    // 这时窗口还没真正落到显示器上，dpiScaleOf(window) 会返回 1.0，于是把刚算好的
+    // 2 倍缩放又抹掉（真机日志：dp=1100x760 -> px=2200x1520，紧接着又"校正"回 1100x760）。
+    // 多显示器/不同缩放的场景交给 WM_DPICHANGED（窗口被拖到别的屏时系统会通知）。
     window->dpi = queryWindowDpi(window->hwnd);
     ShowWindow(window->hwnd, SW_SHOWNORMAL);
     UpdateWindow(window->hwnd);
