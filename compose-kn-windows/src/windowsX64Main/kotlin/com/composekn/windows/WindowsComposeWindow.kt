@@ -18,17 +18,20 @@ import kotlin.concurrent.Volatile
 /** 最小化时的轮询间隔：不渲染，但也不能忙等（5 次/秒的唤醒，CPU ≈ 0）。 */
 private const val MINIMIZED_POLL_MS = 200
 
+private const val FALLBACK_REFRESH_HZ = 60
+
 /**
- * 由显示器刷新率推出帧间隔（默认 60Hz）。
+ * 把 `GetDeviceCaps(VREFRESH)` 的原始值换成可信的刷新率。
  *
- * 虚拟机/远程桌面上 `GetDeviceCaps(VREFRESH)` 会返回 0 或 1，这类不可信的值直接
- * 退回 60Hz —— 不能让它把帧率压成 1fps。
+ * 虚拟机/远程桌面上它会返回 0 或 1，这类不可信的值直接退回 60Hz —— 不能让它把
+ * 帧率压成 1fps。
  */
-private fun frameIntervalNanos(win: Win32Window): Long {
-    val hz = win.refreshHz
-    val usable = if (hz in 24..360) hz else 60
-    return 1_000_000_000L / usable
-}
+internal fun usableRefreshHz(rawHz: Int): Int =
+    if (rawHz in 24..360) rawHz else FALLBACK_REFRESH_HZ
+
+/** 由（可信的）刷新率推出帧间隔，默认 60Hz。 */
+private fun frameIntervalNanos(win: Win32Window): Long =
+    1_000_000_000L / usableRefreshHz(win.refreshHz)
 
 /**
  * Windows window + SkiaLayer with rendering and input events.
@@ -56,6 +59,17 @@ class WindowsComposeWindow(
 
     /** 当前物理像素 / 逻辑像素（未 attach 时为 1.0）。 */
     val dpiScale: Float get() = layer.contentScale
+
+    /**
+     * `GetDeviceCaps(VREFRESH)` 的原始值（未 attach / 不可信时为 0）。
+     *
+     * 注意：窗口是在 [run] 里创建的，`run` 之前取不到 —— 诊断日志必须等窗口出现
+     * 再打，否则会打出「刷新率=0Hz」，看着像 VREFRESH 失败（实际只是窗口还没建）。
+     */
+    val rawRefreshHz: Int get() = win32Window?.refreshHz ?: 0
+
+    /** 实际生效的刷新率（不可信值已回退到 60Hz）。 */
+    val effectiveRefreshHz: Int get() = usableRefreshHz(rawRefreshHz)
 
     /** 底层 Win32 窗口（未 attach 时为 null）。 */
     val nativeWindow: Win32Window? get() = win32Window

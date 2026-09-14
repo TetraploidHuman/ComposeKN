@@ -68,40 +68,49 @@ fun main(args: Array<String>) {
             }
         }
 
-        // 性能日志：每秒一行，同时写到 stdout 和 exe 同目录的 composekn-startup.log。
+        val cores = win32ProcessorCount
+
+        // PERF-BANNER + 每秒一行 GALLERY-STATS：同时写 stdout 和 exe 同目录的
+        // composekn-startup.log。真机上任务管理器看不了细节时，跑一遍把日志拷出来即可。
         //
-        // 真机（Windows）上任务管理器看不了细节、或想直接留证据时，跑一遍把
-        // composekn-startup.log 拷出来即可。字段含义：
+        // 字段含义：
         //   fps            —— 宿主真实渲染帧率（= 每秒重绘次数）
         //   frames/s       —— 这一秒渲染的帧数
         //   recompose(...) —— 各作用域这一秒的重组次数：gallery=根、hud=HUD 函数体、
         //                     hudInner=读 frames 的最小作用域、summary=文本重算次数。
-        //                     动画在跑时预期是 0/0/≈60/≈60 —— 只有最小作用域重组，
-        //                     根和 HUD 函数体不涨，就是「按需重组生效」的证据。
+        //                     动画在跑时预期是 0/0/≈刷新率/≈刷新率 —— 只有最小作用域
+        //                     重组，根和 HUD 函数体不涨，就是「按需重组生效」的证据。
         //   cpu            —— 本进程这一秒消耗的 CPU 时间（1000ms/s = 满一个逻辑核），
         //                     由 GetProcessTimes 自测，不需要任务管理器。
-        val cores = win32ProcessorCount
         LaunchedEffect(Unit) {
             val win = app.window
+            // 窗口是在 window.run() 里创建的：必须等它出现再读 dpi/刷新率，
+            // 否则 banner 会打出「刷新率=0Hz」，看着像 VREFRESH 失败（v0.3.1 就是这样，
+            // 排查时白绕了一圈）。
+            while (win.nativeWindow == null) delay(10)
+
+            val rawHz = win.rawRefreshHz
+            val effHz = win.effectiveRefreshHz
+            val hzNote = if (rawHz == effHz) {
+                "${effHz}Hz"
+            } else {
+                "原始=${rawHz}Hz 生效=${effHz}Hz（VREFRESH 不可信，已回退）"
+            }
             val banner = "PERF-BANNER: 窗口=${win.logicalWidth}x${win.logicalHeight}dp" +
-                " dpi=${fmt1(win.layer.contentScale.toDouble())}" +
-                " 刷新率=${win.nativeWindow?.refreshHz ?: 0}Hz" +
+                "（物理 ${(win.logicalWidth * win.dpiScale).toInt()}x${(win.logicalHeight * win.dpiScale).toInt()}）" +
+                " dpi=${fmt1(win.dpiScale.toDouble())}" +
+                " 刷新率=$hzNote 帧间隔=${fmt1(1_000_000_000.0 / effHz / 1_000_000.0)}ms" +
                 " 动画=$animate 逻辑核=$cores" +
                 " 日志=exe 同目录 composekn-startup.log"
             println(banner)
             log(banner)
-        }
 
-        // 标题里显示实测帧率：人工测试和脚本（xwininfo -root -tree）都能直接读到
-        // 宿主真实的渲染节奏 —— 「按需渲染 + 帧节流」是否生效一眼可见。
-        // 这个协程每秒醒一次（用 delay，不依赖渲染），所以静止时也会把 fps=0 刷出来。
-        LaunchedEffect(Unit) {
-            var lastFrames = 0
+            var lastFrames = app.window.frameCount
             var lastGallery = probe.galleryComposes
             var lastHud = probe.hudComposes
             var lastHudInner = probe.hudInnerComposes
             var lastSummary = probe.summaryCalls
-            var lastCpu = app.window.nativeWindow?.processCpuNanos() ?: -1L
+            var lastCpu = win.nativeWindow?.processCpuNanos() ?: -1L
             var lastMark = TimeSource.Monotonic.markNow()
             while (true) {
                 delay(1000)

@@ -1377,3 +1377,34 @@ Windows 侧对应物（**同一形状，只换平台调用**）：
   `skia_enable_graphite=true` + `skia_use_direct3d=true`，mingw 下还要解决着色器编译链
   （DXC），属于另一轮工程。
 * 高刷屏 / 动态刷新（§16.6）、真正的 vsync 对齐（§15.6）。
+
+### 16.7 真机数据（v0.3.1，用户实测，2026-09-14）
+
+用户提供 `composekn-startup.log`（1100×760、dpi=1.0、12 逻辑核、**144Hz 屏**、动画模式）：
+
+```
+PERF-BANNER: 窗口=1100x760dp dpi=1.0 刷新率=0Hz 动画=true 逻辑核=12 日志=...
+run: frame interval 6 ms (refresh=144Hz)
+GALLERY-STATS: fps=144.5 frames/s=145 recompose(gallery/hud/hudInner/summary)=+0/+0/+145/+145 cpu=468.8ms/s (46.7% of one core, 3.9% of 12 logical)
+profile: 120 帧  update=1.3ms  replay=2.0ms  present=0.4ms  draw+present=2.4ms  total=3.7ms  窗口=1100x760  呈现=direct(wrap-pixels, zero-copy)
+（稳态，约 6 秒后）
+GALLERY-STATS: fps=144.3 frames/s=145 recompose(...)=+0/+0/+145/+145 cpu=328.1ms/s (32.3% of one core, 2.7% of 12 logical)
+profile: 120 帧  update=0.7ms  replay=1.5ms  present=0.4ms  draw+present=1.9ms  total=2.6ms  窗口=1100x760  呈现=direct(wrap-pixels, zero-copy)
+```
+
+| 结论 | 数据 |
+|---|---|
+| 按需重组 | `gallery`/`hud` 两次重组都没有；只有读 `frames` 的最小作用域按帧率重组（`+0/+0/+145/+145`）= 每帧只重算那一行文本 |
+| 零拷贝呈现真机生效 | `呈现=direct(wrap-pixels, zero-copy)`，`present=0.3~0.6ms`（Wine 上 1.2ms） |
+| 每帧成本 | 稳态 **2.45ms**（update 0.7 + replay 1.4 + present 0.35）；Wine 上同尺寸是 7.1ms → **真机比 Wine 便宜约 2.9 倍** |
+| 进程 CPU | 稳态 **≈33% 单核 ≈ 2.7% 整机**（12 线程）；比用户最初报告的「10%」降了一个量级 |
+| 预热效应 | 前 4~5 秒是 3.6~4.3ms/帧（≈47% 单核）、之后落到 2.45ms —— 首因可能是 Defender 实时扫描 / 字体缓存 / 频率爬升；**测性能要等 5 秒** |
+| 帧率 | 显示 144Hz → 应用就按 144fps 重绘（帧时钟 + 刷新率节流，与上游一致）；若按 60fps 算，CPU 约 1.1~1.4% 整机 |
+| 剩余成本 | `replay`（Skia CPU 光栅化整窗）1.4ms 仍是最大项；它**与像素数成正比** → 4K/高 DPI 下才会重新变成瓶颈（10 倍像素 ≈ 14ms/帧） |
+
+据此的判断：**1100×760 这类窗口，CPU 侧的问题已经解决**（剩下的 1.4ms/帧是软件光栅化的固有成本）；
+GPU 后端的价值主要在**大窗口 / 4K / 高 DPI / 未来对齐**，而不是这个尺寸下的救火。
+MAINTAINERS.md 级别的小坑：v0.3.1 的 `PERF-BANNER` 打出「刷新率=0Hz」是因为 banner 在
+`window.run()` 创建窗口**之前**就执行了（`nativeWindow` 还是 null），而循环里的
+`frame interval ... (refresh=144Hz)` 才是真值 —— **已被这个假数字误导过一次**，v0.3.2 修掉
+（banner 现在等窗口出现，并同时打印「原始 / 生效」两个值 + 物理像素尺寸）。
