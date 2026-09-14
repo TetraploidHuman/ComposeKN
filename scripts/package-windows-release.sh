@@ -47,14 +47,18 @@ ComposeKN Windows 原生组件画廊 v__VERSION__
 内容
 ----
 Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
-用 Win32 + GDI 软件光栅直接出图，不依赖任何第三方 DLL / 运行库。
+默认走 GPU（OpenGL/WGL + Ganesh）、失败自动回退软件光栅（GDI），
+不依赖任何第三方 DLL / 运行库。无边框自绘标题栏，支持**触摸屏**（单指拖动滚动
++ 甩动惯性）。
 
 界面里可以试：
   · 按钮 / 文本排版（长文本省略、中英混排、多种字号）
   · 输入框（单行/多行、中文输入法、Tab 焦点切换）、复选、开关、滑杆、单选
   · 进度条（确定 + 无限动画）、卡片、分割线、hover 高亮
   · 下拉菜单、对话框（弹层合成）
-  · 横向/纵向 Lazy 列表虚拟化 + **鼠标滚轮滚动**
+  · 横向/纵向 Lazy 列表虚拟化 + **鼠标滚轮滚动** + **触摸屏拖动滚动**
+    （触摸走 WM_POINTER -> PointerType.Touch；`set COMPOSEKN_TOUCH=0` 可关掉，
+      退回系统「触摸提升成鼠标」的老行为）
   · Canvas 绘制（渐变/路径/描边/旋转）、FlowRow 自动换行、主题切换（深/浅色）
   · 渲染：**按需渲染 + 按刷新率节流**（没有内容变化就不重绘，空闲时 CPU ≈ 0；
     这个窗口的标题栏实时显示实测帧率）
@@ -80,13 +84,13 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (95 checks, 0 failures)
+      SELFTEST: RESULT PASS (101 checks, 0 failures)
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、弹层与对话框的位置和像素），不开窗口
   window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、
            干净退出、**性能契约**：静止不空转 / 跨线程刷新能唤醒 / 动画按刷新率节流）
-  all    = 两者都跑（95 条断言）
+  all    = 两者都跑（101 条断言）
 
 性能日志（排查 CPU/帧率时直接拷这个文件）：
   composekn-startup.log —— exe 同目录，含启动诊断 + 每秒一行 GALLERY-STATS
