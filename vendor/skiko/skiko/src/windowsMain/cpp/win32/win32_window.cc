@@ -150,6 +150,16 @@ static double dpiScaleOf(const ComposeKNWin32Window* window) {
     return (window != nullptr && window->dpi > 0) ? (window->dpi / 96.0) : 1.0;
 }
 
+// 系统（主显示器）DPI 缩放：建窗口**之前**用它把 dp 换算成物理像素。
+// 窗口建好后会用窗口自己的 DPI 再校正一次（多显示器 / 不同缩放时以窗口所在屏为准）。
+static double systemDpiScale() {
+    HDC dc = GetDC(nullptr);
+    if (dc == nullptr) return 1.0;
+    const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+    ReleaseDC(nullptr, dc);
+    return dpi > 0 ? (dpi / 96.0) : 1.0;
+}
+
 // 让进程具备 DPI 感知：否则 HiDPI 显示器上 Windows 会把整个窗口位图拉伸，
 // 自绘 UI 会明显发糊。PER_MONITOR_AWARE_V2 = -4。
 static void enableDpiAwareness() {
@@ -482,7 +492,10 @@ static int queryWindowDpi(HWND hwnd) {
 
 } // namespace
 
-extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int width, int height) {
+// width/height 的单位是 **dp（逻辑像素）**，与 Compose 桌面的
+// `WindowState(size = DpSize(...))` 一致；物理尺寸在内部按 DPI 换算。
+// 之前这里直接当物理像素用，结果 200% 缩放的屏幕上「1100x760」只会得到 550x380dp。
+extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int width_dp, int height_dp) {
     enableDpiAwareness();
     HINSTANCE instance = GetModuleHandleW(nullptr);
     static bool classRegistered = false;
@@ -497,7 +510,13 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
         MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle.data(), wlen);
     }
 
-    composeknLog("composekn_win32_create: title=\"%s\" size=%dx%d", title, width, height);
+    const double scale = systemDpiScale();
+    int width = static_cast<int>(width_dp * scale + 0.5);
+    int height = static_cast<int>(height_dp * scale + 0.5);
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    composeknLog("composekn_win32_create: title=\"%s\" dp=%dx%d -> px=%dx%d (scale=%.2f)",
+                 title, width_dp, height_dp, width, height, scale);
     ComposeKNWin32Window* window = new ComposeKNWin32Window();
     window->width = width;
     window->height = height;
@@ -518,6 +537,21 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
         return nullptr;
     }
     composeknLog("composekn_win32_create: hwnd=%p ok", (void*)window->hwnd);
+
+    // 校正：窗口所在显示器的 DPI 可能和系统 DPI 不同（多显示器/缩放不一致）。
+    {
+        const double actual = dpiScaleOf(window);
+        const int want_w = static_cast<int>(width_dp * actual + 0.5);
+        const int want_h = static_cast<int>(height_dp * actual + 0.5);
+        if (want_w > 0 && want_h > 0 && (want_w != window->width || want_h != window->height)) {
+            composeknLog("composekn_win32_create: 按窗口 DPI 校正尺寸 %dx%d -> %dx%d (scale=%.2f)",
+                         window->width, window->height, want_w, want_h, actual);
+            window->width = want_w;
+            window->height = want_h;
+            SetWindowPos(window->hwnd, nullptr, 0, 0, want_w, want_h,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     window->dpi = queryWindowDpi(window->hwnd);
     ShowWindow(window->hwnd, SW_SHOWNORMAL);
     UpdateWindow(window->hwnd);

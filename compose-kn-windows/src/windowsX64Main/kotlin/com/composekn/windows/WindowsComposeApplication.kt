@@ -24,6 +24,13 @@ import com.composekn.windows.internal.winlog
 /**
  * Windows host for real Compose UI ([CanvasLayersComposeScene] + [FrameRecomposer]).
  */
+/**
+ * Windows 宿主。
+ *
+ * [width]/[height] 的单位是 **dp（逻辑像素）**，跟 Compose 桌面的
+ * `WindowState(size = DpSize(...))` 一致 —— 200% 缩放的显示器上 `1100x760(dp)`
+ * 会得到 2200x1520 物理像素的客户区，UI 仍然按 1100x760dp 布局。
+ */
 class WindowsComposeApplication(
     private val title: String,
     private val width: Int = 960,

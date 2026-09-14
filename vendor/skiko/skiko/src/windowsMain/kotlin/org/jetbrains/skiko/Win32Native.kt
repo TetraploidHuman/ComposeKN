@@ -160,7 +160,11 @@ const val SW_WINDOWS_RESTORE = 9
  * High-level wrapper over the Win32 C bridge. All calls are main-thread only.
  */
 class Win32Window internal constructor(internal val native: COpaquePointer) : AutoCloseable {
-    /** Create a window with the given title and client size. */
+    /**
+     * 建窗口。`width`/`height` 的单位是 **dp（逻辑像素）**，与 Compose 桌面的
+     * `WindowState(size = DpSize(...))` 一致：C 侧会按系统 DPI 换算成物理像素，
+     * 建完再用窗口所在显示器的 DPI 校正一次。
+     */
     constructor(title: String, width: Int = 960, height: Int = 640) :
         this(ensureCreated(title, width, height))
 

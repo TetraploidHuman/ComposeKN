@@ -1517,3 +1517,16 @@ GALLERY-STATS: fps=59.8 frames/s=60 recompose(...)=+0/+0/+60/+60
   内容保留，遮挡/取消遮挡不会闪白。
 * 窗口尺寸语义：`CreateWindowExW` 的入参是**物理像素**，窗口内 UI 是 **dp**（`scene.density
   = dpiScale`）。所以 200% 屏上「1100x760」= 550x380dp。是否改成 dp 语义待定（§17.9）。
+
+### 17.9 窗口尺寸改成 dp 语义 + `--no-animate` 冻结真实动画（2026-09-14，用户拍板）
+
+* **建窗口入参改为 dp**（对齐 Compose 桌面 `WindowState(size = DpSize(...))`）：
+  C 桥 `composekn_win32_create(title, dpW, dpH)` 先用系统 DPI 换算物理尺寸建窗口，
+  建完再用**窗口所在显示器**的 DPI 校正一次（多显示器/不同缩放）。日志会打
+  `dp=1100x760 -> px=2200x1520 (scale=2.00)`。
+  之前直接当物理像素用，200% 缩放屏上「1100x760」只会得到 550x380dp（用户报的"窗口怎么这么小"）。
+* **`--no-animate` 现在会冻结画廊里真实的无限动画**：`CircularProgressIndicator` 在
+  `animate=false` 时换成确定态（`progress = { 0.5f }`）。理由：`--no-animate` 的用途是
+  「静止对照」，而进度圈会一直持有帧时钟 awaiter → 宿主按刷新率重绘，表现为
+  `frames/s≈60 但 recompose=0`（真机日志里正是这样，浪费了排查时间）。
+  实测（Wine）：`--no-animate` → `frames/s=0`、`frames(loop/tick)=+0/+0`、`cpu=0.0ms/s`。

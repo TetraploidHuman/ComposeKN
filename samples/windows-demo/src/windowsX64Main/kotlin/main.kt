@@ -159,7 +159,7 @@ fun main(args: Array<String>) {
             }
         }
 
-        ComponentGallery(probe = probe, window = app.window)
+        ComponentGallery(probe = probe, window = app.window, animate = animate)
     }
     println("ComposeKN Windows: window loop finished")
 }

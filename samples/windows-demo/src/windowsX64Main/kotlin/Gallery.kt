@@ -162,7 +162,19 @@ class GalleryProbe {
  * 主题切换、hover 交互、动画（无限动画 + 每帧重组计数）。
  */
 @Composable
-fun ComponentGallery(probe: GalleryProbe, window: WindowsComposeWindow) {
+fun ComponentGallery(
+    probe: GalleryProbe,
+    window: WindowsComposeWindow,
+    /**
+     * 是否让画廊里**真实的**无限动画（不确定进度圈）跑起来。
+     *
+     * `--no-animate` 会把 demo 自己那个「每帧 +1」计数器关掉；如果这里的进度圈还在转，
+     * 「空闲对照」就没法验证了（它会一直持有帧时钟 awaiter → 宿主一直按刷新率重绘，
+     * 表现为 frames 在涨但 recompose 全 0 —— 真机日志里踩过这个坑）。
+     * 所以 `--no-animate` 时把它换成确定态（`progress = { 0.5f }`），做到真正静止。
+     */
+    animate: Boolean = true,
+) {
     probe.galleryComposes++
     MaterialTheme(
         colorScheme = if (probe.darkTheme) darkColorScheme() else lightColorScheme(),
@@ -175,7 +187,7 @@ fun ComponentGallery(probe: GalleryProbe, window: WindowsComposeWindow) {
             // 2) 顺带验证 Lazy 虚拟化 + 滚轮滚动。
             LazyColumn(modifier = Modifier.fillMaxSize()) {
                 item { DiagnosticsHud(probe, window) }
-                gallerySections(probe)
+                gallerySections(probe, animate)
                 item { Spacer(Modifier.height(24.dp)) }
             }
         }
@@ -212,7 +224,7 @@ private fun DiagnosticsHud(probe: GalleryProbe, window: WindowsComposeWindow) {
     }
 }
 
-private fun LazyListScope.gallerySections(probe: GalleryProbe) {
+private fun LazyListScope.gallerySections(probe: GalleryProbe, animate: Boolean) {
     section("按钮 / Buttons") {
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -323,9 +335,17 @@ private fun LazyListScope.gallerySections(probe: GalleryProbe) {
                 )
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("不确定（无限动画）")
+                Text(if (animate) "不确定（无限动画）" else "不确定（--no-animate 已冻结）")
                 Spacer(Modifier.height(4.dp))
-                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                if (animate) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                } else {
+                    // progress 非空 = 确定态：不持有帧时钟 awaiter，画完就静止
+                    CircularProgressIndicator(
+                        progress = { 0.5f },
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("每帧重组计数")
