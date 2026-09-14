@@ -110,6 +110,14 @@ actual open class SkiaLayer {
         (redrawer as? WindowsRenderLoopRedrawer)?.onRenderRequest = handler
     }
 
+    /** 诊断：由宿主消息循环（按需渲染）画出的帧数。 */
+    val loopFrameCount: Int
+        get() = (redrawer as? WindowsRenderLoopRedrawer)?.loopFrames ?: 0
+
+    /** 诊断：由同步渲染 tick（WM_SIZE 模态循环 / 首帧）画出的帧数。 */
+    val immediateFrameCount: Int
+        get() = (redrawer as? WindowsRenderLoopRedrawer)?.immediateFrames ?: 0
+
     /** 当前后端的诊断信息（后端类型 / 呈现方式）；写进性能日志用。 */
     val rendererInfo: String
         get() = redrawer?.renderInfo?.trim()?.replace('\n', ';') ?: "n/a"

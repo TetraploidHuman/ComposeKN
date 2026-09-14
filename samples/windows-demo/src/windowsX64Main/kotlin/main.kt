@@ -111,6 +111,8 @@ fun main(args: Array<String>) {
             var lastHudInner = probe.hudInnerComposes
             var lastSummary = probe.summaryCalls
             var lastCpu = win.nativeWindow?.processCpuNanos() ?: -1L
+            var lastLoopFrames = win.layer.loopFrameCount
+            var lastTickFrames = win.layer.immediateFrameCount
             var lastMark = TimeSource.Monotonic.markNow()
             while (true) {
                 delay(1000)
@@ -131,7 +133,12 @@ fun main(args: Array<String>) {
                 } else {
                     "cpu=n/a"
                 }
+                // 帧来源：loop = 消息循环按需渲染；tick = 同步渲染 tick（WM_SIZE 模态缩放周期）。
+                // 真机日志里靠它区分「帧在涨」是动画在跑、还是缩放/交互在补帧。
+                val loopDelta = win.layer.loopFrameCount - lastLoopFrames
+                val tickDelta = win.layer.immediateFrameCount - lastTickFrames
                 val line = "GALLERY-STATS: fps=${fmt1(fps)} frames/s=${total - lastFrames}" +
+                    " frames(loop/tick)=+$loopDelta/+$tickDelta" +
                     " recompose(gallery/hud/hudInner/summary)=" +
                     "+${probe.galleryComposes - lastGallery}" +
                     "/+${probe.hudComposes - lastHud}" +
@@ -145,6 +152,8 @@ fun main(args: Array<String>) {
                 lastHudInner = probe.hudInnerComposes
                 lastSummary = probe.summaryCalls
                 lastCpu = cpuNow
+                lastLoopFrames = win.layer.loopFrameCount
+                lastTickFrames = win.layer.immediateFrameCount
                 lastMark = TimeSource.Monotonic.markNow()
                 app.window.setTitle("ComposeKN Windows Demo — ${fmt1(fps)} fps (frames=$total)")
             }

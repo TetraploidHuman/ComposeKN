@@ -1477,3 +1477,43 @@ GALLERY-STATS: fps=59.8 frames/s=60 recompose(...)=+0/+0/+60/+60
 * 真机 CPU/帧率 A/B（GL vs software）——需要用户跑 v0.4.0 的日志。
 * Graphite/D3D12（上游桌面 Windows 的默认路线）；真正的 vsync 对齐（`wglSwapIntervalEXT(1)`
   只是让 present 跟垂直同步走，帧节拍仍由我们的 `refreshHz` 节流）；高刷屏/动态刷新（§16.6）。
+
+### 17.8 真机 GPU 首测（Intel Iris Xe）+ 修「模态循环里渲染 tick 不 flush 主线程队列」
+
+#### 真机数据（用户 v0.4.0 日志，200% 缩放屏、**最大化** 2762x1762 物理 = 5.2 Mpx）
+
+| 后端 | update | draw / replay | present | total | 帧率 | 进程 CPU（8 线程机） |
+|---|---|---|---|---|---|---|
+| 软件（v0.3.2） | 1.3ms | **10.0ms** | 3.3ms | **14.6ms** | 46-53 | 64-88% 单核 = **8-11%** |
+| **GPU（v0.4.0）** | 0.5-1.3ms | **0.7-1.7ms** | 2.5-4.7ms | **4-7ms** | **55-60** | 6-31% 单核 = 0.8-3.9% |
+
+* `gl: created GL_VERSION=4.6.0 - Build 32.0.101.6737 GL_RENDERER=Intel(R) Iris(R) Xe Graphics`
+  → 真机 GL 路径正常，Ganesh 光栅化把 `draw` 从 10ms 打到 ~1ms（2.5~3 倍）。
+* **静止（`--no-animate`，动画滚出视口后）：`frames/s=0`、`cpu=0.0ms/s`** → 「静止窗口不烧 CPU」在真机成立。
+* 用户 `--no-animate` 日志里那段连续 ~60fps **不是空转**：画廊里有一个
+  `CircularProgressIndicator`（indeterminate，真实无限动画），滚进视口就转、滚出去就停
+  （日志尾部 `frames/s=0 cpu=0.0ms/s` 即它离开视口后）。—— `--no-animate` 只关掉 demo
+  自己那个「每帧 +1」的计数器，画布里真实的动画仍然会按需渲染（这是正确行为）。
+
+#### 抓到的真 bug：模态缩放循环里的渲染 tick 没有 flush 主线程队列
+
+用户的 v0.3.2 日志在「拖拽/最大化」期间出现连续多秒的
+`frames/s≈50 而 recompose(...)=+0` —— 帧在画、画面却不重组。机制：
+
+* 拖拽/最大化时 Windows 进入 DefWindowProc 的**模态循环**，宿主消息循环跑不到；
+  我们为此在 WM_SIZE 里同步调 Kotlin 的 `renderImmediately()`（`fireRenderTick`，见 §13.6）。
+* 但 `SkikoDispatchers.Main`（`WindowsMainDispatcher`）上排队的任务**只有宿主循环里的
+  `flushMainUIDispatcher()` 才会执行**。模态循环期间没人 flush → 动画协程的续体一直排队
+  → 帧时钟丢掉 awaiter → tick 还在画帧、但 Compose 不再重组。
+* 修法：`WindowsRenderLoopRedrawer.renderImmediately()` 里先 `flushMainUIDispatcher()`
+  再渲染（这条路径本来就在主线程上）。
+* 顺带加诊断：`GALLERY-STATS` 新增 `frames(loop/tick)=+N/+M` —— loop = 消息循环按需渲染，
+  tick = 同步渲染 tick（WM_SIZE 模态循环/首帧）。以后「帧在涨」到底是谁画的，日志一眼可辨。
+
+#### 其他已确认非问题
+
+* GL 路径的 `WM_PAINT` 只做 `BeginPaint/EndPaint` + `blitFrame`（GL 下 frame 缓冲为空、等于
+  什么都不画）—— **不是 bug**：`WM_ERASEBKGND` 返回 1（不擦背景）、窗口类不擦白，GL 前缓冲
+  内容保留，遮挡/取消遮挡不会闪白。
+* 窗口尺寸语义：`CreateWindowExW` 的入参是**物理像素**，窗口内 UI 是 **dp**（`scene.density
+  = dpiScale`）。所以 200% 屏上「1100x760」= 550x380dp。是否改成 dp 语义待定（§17.9）。

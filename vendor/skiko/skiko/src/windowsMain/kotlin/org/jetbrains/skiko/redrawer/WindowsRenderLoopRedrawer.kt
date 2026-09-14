@@ -5,6 +5,7 @@ package org.jetbrains.skiko.redrawer
 import org.jetbrains.skiko.SkiaLayer
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.currentNanoTime
+import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.initWindowsMainThread
 import org.jetbrains.skiko.setWindowsRenderTick
 import org.jetbrains.skiko.win32Log
@@ -34,6 +35,23 @@ internal abstract class WindowsRenderLoopRedrawer(
 
     /** 请求渲染时回调（窗口循环把它接到「唤醒阻塞的消息泵」上）。 */
     var onRenderRequest: (() -> Unit)? = null
+
+    /**
+     * 诊断：这一帧是谁画出来的。
+     *
+     *  - [loopFrames]：宿主消息循环的按需渲染（`renderIfRequested`）
+     *  - [immediateFrames]：同步渲染 tick（`renderImmediately`，来自 WM_SIZE 模态缩放循环、
+     *    首帧、以及命令式调用）
+     *
+     * 真机日志里靠这两个数才能区分「帧在涨」是动画在跑、还是缩放/交互在补帧。
+     */
+    @Volatile
+    var loopFrames: Int = 0
+        private set
+
+    @Volatile
+    var immediateFrames: Int = 0
+        private set
 
     /** 当前呈现方式（写进性能日志，真机上用来确认走的是哪条后端）。 */
     abstract val presentationMode: String
@@ -82,12 +100,21 @@ internal abstract class WindowsRenderLoopRedrawer(
         if (!renderRequested) return false
         renderRequested = false
         renderFrame()
+        loopFrames++
         return true
     }
 
     override fun renderImmediately() {
+        // 这条路径会在两个场合被调用：宿主循环（首帧）与 **Windows 模态循环内部**
+        // （WM_SIZE 渲染 tick，见 cpp/win32/win32_window.cc 的 fireRenderTick）。
+        // 后者发生时宿主消息循环跑不到 —— 而 `WindowsMainDispatcher` 上排队的任务
+        // 只有宿主循环里的 flushMainUIDispatcher() 才会执行。不在这里 flush 的话，
+        // 动画协程的续体会一直排队：帧时钟丢掉 awaiter → **tick 还在画帧，但画面不再
+        // 重组**（真机日志抓到的就是「frames/s≈50、recompose=0」这种组合）。
+        flushMainUIDispatcher()
         renderRequested = false
         renderFrame()
+        immediateFrames++
     }
 
     /**
