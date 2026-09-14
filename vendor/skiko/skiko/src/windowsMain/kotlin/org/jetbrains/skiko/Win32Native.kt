@@ -96,6 +96,10 @@ internal external fun composekn_win32_client_overflow_count(window: COpaquePoint
 @SymbolName("composekn_win32_touch_enabled")
 internal external fun composekn_win32_touch_enabled(window: COpaquePointer?): Boolean
 
+/** 设置光标形状（0=箭头 1=手 2=文本 I 型 3=十字）。 */
+@SymbolName("composekn_win32_set_cursor")
+internal external fun composekn_win32_set_cursor(window: COpaquePointer?, kind: Int)
+
 // ---------------------------------------------------------------------------
 // OpenGL / WGL（GPU 后端，对齐上游 linuxMain 的 EGL 版）
 //
@@ -257,6 +261,13 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
     /** 触摸通道是否启用（COMPOSEKN_TOUCH=0 关闭）。 */
     val touchEnabled: Boolean get() = composekn_win32_touch_enabled(native)
+
+    /**
+     * 设置鼠标光标形状：0=箭头 1=手 2=文本 I 型 3=十字。
+     * 由 Compose 的 PointerIcon（[androidx.compose.ui.input.pointer.pointerHoverIcon]，
+     * clickable 默认就是手型）驱动 —— 见 WindowsPlatformContext.setPointerIcon。
+     */
+    fun setCursor(kind: Int): Unit = composekn_win32_set_cursor(native, kind)
 
     // ---- OpenGL / WGL（GPU 后端）----
 

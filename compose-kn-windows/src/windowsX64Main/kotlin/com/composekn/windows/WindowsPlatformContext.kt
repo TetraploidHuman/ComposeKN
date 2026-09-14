@@ -8,6 +8,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
 import androidx.compose.ui.platform.DefaultArchitectureComponentsOwner
 import androidx.compose.ui.platform.PlatformContext
+import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.platform.WindowInfo
 import androidx.compose.ui.unit.Density
@@ -77,4 +78,29 @@ internal class WindowsPlatformContext(
     override suspend fun startInputMethod(request: PlatformTextInputMethodRequest): Nothing {
         windowsTextInputService.startInputMethod(request)
     }
+
+    /**
+     * 光标形状。
+     *
+     * 上游 skiko 的 PlatformContext 默认实现是空的（`setPointerIcon = Unit`），
+     * 所以 K/N 平台上「鼠标悬停到手型」需要各宿主自己接一下（JVM 桌面接的是 AWT
+     * `contentComponent.cursor`，见 ComposeSceneMediator.desktop.kt）。
+     * Compose 侧不用改任何行为：`clickable` 默认就会请求 Hand。
+     *
+     * [cursorSink] 由 [WindowsComposeApplication] 在窗口可用时接上。
+     */
+    var cursorSink: ((Int) -> Unit)? = null
+
+    override fun setPointerIcon(pointerIcon: PointerIcon) {
+        cursorSink?.invoke(win32CursorKind(pointerIcon))
+    }
+}
+
+/** Compose 的 PointerIcon -> Win32 光标种类（0=箭头 1=手 2=文本I型 3=十字）。 */
+internal fun win32CursorKind(pointerIcon: PointerIcon): Int = when (pointerIcon) {
+    PointerIcon.Hand -> 1
+    PointerIcon.Text -> 2
+    PointerIcon.Crosshair -> 3
+    // 自定义 PointerIcon 实现（本平台不渲染自定义位图）与 Default 都退回箭头
+    else -> 0
 }

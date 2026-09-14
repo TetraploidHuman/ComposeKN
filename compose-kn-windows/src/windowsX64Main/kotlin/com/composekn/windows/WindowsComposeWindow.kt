@@ -92,6 +92,18 @@ class WindowsComposeWindow(
     private var win32Window: Win32Window? = null
 
     /**
+     * Compose 请求的光标形状（0=箭头 1=手 2=文本 I 型 3=十字）。
+     *
+     * 由 PlatformContext.setPointerIcon 设置；窗口还不存在时先记下来，
+     * 窗口一建好就立刻应用（窗口存在时立即 SetCursor）。
+     */
+    var pointerIconKind: Int = 0
+        set(value) {
+            field = value
+            win32Window?.setCursor(value)
+        }
+
+    /**
      * Run the window with event handling.
      */
     fun run(onEvent: (WindowsEvent) -> Unit) {
@@ -102,6 +114,7 @@ class WindowsComposeWindow(
         win32Window = win
         println("WindowsComposeWindow: created window '$title' (${win.width}x${win.height})")
         win32Log("run: window created ok ${win.width}x${win.height}")
+        if (pointerIconKind != 0) win.setCursor(pointerIconKind)
 
         check(layer.renderDelegate != null) {
             "SkiaLayer.renderDelegate must be set before WindowsComposeWindow.run()"
@@ -233,8 +246,10 @@ class WindowsComposeWindow(
                     WindowsEvent.MouseWheelEvent(
                         x = raw.x.toInt(),
                         y = raw.y.toInt(),
-                        deltaX = 0,
-                        deltaY = raw.a / 120,
+                        // raw.b == 1 表示来自 WM_MOUSEHWHEEL（横向滚轮 / 触控板横滑）；
+                        // 纵向和横向都按「一格 = 120」换算成 Compose 的滚轮单位。
+                        deltaX = if (raw.b == 1) raw.a / 120 else 0,
+                        deltaY = if (raw.b == 1) 0 else raw.a / 120,
                         isShiftPressed = raw.modifiers and MOD_SHIFT != 0u,
                         isCtrlPressed = raw.modifiers and MOD_CTRL != 0u,
                         isAltPressed = raw.modifiers and MOD_ALT != 0u,

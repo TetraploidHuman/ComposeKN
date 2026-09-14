@@ -172,6 +172,12 @@ int composekn_win32_height(ComposeKNWin32Window* window);
  */
 int32_t composekn_win32_client_overflow_count(ComposeKNWin32Window* window);
 
+/**
+ * 设置光标形状：0=箭头 1=手 2=文本 I 型 3=十字。
+ * 由 Compose 的 PointerIcon（Modifier.pointerHoverIcon / clickable 的默认手型）驱动。
+ */
+void composekn_win32_set_cursor(ComposeKNWin32Window* window, int32_t kind);
+
 /** 触摸通道是否启用（COMPOSEKN_TOUCH=0 可关掉，退回系统「触摸提升成鼠标」的老行为）。 */
 bool composekn_win32_touch_enabled(ComposeKNWin32Window* window);
 

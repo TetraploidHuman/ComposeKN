@@ -125,6 +125,8 @@ struct ComposeKNWin32Window {
     // 触摸（WM_POINTER）通道。COMPOSEKN_TOUCH=0 可整体关掉，退回「系统把触摸提升成鼠标」的老行为。
     bool touchEnabled = true;
     int touchLogCount = 0;
+    // 光标形状（0=箭头 1=手 2=文本I型 3=十字），由 Compose 的 PointerIcon 驱动。
+    int cursorKind = 0;
     // 最近一帧的像素缓存：缩放/重绘期间用来立刻重绘，避免白屏
     std::vector<unsigned char> frame;
     int frameW = 0;
@@ -230,6 +232,21 @@ static void fireRenderTick() {
     g_inRenderTick = true;
     g_renderTick(g_renderTickUser);
     g_inRenderTick = false;
+}
+
+// mingw 的 IDC_* 是 MAKEINTRESOURCE()（窄字符），不能直接喂 LoadCursorW；
+// 这里用系统资源 id 的数值重建宽字符版本。
+static LPCWSTR composeknCursorRes(int id) {
+    return reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(static_cast<WORD>(id)));
+}
+
+static HCURSOR composeknLoadCursor(int kind) {
+    switch (kind) {
+        case 1: return LoadCursorW(nullptr, composeknCursorRes(32649));  // IDC_HAND
+        case 2: return LoadCursorW(nullptr, composeknCursorRes(32513));  // IDC_IBEAM
+        case 3: return LoadCursorW(nullptr, composeknCursorRes(32515));  // IDC_CROSS
+        default: return LoadCursorW(nullptr, composeknCursorRes(32512)); // IDC_ARROW
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -526,8 +543,33 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             e.x = static_cast<float>(pt.x);
             e.y = static_cast<float>(pt.y);
             e.a = GET_WHEEL_DELTA_WPARAM(wParam);
+            e.b = 0;  // 0 = 纵向（WM_MOUSEWHEEL）
             e.modifiers = queryCurrentModifiers();
             pushEvent(window, e);
+            break;
+        }
+        case WM_MOUSEHWHEEL: {
+            // 横向滚轮 / 触控板横滑。之前完全没处理，所以「横着滑」没有任何反应
+            // （JVM 桌面是支持的 —— 这条属于行为对齐缺口）。
+            ComposeKNWin32Event e{};
+            e.type = COMPOSEKN_WIN32_EVENT_MOUSE_WHEEL;
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ScreenToClient(window->hwnd, &pt);
+            e.x = static_cast<float>(pt.x);
+            e.y = static_cast<float>(pt.y);
+            e.a = GET_WHEEL_DELTA_WPARAM(wParam);
+            e.b = 1;  // 1 = 横向（WM_MOUSEHWHEEL）
+            e.modifiers = queryCurrentModifiers();
+            pushEvent(window, e);
+            break;
+        }
+        case WM_SETCURSOR: {
+            // 客户区里必须由我们回答光标：箭头是**类**光标，鼠标一动系统就会把它
+            // 设回去，所以这里每次都 SetCursor(当前 Compose 想要的形状) 并返回 TRUE。
+            if (window != nullptr && LOWORD(lParam) == HTCLIENT) {
+                SetCursor(composeknLoadCursor(window->cursorKind));
+                return TRUE;
+            }
             break;
         }
         case WM_POINTERDOWN:
@@ -927,6 +969,13 @@ extern "C" int composekn_win32_height(ComposeKNWin32Window* window) {
 
 extern "C" float composekn_win32_dpi_scale(ComposeKNWin32Window* window) {
     return static_cast<float>(dpiScaleOf(window));
+}
+
+/** 设置光标形状（0=箭头 1=手 2=文本I型 3=十字）。由 Compose 的 PointerIcon 驱动。 */
+extern "C" void composekn_win32_set_cursor(ComposeKNWin32Window* window, int32_t kind) {
+    if (window == nullptr) return;
+    window->cursorKind = kind;
+    if (window->hwnd != nullptr) SetCursor(composeknLoadCursor(kind));
 }
 
 extern "C" int32_t composekn_win32_client_overflow_count(ComposeKNWin32Window* window) {

@@ -194,6 +194,8 @@ class WindowsComposeApplication(
     fun run(content: @Composable () -> Unit) {
         setContent(withChrome = true, content = content)
 
+        // Compose 的光标请求（clickable -> Hand 等）转成 Win32 光标。
+        platformContext.cursorSink = { kind -> window.pointerIconKind = kind }
         win32Log("app: scene + content ready, starting window loop")
         try {
             window.run(onEvent = ::handleEvent)
