@@ -1408,3 +1408,72 @@ MAINTAINERS.md 级别的小坑：v0.3.1 的 `PERF-BANNER` 打出「刷新率=0Hz
 `window.run()` 创建窗口**之前**就执行了（`nativeWindow` 还是 null），而循环里的
 `frame interval ... (refresh=144Hz)` 才是真值 —— **已被这个假数字误导过一次**，v0.3.2 修掉
 （banner 现在等窗口出现，并同时打印「原始 / 生效」两个值 + 物理像素尺寸）。
+
+### 17.7 阶段 1：Windows GL/WGL 后端已接入（2026-09-14）
+
+#### 落地了什么
+
+| 层 | 文件 | 作用 |
+|---|---|---|
+| C 桥 | `windowsMain/cpp/win32/win32_gl.cc`（新） | 只管**平台上下文**：WGL 建/销毁、make current、`glViewport`、读 `GL_DRAW_FRAMEBUFFER_BINDING`、`wglSwapIntervalEXT`、`SwapBuffers`。不包含任何 Skia 头（Skia 上下文在 Kotlin 侧建） |
+| C 桥 | `win32_window.cc` | 新增 `composekn_win32_hwnd()`（`ComposeKNWin32Window` 在头文件里是不透明类型，GL 文件需要 HWND） |
+| 绑定 | `Win32Native.kt` | 7 个 GL 外部函数 + `Win32Window.gl*` 包装 |
+| 上下文 | `context/WindowsGLContextHandler.kt`（新） | 照 `LinuxWaylandOpenGLContextHandler` 的形状：`DirectContext.makeGL()` → `BackendRenderTarget.makeGL(w,h,0,8,fbId,GR_GL_RGBA8)` → `Surface.makeFromBackendRenderTarget(..., BOTTOM_LEFT, RGBA_8888, sRGB, SurfaceProps)` → `flush()` 里 `surface.flushAndSubmit()` |
+| 循环 | `redrawer/WindowsRenderLoopRedrawer.kt`（新，抽出共用逻辑） | `needRender` 唯一触发源 / `renderIfRequested` / 帧节流语义 / 每帧 `update·draw·present` 耗时拆解与日志 |
+| 循环 | `redrawer/WindowsGLRedrawer.kt`（新） | `make current` → 画 → `SwapBuffers`；**构造失败抛 `RenderException`** |
+| 选择 | `SkiaLayer.windows.kt` | `renderApi` 现在是真语义：`OPENGL`=GPU、`SOFTWARE_*`=软件；**默认 GPU，创建失败自动回退软件**并把 `renderApi` 改写成实际值；`COMPOSEKN_RENDER_API=gl|software` 可强制 |
+| 链接 | `WindowsNativeLinkerPlugin.kt` | 加 `-lopengl32`（软件路径不引用 GL 符号，静态链接不会拉进来，无副作用） |
+
+呈现方式会写进日志（`profile:` 行的 `呈现=` 字段）：`opengl(wgl swap-buffers)` 或
+`direct(wrap-pixels, zero-copy)`，真机一眼能看出走的是哪条后端。
+
+#### 两个「构建配置」坑（本轮真正的难点）
+
+1. **`SKIKO_MINGW_NO_GPU` 把 GPU 入口全打桩了**。`NativeTasksConfiguration` 原本只要
+   设了 `skiko.skia.mingw.dir` 就加这个宏，于是 `Surface.cc`/`Image.cc` 里那些 GPU 入口
+   直接 `return nullptr` —— 症状是 GL 上下文、Skia 上下文都建好了，却报
+   `RenderException: Cannot create Windows GL surface (fb=0 1100x760)`（冒烟测试用同一套
+   参数却能过，因为它是 C++ 直接调用，没走 K/N 桥）。
+   现在按**实际链接的那份 Skia 的 `args.gn`** 判断（`mingwSkiaHasGpuBackend()`）。
+2. **上游 Windows 预处理宏假设 Skia 一定编了 D3D/ANGLE**。`skiaPreprocessorFlags(OS.Windows)`
+   会无条件定义 `-DSK_DIRECT3D`/`-DSK_ANGLE`，于是 `nativeJsMain/cpp` 里那些包装函数走
+   D3D 分支、引用我们 Skia 里不存在的 `GrDirectContexts::MakeD3D` /
+   `GrBackendRenderTargets::MakeD3D` → **K/N 链接失败**。
+   现在同样按 `args.gn` 决定（`mingwGpuBackendFlags()`）。
+
+#### 验证（Wine + Mesa llvmpipe）
+
+```
+gl: created GL_VERSION=4.6 (Compatibility Profile) Mesa 26.1.2 GL_RENDERER=llvmpipe
+gl: wglSwapIntervalEXT(1) -> ok
+glredrawer: WGL 后端就绪（GraphicsApi: OPENGL;OS: windows x64;Presentation: opengl(wgl swap-buffers)）
+skialayer: 使用 GL(GPU) 后端
+glctx.initContext: DirectContext.makeGL OK
+glctx.initCanvas: GL surface 1100x760 fb=0
+profile: 120 帧  update=1.6ms  draw=1.7ms  present=1.3ms  total=4.6ms  呈现=opengl(wgl swap-buffers)
+GALLERY-STATS: fps=59.8 frames/s=60 recompose(...)=+0/+0/+60/+60
+```
+
+* 默认（GL）与 `COMPOSEKN_RENDER_API=software` 两种后端，**同一份 exe** 都能跑：
+  软件路径仍是 `呈现=direct(wrap-pixels, zero-copy)`、total ≈7.1ms（与接入前一致）。
+* 自检全绿：**logic 73 / window 22 / screenshot 60.7fps**（window/screenshot 这次走的是 GL）。
+* Wine 的 GL 是 **llvmpipe（软件 GL）** → 只证明链路与正确性，**性能数字必须真机**。
+* CI：新增独立一关 `Assert GL(GPU) backend works`（强制 `COMPOSEKN_RENDER_API=gl`，
+  在日志里断言 `skialayer: 使用 GL` + `呈现=opengl`）——因为主自检默认也是 GL，
+  但「跑过」不等于「真的在用 GL」。
+
+#### 预编译包换成 GPU 版
+
+* `package-prebuilt.sh` 增加 `SKIA_OUT_DIR` / `PKG_SUFFIX` 覆盖点，并在 manifest.json 里
+  记录 `gpu_backends`（本包 = `["gl"]`）。
+* 同一个 release asset 名（`skia-mingw-m150-b8e40a7c49.tar.zst`）已更新为 GPU 版，
+  `prebuilt.sha256` 同步更新 → CI 与本地 `fetch-skia-mingw.sh` 都自动拿到 GPU 版。
+* **今后 Windows 构建必须用 GPU 版 Skia**（Kotlin 侧引用 `DirectContext.makeGL()`；
+  纯 CPU 包会在链接期报 undefined symbol）。国产替代：软件路径仍在，只是它跟 GPU 版
+  共用同一份 Skia。
+
+#### 还没做
+
+* 真机 CPU/帧率 A/B（GL vs software）——需要用户跑 v0.4.0 的日志。
+* Graphite/D3D12（上游桌面 Windows 的默认路线）；真正的 vsync 对齐（`wglSwapIntervalEXT(1)`
+  只是让 present 跟垂直同步走，帧节拍仍由我们的 `refreshHz` 节流）；高刷屏/动态刷新（§16.6）。

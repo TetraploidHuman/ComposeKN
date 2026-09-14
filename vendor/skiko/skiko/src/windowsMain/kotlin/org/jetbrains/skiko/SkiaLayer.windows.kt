@@ -6,17 +6,33 @@ import org.jetbrains.skia.Picture
 import org.jetbrains.skia.PixelGeometry
 import org.jetbrains.skia.PictureRecorder
 import org.jetbrains.skiko.redrawer.Redrawer
+import org.jetbrains.skiko.redrawer.WindowsGLRedrawer
+import org.jetbrains.skiko.redrawer.WindowsRenderLoopRedrawer
 import org.jetbrains.skiko.redrawer.WindowsSoftwareRedrawer
+import kotlinx.cinterop.toKString
 
 /**
  * SkiaLayer for Kotlin/Native Windows (mingwX64): Win32 borderless window +
  * software raster rendering presented through GDI's StretchDIBits.
  */
 actual open class SkiaLayer {
-    actual var renderApi: GraphicsApi = GraphicsApi.OPENGL
+    /**
+     * 渲染后端选择（与上游一致：OPENGL = GPU，SOFTWARE_* = 软件回退）。
+     *
+     * - [GraphicsApi.OPENGL]：WGL + Ganesh（GPU）。**创建失败会自动回退到软件路径**，
+     *   并把这里改写成 [GraphicsApi.SOFTWARE_FAST]，所以读回来的值就是实际生效的后端。
+     * - [GraphicsApi.SOFTWARE_FAST] / [GraphicsApi.SOFTWARE_COMPAT]：CPU raster + GDI
+     *   （对齐上游 SOFTWARE_FAST 形状，见 WindowsSoftwareContextHandler）。
+     *
+     * 环境变量 `COMPOSEKN_RENDER_API=gl|software` 可强制指定（CI / 排查用）。
+     */
+    actual var renderApi: GraphicsApi = defaultWindowsRenderApi()
         set(value) {
-            if (value != GraphicsApi.OPENGL) {
-                throw IllegalArgumentException("Only OPENGL (software raster) is supported on Windows (mingw)")
+            if (value != GraphicsApi.OPENGL &&
+                value != GraphicsApi.SOFTWARE_FAST &&
+                value != GraphicsApi.SOFTWARE_COMPAT
+            ) {
+                throw IllegalArgumentException("Unsupported GraphicsApi on Windows (mingw): $value")
             }
             field = value
         }
@@ -52,7 +68,7 @@ actual open class SkiaLayer {
             else -> error("container must be Win32Window or window title String")
         }
         org.jetbrains.skiko.compositionWindowRegistry.add(win32Window!!)
-        redrawer = WindowsSoftwareRedrawer(this, win32Window!!).apply {
+        redrawer = createRedrawer(win32Window!!).apply {
             syncBounds()
             needRender()
         }
@@ -76,13 +92,13 @@ actual open class SkiaLayer {
      * 空实现，所以静止的窗口不会重绘，空闲时 CPU ≈ 0。
      */
     fun hasRenderRequest(): Boolean =
-        (redrawer as? WindowsSoftwareRedrawer)?.renderRequested ?: false
+        (redrawer as? WindowsRenderLoopRedrawer)?.renderRequested ?: false
 
     /**
      * 有请求时画一帧，返回是否真的画了（见 [hasRenderRequest]）。
      */
     fun renderIfRequested(): Boolean =
-        (redrawer as? WindowsSoftwareRedrawer)?.renderIfRequested() ?: false
+        (redrawer as? WindowsRenderLoopRedrawer)?.renderIfRequested() ?: false
 
     /**
      * 注册「Compose 请求渲染」的回调。
@@ -91,7 +107,34 @@ actual open class SkiaLayer {
      * 窗口循环把它接到 `Win32Window::wake` 上，保证立刻醒来而不是等到下一条输入消息。
      */
     fun setRenderRequestHandler(handler: (() -> Unit)?) {
-        (redrawer as? WindowsSoftwareRedrawer)?.onRenderRequest = handler
+        (redrawer as? WindowsRenderLoopRedrawer)?.onRenderRequest = handler
+    }
+
+    /** 当前后端的诊断信息（后端类型 / 呈现方式）；写进性能日志用。 */
+    val rendererInfo: String
+        get() = redrawer?.renderInfo?.trim()?.replace('\n', ';') ?: "n/a"
+
+    /**
+     * 建后端：默认先试 GPU（OPENGL），失败（虚拟机/远程桌面/只有 GL 1.1 的驱动）
+     * 自动回退到软件路径 —— 与上游的「主后端 + 软件回退」一致。
+     */
+    private fun createRedrawer(window: Win32Window): Redrawer {
+        val requested = windowsRenderApiOverride() ?: renderApi
+        if (requested == GraphicsApi.OPENGL) {
+            try {
+                val gl = WindowsGLRedrawer(this, window)
+                renderApi = GraphicsApi.OPENGL
+                win32Log("skialayer: 使用 GL(GPU) 后端")
+                return gl
+            } catch (t: Throwable) {
+                win32Log(
+                    "skialayer: GL 后端创建失败（${t::class.simpleName}: ${t.message}），回退软件路径"
+                )
+            }
+        }
+        renderApi = GraphicsApi.SOFTWARE_FAST
+        win32Log("skialayer: 使用软件(CPU raster + GDI) 后端")
+        return WindowsSoftwareRedrawer(this, window)
     }
 
     @Deprecated(
@@ -147,3 +190,25 @@ actual open class SkiaLayer {
         redrawer?.renderImmediately()
     }
 }
+
+/**
+ * `COMPOSEKN_RENDER_API=gl|opengl|software|sw|gdi`：强制指定后端（CI / 排查用）。
+ * 未设置时返回 null，表示按 [SkiaLayer.renderApi] 走默认逻辑。
+ */
+private fun windowsRenderApiOverride(): GraphicsApi? {
+    val raw = platform.posix.getenv("COMPOSEKN_RENDER_API")?.toKString()?.trim()?.lowercase() ?: return null
+    return when (raw) {
+        "gl", "opengl", "gpu" -> GraphicsApi.OPENGL
+        "software", "sw", "gdi", "cpu" -> GraphicsApi.SOFTWARE_FAST
+        else -> {
+            win32Log("skialayer: 无法识别的 COMPOSEKN_RENDER_API=$raw（按默认处理）")
+            null
+        }
+    }
+}
+
+/**
+ * 默认后端 = GPU（OPENGL），与上游各平台一致：上游 Windows 桌面默认 D3D12/ANGLE、
+ * macOS METAL、Linux Wayland OPENGL；软件路径是回退，不是主路线。
+ */
+private fun defaultWindowsRenderApi(): GraphicsApi = GraphicsApi.OPENGL

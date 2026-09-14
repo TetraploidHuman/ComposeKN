@@ -88,6 +88,36 @@ internal external fun composekn_win32_process_cpu_nanos(window: COpaquePointer?)
 @SymbolName("composekn_win32_processor_count")
 internal external fun composekn_win32_processor_count(): Int
 
+// ---------------------------------------------------------------------------
+// OpenGL / WGL（GPU 后端，对齐上游 linuxMain 的 EGL 版）
+//
+// 只绑定平台上下文操作；Skia 的 GPU 上下文由 Kotlin 侧 DirectContext.makeGL() 建
+// （K/N 的 skia binding 已提供，见 org.jetbrains.skia.DirectContext.makeGL）。
+// ---------------------------------------------------------------------------
+
+/** 建 WGL 双缓冲上下文并 make current；失败返回 false（上层回退软件路径）。 */
+@SymbolName("composekn_win32_gl_create")
+internal external fun composekn_win32_gl_create(window: COpaquePointer?): Boolean
+
+/** make current（幂等）。 */
+@SymbolName("composekn_win32_gl_make_current")
+internal external fun composekn_win32_gl_make_current(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_gl_viewport")
+internal external fun composekn_win32_gl_viewport(width: Int, height: Int)
+
+@SymbolName("composekn_win32_gl_get_draw_framebuffer_binding")
+internal external fun composekn_win32_gl_get_draw_framebuffer_binding(): Int
+
+@SymbolName("composekn_win32_gl_set_swap_interval")
+internal external fun composekn_win32_gl_set_swap_interval(interval: Int)
+
+@SymbolName("composekn_win32_gl_swap_buffers")
+internal external fun composekn_win32_gl_swap_buffers(window: COpaquePointer?)
+
+@SymbolName("composekn_win32_gl_destroy")
+internal external fun composekn_win32_gl_destroy(window: COpaquePointer?)
+
 @SymbolName("composekn_win32_width")
 internal external fun composekn_win32_width(window: COpaquePointer?): Int
 
@@ -203,6 +233,28 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
     /** 本进程累计 CPU 时间（纳秒），失败返回 -1。用于把 CPU 占用写进日志。 */
     fun processCpuNanos(): Long = composekn_win32_process_cpu_nanos(native)
+
+    // ---- OpenGL / WGL（GPU 后端）----
+
+    /** 建 WGL 上下文并 make current；失败返回 false（调用方回退软件路径）。 */
+    fun glCreate(): Boolean = composekn_win32_gl_create(native)
+
+    /** make current（幂等）。渲染/销毁前调用，与上游 Linux GL redrawer 一致。 */
+    fun glMakeCurrent(): Boolean = composekn_win32_gl_make_current(native)
+
+    fun glViewport(width: Int, height: Int) = composekn_win32_gl_viewport(width, height)
+
+    /** 当前 draw framebuffer 绑定（默认帧缓冲通常是 0）。 */
+    fun glGetDrawFramebufferBinding(): Int = composekn_win32_gl_get_draw_framebuffer_binding()
+
+    /** WGL_EXT_swap_interval（1 = 垂直同步）。 */
+    fun glSetSwapInterval(interval: Int) = composekn_win32_gl_set_swap_interval(interval)
+
+    /** present：SwapBuffers。 */
+    fun glSwapBuffers(): Unit = composekn_win32_gl_swap_buffers(native)
+
+    /** 销毁 WGL 上下文。 */
+    fun glDestroy(): Unit = composekn_win32_gl_destroy(native)
 
     // 注意：这里必须用 memScoped + alloc<>().ptr 传「真实指针」。
     // Kotlin 的 IntArray/FloatArray/UIntArray 是托管对象，传给 external 函数时

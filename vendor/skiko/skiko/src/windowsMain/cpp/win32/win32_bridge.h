@@ -119,6 +119,36 @@ int64_t composekn_win32_process_cpu_nanos(ComposeKNWin32Window* window);
 /** 逻辑处理器数量（把进程 CPU 换算成「占整机百分比」用）。 */
 int32_t composekn_win32_processor_count(void);
 
+/** 原生 HWND（void*）。给 win32_gl.cc 用：ComposeKNWin32Window 在头文件里是不透明类型。 */
+void* composekn_win32_hwnd(ComposeKNWin32Window* window);
+
+// ---------------------------------------------------------------------------
+// OpenGL / WGL（GPU 后端，对齐上游 linuxMain 的 EGL 版）
+//
+// C 侧只管平台上下文；Skia 的 GPU 上下文在 Kotlin 侧用 DirectContext.makeGL() 建。
+// ---------------------------------------------------------------------------
+
+/** 建 WGL 双缓冲上下文并 make current。失败返回 false（上层回退软件路径）。 */
+bool composekn_win32_gl_create(ComposeKNWin32Window* window);
+
+/** make current（幂等；渲染/销毁前调用，与上游 Linux GL redrawer 一致）。 */
+bool composekn_win32_gl_make_current(ComposeKNWin32Window* window);
+
+/** glViewport(0, 0, w, h)。 */
+void composekn_win32_gl_viewport(int width, int height);
+
+/** 当前 draw framebuffer 绑定（默认帧缓冲通常是 0）。 */
+int composekn_win32_gl_get_draw_framebuffer_binding(void);
+
+/** WGL_EXT_swap_interval（1 = 垂直同步）。 */
+void composekn_win32_gl_set_swap_interval(int interval);
+
+/** present：SwapBuffers。 */
+void composekn_win32_gl_swap_buffers(ComposeKNWin32Window* window);
+
+/** 销毁上下文并释放 DC。 */
+void composekn_win32_gl_destroy(ComposeKNWin32Window* window);
+
 int composekn_win32_width(ComposeKNWin32Window* window);
 int composekn_win32_height(ComposeKNWin32Window* window);
 

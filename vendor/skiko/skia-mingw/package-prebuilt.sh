@@ -83,6 +83,9 @@ NIXPKGS_REV="$(cat "$(nix-instantiate --find-file nixpkgs 2>/dev/null)/.git-revi
     echo "  \"built_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
     echo "  \"abi\": \"GNU/Itanium (MinGW-w64 + UCRT + mcfgthread), 供 Kotlin/Native mingwX64 链接\","
     echo "  \"lib_count\": $(ls -1 "$PKG_DIR/libs"/*.a | wc -l),"
+    # 记录这份 Skia 编进了哪些 GPU 后端（从实际构建的 args.gn 读）。
+    # 真机/CI 日志里一眼能看出「这份预编译包有没有 GPU」，不用再去翻 args.gn。
+    echo "  \"gpu_backends\": [$(grep -E '^skia_use_(gl|direct3d|metal|vulkan|angle) = true' "$SKIA_OUT/args.gn" 2>/dev/null | sed -E 's/^skia_use_([a-z0-9]+) = true/"\1"/' | paste -sd, -)],"
     echo "  \"sha256\": {"
     first=1
     for f in "$PKG_DIR"/libs/*.a "$PKG_DIR"/runtime/*.a "$PKG_DIR"/shim/*.a "$PKG_DIR/icudtl.dat"; do

@@ -7,11 +7,20 @@ Kotlin/Native `mingwX64` 目标能够链接 Skia（JetBrains 发布的 Windows S
 MSVC ABI，符号名形如 `?drawRect@SkCanvas@@QEAAX...`，跟 K/N 需要的 Itanium
 ABI `_ZN8SkCanvas8drawRect...` 根本对不上）。
 
+> **这份包带 GPU 后端（Ganesh + OpenGL）**：用 `gn_args_gl.txt`
+> （`skia_use_gl = true` + `skia_enable_ganesh = true`）构建，manifest.json 里的
+> `gpu_backends` 会写成 `["gl"]`。Windows 宿主默认走 GL/WGL，创建失败自动回退软件
+> 路径（软件路径不依赖 GPU，所以同一份包两种后端都能用）。
+>
+> 注意：**现在必须用带 GPU 的这份包**。Kotlin 侧（`WindowsGLContextHandler`）引用了
+> `DirectContext.makeGL()`，纯 CPU 版 Skia 里没有 `GrDirectContexts::MakeGL` 符号，
+> 会在链接期报 undefined symbol。构建见 `build-skia-mingw-gl.sh`。
+
 包里所有东西都是**静态归档**，链接期只需要 konan 自带的 lld：
 
 ```
 skia-mingw-m150-b8e40a7c49/
-├── manifest.json      # skia tag/commit、构建用的 gcc/nixpkgs 版本、每个文件的 sha256
+├── manifest.json      # skia tag/commit、gcc/nixpkgs 版本、gpu_backends、每个文件的 sha256
 ├── icudtl.dat         # Skia 的 ICU 数据（必须放在 exe 同目录）
 ├── libs/              # 22 个 Skia 静态库（libskia.a / libicu.a / ...）
 ├── runtime/           # 链接期需要的运行期/导入库

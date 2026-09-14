@@ -65,7 +65,11 @@ fun skiaHeadersDirs(skiaDir: File): List<File> =
 fun includeHeadersFlags(headersDirs: List<File>) =
     headersDirs.map { "-I${it.absolutePath}" }.toTypedArray()
 
-fun skiaPreprocessorFlags(os: OS, buildType: SkiaBuildType): Array<String> {
+fun skiaPreprocessorFlags(
+    os: OS,
+    buildType: SkiaBuildType,
+    mingwSkiaDir: String? = null,
+): Array<String> {
     val base = listOf(
         "-DSK_ALLOW_STATIC_GLOBAL_INITIALIZERS=1",
         "-DSK_FORCE_DISTANCE_FIELD_TEXT=0",
@@ -113,8 +117,14 @@ fun skiaPreprocessorFlags(os: OS, buildType: SkiaBuildType): Array<String> {
             "-DWIN32_LEAN_AND_MEAN",
             "-DNOMINMAX",
             "-DSK_GAMMA_APPLY_TO_A8",
-            "-DSK_DIRECT3D",
-            "-DSK_ANGLE"
+            // ComposeKN: 上游这里无条件定义 SK_DIRECT3D / SK_ANGLE（因为它假设 Windows
+            // 版 Skia 一定编了 D3D/ANGLE）。我们用的是自建 GNU-ABI Skia，gn args 里
+            // skia_use_direct3d / skia_use_angle 都是 false —— 若仍然定义这两个宏，
+            // nativeJsMain/cpp 里的包装函数就会走 D3D 分支、引用 Skia 里不存在的符号
+            // （GrDirectContexts::MakeD3D / GrBackendRenderTargets::MakeD3D）→ K/N 链接失败。
+            // 所以按「实际链接的那份 Skia 的 args.gn」决定；取不到就按不开处理
+            // （那时包装函数走 #else 分支返回 nullptr，语义与上游「后端不可用」一致）。
+            *mingwGpuBackendFlags(mingwSkiaDir)
         )
         OS.Linux -> listOf(
             "-DSK_BUILD_FOR_LINUX",
@@ -370,3 +380,58 @@ fun KotlinTarget.generateVersion(
         }
     }
 }
+
+
+/**
+ * ComposeKN: 找到「实际链接的那份 Skia」的 args.gn。
+ *
+ * 查找顺序：gradle 属性 `skiko.skia.mingw.dir`（预编译包是 <pkg>/libs，源码构建是
+ * skia/out/mingw）→ 环境变量 SKIA_MINGW_PREBUILT / SKIA_MINGW_WORK。
+ */
+private fun mingwSkiaArgsGn(mingwSkiaDir: String?): File? {
+    val candidates = listOfNotNull(
+        mingwSkiaDir?.let { File(it, "args.gn") },
+        System.getenv("SKIA_MINGW_PREBUILT")?.let { File(it, "libs/args.gn") },
+        System.getenv("SKIA_MINGW_WORK")?.let { File(it, "skia/out/mingw/args.gn") },
+    )
+    return candidates.firstOrNull { it.isFile }
+}
+
+/** args.gn 里某个开关是不是 true。 */
+private fun mingwGnArgEnabled(mingwSkiaDir: String?, name: String): Boolean {
+    val argsGn = mingwSkiaArgsGn(mingwSkiaDir) ?: return false
+    return Regex("""(^|\s)$name\s*=\s*true""").containsMatchIn(argsGn.readText())
+}
+
+/**
+ * ComposeKN: Windows bridge 要不要定义 `SK_DIRECT3D` / `SK_ANGLE`。
+ *
+ * 上游是无条件定义的（它假设 Windows 版 Skia 一定编了 D3D/ANGLE）。我们用的是自建
+ * GNU-ABI Skia，gn args 里这些后端可能全是 false —— 若仍然定义这两个宏，
+ * `nativeJsMain/cpp` 里的包装函数就会走 D3D 分支、引用 Skia 里不存在的符号
+ * （`GrDirectContexts::MakeD3D` …）→ K/N 链接失败。
+ *
+ * 所以按**实际链接的那份 Skia**的 args.gn 决定。拿不到 args.gn 时：
+ *   - 调用方没给 dir（例如 JVM 路径）→ 保持上游行为（两个都定义）；
+ *   - 调用方给了 dir 但文件不在 → 按「都没开」处理（我们 mingw 的保守默认）。
+ */
+fun mingwGpuBackendFlags(mingwSkiaDir: String? = null): Array<String> {
+    val argsGn = mingwSkiaArgsGn(mingwSkiaDir)
+    if (argsGn == null) {
+        return if (mingwSkiaDir == null) arrayOf("-DSK_DIRECT3D", "-DSK_ANGLE") else emptyArray()
+    }
+    val flags = mutableListOf<String>()
+    if (mingwGnArgEnabled(mingwSkiaDir, "skia_use_direct3d")) flags += "-DSK_DIRECT3D"
+    if (mingwGnArgEnabled(mingwSkiaDir, "skia_use_angle")) flags += "-DSK_ANGLE"
+    return flags.toTypedArray()
+}
+
+/**
+ * ComposeKN: 这份 MinGW Skia 到底有没有 GPU 后端。
+ *
+ * 用来决定要不要定义 `SKIKO_MINGW_NO_GPU`（那个宏会把 Surface/Image 的 GPU 入口
+ * 整个打桩成 return nullptr）。拿不到 args.gn 时按「没有 GPU」处理 = 保持旧行为。
+ */
+fun mingwSkiaHasGpuBackend(mingwSkiaDir: String?): Boolean =
+    listOf("skia_use_gl", "skia_use_direct3d", "skia_use_metal", "skia_use_vulkan")
+        .any { mingwGnArgEnabled(mingwSkiaDir, it) }

@@ -16,12 +16,20 @@
 #include <windows.h>
 #include <GL/gl.h>
 
+#ifndef GL_SAMPLES
+#define GL_SAMPLES 0x80A9
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER_BINDING
+#define GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColor.h"
+#include "include/core/SkColorSpace.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkSurface.h"
@@ -61,8 +69,16 @@ HWND createHiddenWindow() {
 
 }  // namespace
 
-int main() {
-    std::printf("GL-SMOKE: start (%dx%d)\n", kW, kH);
+static bool useLegacyMakeGL = false;   // GrDirectContexts::MakeGL()（K/N binding 走这条）
+static bool useSrgb = false;           // Surface 用 sRGB 还是 nullptr
+
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--legacy-gl") == 0) useLegacyMakeGL = true;
+        if (std::strcmp(argv[i], "--srgb") == 0) useSrgb = true;
+    }
+    std::printf("GL-SMOKE: start (%dx%d) legacyMakeGL=%d srgb=%d\n",
+                kW, kH, (int)useLegacyMakeGL, (int)useSrgb);
     std::fflush(stdout);
 
     HWND hwnd = createHiddenWindow();
@@ -93,10 +109,31 @@ int main() {
                 version ? version : "(null)", renderer ? renderer : "(null)");
     std::fflush(stdout);
 
+    // 默认帧缓冲的实际参数（判断 Skia 的 format/stencil 是否与之匹配）
+    GLint fb = -1, stencil = -1, samples = -1, red = -1, green = -1, blue = -1, alpha = -1,
+          depth = -1;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    glGetIntegerv(GL_STENCIL_BITS, &stencil);
+    glGetIntegerv(GL_SAMPLES, &samples);
+    glGetIntegerv(GL_RED_BITS, &red);
+    glGetIntegerv(GL_GREEN_BITS, &green);
+    glGetIntegerv(GL_BLUE_BITS, &blue);
+    glGetIntegerv(GL_ALPHA_BITS, &alpha);
+    glGetIntegerv(GL_DEPTH_BITS, &depth);
+    std::printf("GL-SMOKE: fb=%d rgba=%d%d%d%d depth=%d stencil=%d samples=%d\n",
+                fb, red, green, blue, alpha, depth, stencil, samples);
+    std::fflush(stdout);
+
     // ---- 1) Skia GPU 上下文 ----
-    sk_sp<const GrGLInterface> glInterface = GrGLInterfaces::MakeWin();
-    if (!glInterface) return fail("GrGLInterfaces::MakeWin");
-    sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeGL(glInterface);
+    sk_sp<const GrGLInterface> glInterface;
+    sk_sp<GrDirectContext> ctx;
+    if (useLegacyMakeGL) {
+        ctx = GrDirectContexts::MakeGL();      // K/N binding _nMakeGL() 走这条
+    } else {
+        glInterface = GrGLInterfaces::MakeWin();
+        if (!glInterface) return fail("GrGLInterfaces::MakeWin");
+        ctx = GrDirectContexts::MakeGL(glInterface);
+    }
     if (!ctx) return fail("GrDirectContexts::MakeGL");
     std::printf("GL-SMOKE: GrDirectContext OK\n");
     std::fflush(stdout);
@@ -110,7 +147,7 @@ int main() {
 
     sk_sp<SkSurface> surface = SkSurfaces::WrapBackendRenderTarget(
             ctx.get(), rt, kBottomLeft_GrSurfaceOrigin, kRGBA_8888_SkColorType,
-            nullptr, nullptr);
+            useSrgb ? SkColorSpace::MakeSRGB() : nullptr, nullptr);
     if (!surface) return fail("SkSurfaces::WrapBackendRenderTarget");
     std::printf("GL-SMOKE: SkSurface(GPU) OK\n");
     std::fflush(stdout);

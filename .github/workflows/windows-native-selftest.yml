@@ -205,6 +205,38 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
+      # GPU 后端（GL/WGL）单独一关：主自检默认就是 GL（失败会自动回退软件，所以
+      # 「跑过」不等于「GL 真的在用」）。这一步强制 COMPOSEKN_RENDER_API=gl，并在日志里
+      # 断言真的走成了 GL —— 否则说明 CI 环境的 GL 不可用，需要显式暴露出来。
+      - name: Assert GL(GPU) backend works
+        env:
+          SKIA_MINGW_PREBUILT: ${{ steps.prebuilt.outputs.dir }}
+          WINEPREFIX: ${{ runner.temp }}/wineprefix
+        run: |
+          set -euo pipefail
+          run_dir="$RUNNER_TEMP/gl-backend-check"
+          rm -rf "$run_dir"; mkdir -p "$run_dir"
+          cp "${{ steps.prebuilt.outputs.dir }}/icudtl.dat" "$run_dir/"
+          exe="$(find samples/windows-demo/build/bin -name windows-demo.exe -type f | head -1)"
+          cp "$exe" "$run_dir/windows-demo.exe"
+          export WINEDEBUG=-all
+          export COMPOSEKN_RENDER_API=gl
+          Xvfb :88 -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 &
+          xp=$!
+          export DISPLAY=:88
+          for _ in $(seq 1 40); do [ -e /tmp/.X88-lock ] && break; sleep 0.25; done
+          sleep 1
+          ( cd "$run_dir" && wine ./windows-demo.exe ) >/dev/null 2>&1 &
+          app=$!
+          sleep 12
+          kill -9 "$app" 2>/dev/null || true
+          kill -9 "$xp" 2>/dev/null || true
+          log="$run_dir/composekn-startup.log"
+          echo '--- GL 后端断言 ---'
+          grep -E 'gl: created GL_VERSION|skialayer: 使用 GL|呈现=opengl' "$log" | head -5 || true
+          grep -q 'skialayer: 使用 GL' "$log" || { echo '!! 期望走 GL 后端，但日志里没有「使用 GL(GPU) 后端」'; exit 1; }
+          grep -q '呈现=opengl' "$log" || { echo '!! 期望 profile 行显示 呈现=opengl(wgl swap-buffers)'; exit 1; }
+
       - name: Upload artifacts (exe / 日志 / 截图)
         if: always()
         uses: actions/upload-artifact@v4

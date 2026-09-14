@@ -179,9 +179,11 @@ fun SkikoProjectContext.compileNativeBridgesTask(
                         "-fvisibility=hidden",
                         "-fvisibility-inlines-hidden",
                     ))
-                    windowsFlags.addAll(skiaPreprocessorFlags(OS.Windows, buildType))
-                    if (project.findProperty("skiko.skia.mingw.dir") != null) {
-                        // GPU backends are disabled in the MinGW Skia build.
+                    val mingwSkiaDir = project.findProperty("skiko.skia.mingw.dir") as? String
+                    windowsFlags.addAll(skiaPreprocessorFlags(OS.Windows, buildType, mingwSkiaDir))
+                    if (mingwSkiaDir != null && !mingwSkiaHasGpuBackend(mingwSkiaDir)) {
+                        // 这份 MinGW Skia 没有 GPU 后端：把 GPU 入口打桩，
+                        // 免得引用 Skia 里不存在的符号（详见 mingwSkiaHasGpuBackend 注释）。
                         windowsFlags.add("-DSKIKO_MINGW_NO_GPU")
                     }
                     flags.set(windowsFlags)

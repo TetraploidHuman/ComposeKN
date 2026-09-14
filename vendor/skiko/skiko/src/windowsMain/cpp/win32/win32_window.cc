@@ -698,6 +698,11 @@ extern "C" int64_t composekn_win32_process_cpu_nanos(ComposeKNWin32Window* windo
     return toNanos(kernel) + toNanos(user);
 }
 
+extern "C" void* composekn_win32_hwnd(ComposeKNWin32Window* window) {
+    if (window == nullptr) return nullptr;
+    return static_cast<void*>(window->hwnd);
+}
+
 extern "C" int32_t composekn_win32_processor_count(void) {
     const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return n > 0 ? static_cast<int32_t>(n) : 1;
