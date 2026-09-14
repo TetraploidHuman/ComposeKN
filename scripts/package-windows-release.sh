@@ -58,7 +58,12 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · Canvas 绘制（渐变/路径/描边/旋转）、FlowRow 自动换行、主题切换（深/浅色）
   · 渲染：**按需渲染 + 按刷新率节流**（没有内容变化就不重绘，空闲时 CPU ≈ 0；
     这个窗口的标题栏实时显示实测帧率）
+  · 渲染：**默认走 GPU（OpenGL/WGL + Skia Ganesh）**，创建失败会自动回退到软件路径
+    （CPU raster + GDI，零拷贝）——两者共用同一份 Skia，行为一致
+  · 渲染：**按需渲染 + 按刷新率节流**（没有内容变化就不重绘，空闲时 CPU ≈ 0；
+    这个窗口的标题栏实时显示实测帧率）
   · 想看空闲行为：ComposeKN-Windows-Native.exe --no-animate（关掉每帧动画）
+  · 想强制后端：set COMPOSEKN_RENDER_API=software（或 gl）——日志里会写明实际用了哪条
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
 
 自检（自动化测试）
