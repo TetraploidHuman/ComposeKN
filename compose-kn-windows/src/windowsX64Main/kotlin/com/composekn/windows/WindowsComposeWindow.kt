@@ -410,6 +410,14 @@ class WindowsComposeWindow(
     }
 
     /**
+     * 自检用：发一条 `IMR_DOCUMENTFEED`(0) / `IMR_RECONVERTSTRING`(1) /
+     * `IMR_COMPOSITIONFONT`(2)，返回 C 侧填好的字段（见 skiko 的
+     * `composekn_win32_ime_test_reconvert`）。
+     */
+    fun imeTestReconvert(kind: Int, bufferChars: Int): IntArray? =
+        win32Window?.imeTestReconvert(kind, bufferChars)
+
+    /**
      * Begin window move (for title bar drag).
      */
     fun beginMove() {

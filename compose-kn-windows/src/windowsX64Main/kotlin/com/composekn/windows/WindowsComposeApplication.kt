@@ -19,6 +19,7 @@ import org.jetbrains.skiko.SkikoRenderDelegate
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.initWindowsMainThread
 import org.jetbrains.skiko.setWindowsImeCaretProvider
+import org.jetbrains.skiko.setWindowsImeTextProvider
 import org.jetbrains.skiko.win32Log
 import com.composekn.windows.internal.winlog
 
@@ -233,6 +234,9 @@ class WindowsComposeApplication(
                 )
             }
         }
+        // IME 的文档馈送 / 重新转换：输入法通过 WM_IME_REQUEST 问「文档 + 组字范围」
+        // 时会**同步**回调这里（上下文候选排序、重转换都要它）。
+        setWindowsImeTextProvider { textInputService.imeDocument() }
         // 文本会话结束 -> 取消 IME 组字（否则候选窗会赖在屏幕上）。
         textInputService.onSessionEnded = { window.imeCancelComposition() }
         win32Log("app: scene + content ready, starting window loop")

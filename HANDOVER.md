@@ -2010,3 +2010,62 @@ finished normally` 之后）以 `0xC0000005` 退出（`!!! UNHANDLED EXCEPTION`�
 重跑 2 次都干净 —— 属于 §13.2 记过的 Wine 特有崩溃那一类（K/N GC/退出路径在 Wine 上不稳），
 在这台机器上无法进一步定位，也没有在真机复现过。**不要**把它和本次改动混为一谈，但也不装作
 它不存在。
+
+### 17.18 IMM32 补完（一）：文档馈送 / 重转换数据通道 / 组字字体 / 候选窗逐项（v0.5.0）
+
+v0.4.12 之后按计划补 IMM32 剩下的几块。这一版的原则：**能自检的都自检；只能在真机上验的，
+先把数据通道打通、并把输入法发来的东西记进日志**，不假装已经验证过。
+
+#### (1) `IMR_DOCUMENTFEED` / `IMR_RECONVERTSTRING`：把「文档 + 组字范围」交给输入法
+
+真机日志里每次组字都有一行 `WM_IME_REQUEST what=7（未处理，交给 DefWindowProc）` —— 那就是
+`IMR_DOCUMENTFEED`：输入法在要**文档内容**（做上下文候选排序，以及"重新转换"），我们一直
+拒掉它。现在：
+
+* 新增「文档提供者」同步回调（C 侧 `composekn_win32_set_ime_text_provider`；Kotlin 侧
+  `setWindowsImeTextProvider { textInputService.imeDocument() }`）—— 文档只有 Kotlin 侧知道
+  （Compose 的 `TextFieldValue`），和光标矩形那条通道同一个模式；
+* 只交**一段窗口**（组字/选区前后各 128 字，`kImeDocContextChars`），不申请整篇文档那么大的
+  缓冲区；`dwStrOffset = sizeof(RECONVERTSTRING)`，`dwCompStr*`/`dwTargetStr*` 指向组字区
+  （没有组字时用选区）；
+* 缓冲不够时按 IMM32 的两段式约定：把 `dwSize` 改成需要的大小并回 TRUE，让输入法带够缓冲
+  再问一次 —— 这样"输入法先问大小"和"输入法直接给缓冲"两种实现都能成立；
+* 开关 `COMPOSEKN_IME_DOCUMENTFEED=0` 退回 v0.4.12 的行为（不回答）。风险是**可能影响候选词
+  质量**（输入法会拿这段文本做上下文），真机上觉得候选变差就关掉并反馈。
+
+自检（window 阶段，走真实 `WM_IME_REQUEST`，Wine 里也能跑）：
+
+```
+window/ime-document-feed-fills-document   # 文档 "CKni hao" -> dwStrLen=8、comp=6@4、校验和相符
+window/ime-document-feed-two-phase        # 只给 32 字节 -> handled=1 且 dwSize>32（两段式）
+```
+
+#### (2) `IMR_CONFIRMRECONVERTSTRING`：**本轮明确拒绝**
+
+"重新转换"（再変換）的完整流程：应用交文档 → 输入法确认范围 → **应用把原文本变成选区** →
+输入法开一段组字把它替换掉。最后一步要在 Kotlin 侧加"按范围设选区"的逻辑，而且只有真机能验
+（Wine 没有输入法）。在拿到真机结论之前，我们**宁可明确拒绝**（不处理 = 输入法取消重转换），
+也不要弄出重复文本 —— 所以这一版**重转换还不能用**，只把它发来的字段写进日志
+（`ime: IMR_CONFIRMRECONVERTSTRING（本轮明确拒绝）…`）。下一轮按这份日志实现 + 真机验证。
+
+#### (3) `ImmSetCompositionFont` / `IMR_COMPOSITIONFONT`：组字字体
+
+把「我们实际用的行高 + 系统 UI 字体（`SPI_GETNONCLIENTMETRICS` 的 `lfMessageFont`）」交给
+输入法，让它的内部度量与我们画出来的字对得上（组字文本是 Compose 自己画的；这个字体主要给
+输入法算度量用）。行高取 Compose 排版给的真实值（和 `cLineHeight` 同源）。
+
+自检：`window/ime-composition-font`（handled=1 且 `lfHeight` 为负）。
+
+#### (4) 候选窗按 `dwIndex` 逐项 + `IMN_*`
+
+* `ImmSetCandidateWindow` 的 `dwIndex` 是**候选列表下标**，超出范围会直接失败；现在按
+  `ImmGetCandidateListCountW()` 给的项数逐项设置（拿不到、或列表为空时退回"只设第 0 项"，
+  上限 16 项）。Wine 的 imm32 是 stub → 走的正是退回分支，所以这条在本地只能验证"没坏"。
+* `WM_IME_NOTIFY`（`IMN_*`）继续**只记日志**：对自绘文本宿主来说那些通知没有需要应用做的事
+  （候选窗/组字窗都是输入法自己的）—— 这是刻意不做，不是漏掉。
+
+#### 这一版**没**在本地验证、需要真机的
+
+1. 打字时**候选词质量**有没有变化（变了先 `COMPOSEKN_IME_DOCUMENTFEED=0` 对比）；
+2. 组字/提交/候选窗锚点是否照旧（回归）；
+3. "重新转换"目前**不工作**（明确拒绝），属已知状态。

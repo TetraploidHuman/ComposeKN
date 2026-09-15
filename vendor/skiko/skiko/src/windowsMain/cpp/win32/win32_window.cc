@@ -155,6 +155,9 @@ struct ComposeKNWin32Window {
     // 诊断限流：WM_IME_NOTIFY、ImmSetCompositionWindow/ImmSetCandidateWindow 的返回值
     int imeNotifyLogCount = 0;
     int imeSetFormLogCount = 0;
+    // IMM32 重转换/文档馈送的诊断限流 + 开关（COMPOSEKN_IME_DOCUMENTFEED=0 退回旧行为）
+    int imeReconvertLogCount = 0;
+    bool imeDocumentFeedEnabled = true;
     // 「已经通过 GCS_RESULTSTR 提交过」的字符：如果 IME 又把它们作为 WM_CHAR
     // 送一遍（不同 IME / 不同兼容层行为不一致），必须丢掉，否则文本会插入两次。
     std::wstring pendingCommitChars;
@@ -313,6 +316,29 @@ extern "C" void composekn_win32_set_ime_caret_provider(ComposeKNImeCaretFn fn, v
     g_imeCaretProviderUser = user;
 }
 
+// C++ -> Kotlin：取「文本框里的文档」（IMM32 的文档馈送/重转换用）。
+//
+// 为什么需要：`IMR_DOCUMENTFEED` / `IMR_RECONVERTSTRING` 要求应用把**文档内容**和
+// 选区/组字范围交给输入法 —— 输入法拿它做上下文候选排序，以及「重新转换」。
+// 文档只有 Kotlin 侧知道（Compose 的 TextFieldValue），所以走同步回调（和光标矩形
+// 那条一样，在 WM_IME_REQUEST 的 SendMessage 里被调用）。
+//
+// [from] 起始字符偏移；[buffer] UTF-16 缓冲区；返回写入的字符数
+// （capacity <= 0 时只问文档总长度，不拷贝）。selection/composition 是 UTF-16
+// code unit 偏移，-1 表示不存在。
+typedef int32_t (*ComposeKNImeTextFn)(
+    void* user, int32_t from, uint16_t* buffer, int32_t capacity,
+    int32_t* selectionStart, int32_t* selectionEnd,
+    int32_t* compositionStart, int32_t* compositionEnd);
+
+static ComposeKNImeTextFn g_imeTextProvider = nullptr;
+static void* g_imeTextProviderUser = nullptr;
+
+extern "C" void composekn_win32_set_ime_text_provider(ComposeKNImeTextFn fn, void* user) {
+    g_imeTextProvider = fn;
+    g_imeTextProviderUser = user;
+}
+
 static std::string wideToUtf8(const std::wstring& text) {
     if (text.empty()) return std::string();
     const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.data(),
@@ -357,6 +383,102 @@ static void imeCaretRect(
         g_imeCaretProvider(g_imeCaretProviderUser, charIndex, x, y, w, h);
     }
     (void)window;
+}
+
+// 文档馈送时前后各带多少个字符的上下文（不申请整篇文档那么大的缓冲区）。
+static const int32_t kImeDocContextChars = 128;
+
+/**
+ * 填一个 `RECONVERTSTRING`（IMR_DOCUMENTFEED / IMR_RECONVERTSTRING 的答复）。
+ *
+ * 交给输入法的是：**文档的一段窗口**（以组字为中心、前后各 kImeDocContextChars 个
+ * 字符）+ 组字/目标范围。没有组字时用当前选区当目标范围。
+ *
+ * 缓冲区不够时按 IMM32 的两段式约定处理：把 `dwSize` 改成需要的大小并返回 true，
+ * 让输入法带够缓冲区再问一次（写 dwSize 一定落在它给的 RECONVERTSTRING 里，安全）。
+ *
+ * 返回 true = 已处理（消息应当回 TRUE）。
+ */
+static bool fillReconvertString(ComposeKNWin32Window* window, RECONVERTSTRING* rec) {
+    (void)window;
+    if (rec == nullptr || g_imeTextProvider == nullptr) return false;
+    int32_t selStart = -1, selEnd = -1, compStart = -1, compEnd = -1;
+    const int32_t docLen = g_imeTextProvider(
+        g_imeTextProviderUser, 0, nullptr, 0, &selStart, &selEnd, &compStart, &compEnd);
+    if (docLen <= 0) return false;
+    // 目标范围：优先组字，其次选区
+    int32_t targetStart = compStart >= 0 ? compStart : (selStart >= 0 ? selStart : 0);
+    int32_t targetEnd = compStart >= 0 ? compEnd : (selEnd >= 0 ? selEnd : targetStart);
+    if (targetStart < 0) targetStart = 0;
+    if (targetStart > docLen) targetStart = docLen;
+    if (targetEnd < targetStart) targetEnd = targetStart;
+    if (targetEnd > docLen) targetEnd = docLen;
+
+    int32_t from = targetStart - kImeDocContextChars;
+    if (from < 0) from = 0;
+    int32_t to = targetEnd + kImeDocContextChars;
+    if (to > docLen) to = docLen;
+    if (to <= from) return false;
+
+    const int32_t windowChars = to - from;
+    const DWORD needed = static_cast<DWORD>(sizeof(RECONVERTSTRING)) +
+                         static_cast<DWORD>(windowChars + 1) * static_cast<DWORD>(sizeof(WCHAR));
+    if (rec->dwSize < needed) {
+        rec->dwSize = needed;   // 两段式：告诉输入法要多大
+        return true;
+    }
+
+    std::vector<uint16_t> buffer(static_cast<size_t>(windowChars) + 1, 0);
+    const int32_t copied = g_imeTextProvider(
+        g_imeTextProviderUser, from, buffer.data(), windowChars,
+        &selStart, &selEnd, &compStart, &compEnd);
+    if (copied <= 0) return false;
+    // 第二次调用返回的范围才是与这段文本一致的（同线程、两次调用之间状态不会变，
+    // 这里仍然夹一遍，防止文档刚好在两次调用之间被改）。
+    int32_t cs = compStart >= 0 ? compStart - from : -1;
+    int32_t ce = compStart >= 0 ? compEnd - from : -1;
+    if (cs < 0 || ce < cs || ce > copied) { cs = targetStart - from; ce = targetEnd - from; }
+    if (cs < 0) cs = 0;
+    if (cs > copied) cs = copied;
+    if (ce < cs) ce = cs;
+    if (ce > copied) ce = copied;
+
+    rec->dwVersion = 0;
+    rec->dwStrLen = static_cast<DWORD>(copied);
+    rec->dwStrOffset = static_cast<DWORD>(sizeof(RECONVERTSTRING));
+    rec->dwCompStrLen = static_cast<DWORD>(ce - cs);
+    rec->dwCompStrOffset = static_cast<DWORD>(cs) * static_cast<DWORD>(sizeof(WCHAR));
+    rec->dwTargetStrLen = static_cast<DWORD>(ce - cs);
+    rec->dwTargetStrOffset = static_cast<DWORD>(cs) * static_cast<DWORD>(sizeof(WCHAR));
+    std::memcpy(reinterpret_cast<unsigned char*>(rec) + sizeof(RECONVERTSTRING),
+                buffer.data(), static_cast<size_t>(copied) * sizeof(WCHAR));
+    return true;
+}
+
+/**
+ * 填一个 `LOGFONT`：把「我们实际用的字体 + 行高」告诉输入法
+ * （`ImmSetCompositionFontW` + IMR_COMPOSITIONFONT 的答复）。
+ *
+ * 组字文本是 Compose 自己画的，所以这里主要是让输入法内部排版/度量跟我们一致：
+ * 字体取系统 UI 字体（`SPI_GETNONCLIENTMETRICS`，中文系统上通常是微软雅黑 UI），
+ * 行高取 Compose 排版给的真实值（caret provider 的第 4 个出参）。
+ */
+static bool fillImeCompositionFont(ComposeKNWin32Window* window, LOGFONTW* lf) {
+    if (lf == nullptr) return false;
+    ZeroMemory(lf, sizeof(*lf));
+    NONCLIENTMETRICSW metrics;
+    ZeroMemory(&metrics, sizeof(metrics));
+    metrics.cbSize = sizeof(metrics);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+        *lf = metrics.lfMessageFont;
+    } else {
+        lf->lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    }
+    lf->lfCharSet = DEFAULT_CHARSET;
+    int32_t x = 0, y = 0, w = 0, h = 0;
+    imeCaretRect(window, -1, &x, &y, &w, &h);
+    if (h > 0) lf->lfHeight = -h;   // LOGFONT 的字符高度用负值表示"字符高度"
+    return true;
 }
 
 /**
@@ -486,25 +608,48 @@ static void positionImeWindows(ComposeKNWin32Window* window) {
     const BOOL compositionOk = ImmSetCompositionWindow(himc, &composition);
     const DWORD compositionErr = compositionOk ? 0u : GetLastError();
 
-    CANDIDATEFORM candidate;
-    ZeroMemory(&candidate, sizeof(candidate));
-    candidate.dwIndex = 0;
-    candidate.dwStyle = CFS_CANDIDATEPOS;
-    candidate.ptCurrentPos = anchorPoint;
-    const BOOL candidateOk = ImmSetCandidateWindow(himc, &candidate);
-    const DWORD candidateErr = candidateOk ? 0u : GetLastError();
+    // 组字字体：让输入法内部排版用和我们一致的行高（它自己按系统字体推）。
+    // 失败不算错（Wine 的 imm32 是 stub；真机上拿不到字体会照样工作）。
+    LOGFONTW logFont;
+    BOOL fontOk = FALSE;
+    if (fillImeCompositionFont(window, &logFont)) {
+        fontOk = ImmSetCompositionFontW(himc, &logFont);
+    }
+
+    // 候选窗位置：**候选列表里每一项都要设一次** —— `CANDIDATEFORM.dwIndex` 是候选
+    // 列表下标，超出范围 `ImmSetCandidateWindow` 会直接失败（老写法只设 dwIndex=0）。
+    // 拿不到列表数量时（列表为空、或 Wine 没实现）退回"只设第 0 项"。
+    DWORD candidateCount = 0;
+    if (ImmGetCandidateListCountW(himc, &candidateCount) == 0 || candidateCount == 0) {
+        candidateCount = 1;
+    }
+    if (candidateCount > 16) candidateCount = 16;   // 保险：别为超长列表打一圈
+    BOOL candidateOk = TRUE;
+    DWORD candidateErr = 0;
+    for (DWORD i = 0; i < candidateCount; ++i) {
+        CANDIDATEFORM candidate;
+        ZeroMemory(&candidate, sizeof(candidate));
+        candidate.dwIndex = i;
+        candidate.dwStyle = CFS_CANDIDATEPOS;
+        candidate.ptCurrentPos = anchorPoint;
+        if (!ImmSetCandidateWindow(himc, &candidate)) {
+            candidateOk = FALSE;
+            candidateErr = GetLastError();
+        }
+    }
     ImmReleaseContext(window->hwnd, himc);
-    // 诊断：这两个调用到底有没有成功（以前完全不看返回值 —— 失败的话我们就一直
+    // 诊断：这些调用到底有没有成功（以前完全不看返回值 —— 失败的话我们就一直
     // 以为候选窗被我们摆好了）。失败必记，成功只记前几条。
     if ((!compositionOk || !candidateOk) || window->imeSetFormLogCount < 3) {
         if (window->imeSetFormLogCount < 12) {
             ++window->imeSetFormLogCount;
             composeknLog(
                 "ime: ImmSet{Composition,Candidate}Window 锚点=%ld,%ld composing=%d "
-                "-> comp=%d(err=%lu) cand=%d(err=%lu)",
+                "-> comp=%d(err=%lu) cand=%d/%lu项(err=%lu) font=%d",
                 (long)anchorPoint.x, (long)anchorPoint.y, window->imeComposing ? 1 : 0,
                 static_cast<int>(compositionOk), (unsigned long)compositionErr,
-                static_cast<int>(candidateOk), (unsigned long)candidateErr);
+                static_cast<int>(candidateOk), (unsigned long)candidateCount,
+                (unsigned long)candidateErr, static_cast<int>(fontOk));
         }
     }
 }
@@ -1173,9 +1318,55 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     }
                     break;
                 }
+                case IMR_RECONVERTSTRING:
+                case IMR_DOCUMENTFEED: {
+                    // 输入法要「文档 + 组字/目标范围」：上下文候选排序和「重新转换」
+                    // 都要它。我们交一段窗口（组字/选区前后各 128 字），缓冲不够时
+                    // 按两段式约定把 dwSize 改成需要的大小再回 TRUE。
+                    auto* rec = reinterpret_cast<RECONVERTSTRING*>(lParam);
+                    if (rec == nullptr) break;
+                    if (window->imeReconvertLogCount < 8) {
+                        ++window->imeReconvertLogCount;
+                        composeknLog(
+                            "ime: WM_IME_REQUEST what=%lu(%s) 收到 dwSize=%lu dwStrLen=%lu "
+                            "comp=%lu@%lu target=%lu@%lu",
+                            (unsigned long)wParam,
+                            wParam == IMR_DOCUMENTFEED ? "DOCUMENTFEED" : "RECONVERTSTRING",
+                            (unsigned long)rec->dwSize, (unsigned long)rec->dwStrLen,
+                            (unsigned long)rec->dwCompStrLen, (unsigned long)rec->dwCompStrOffset,
+                            (unsigned long)rec->dwTargetStrLen, (unsigned long)rec->dwTargetStrOffset);
+                    }
+                    if (!window->imeDocumentFeedEnabled) break;   // COMPOSEKN_IME_DOCUMENTFEED=0
+                    if (fillReconvertString(window, rec)) return TRUE;
+                    break;
+                }
+                case IMR_CONFIRMRECONVERTSTRING: {
+                    // 「重新转换」的确认步。确认之后输入法会开一段组字，而应用必须把
+                    // **原文本**变成选区交给这段组字替换 —— 否则文本会重复。这一步要
+                    // 改 Kotlin 侧的选区逻辑，而且只能在真机上验证，所以本轮**明确
+                    // 拒绝**（不处理 = 输入法取消重转换），只把它发来的内容记下来，
+                    // 作为下一轮实现 + 验证的依据。
+                    auto* rec = reinterpret_cast<RECONVERTSTRING*>(lParam);
+                    if (rec != nullptr && window->imeReconvertLogCount < 12) {
+                        ++window->imeReconvertLogCount;
+                        composeknLog(
+                            "ime: IMR_CONFIRMRECONVERTSTRING（本轮明确拒绝）dwSize=%lu "
+                            "dwStrLen=%lu comp=%lu@%lu target=%lu@%lu",
+                            (unsigned long)rec->dwSize, (unsigned long)rec->dwStrLen,
+                            (unsigned long)rec->dwCompStrLen, (unsigned long)rec->dwCompStrOffset,
+                            (unsigned long)rec->dwTargetStrLen, (unsigned long)rec->dwTargetStrOffset);
+                    }
+                    break;
+                }
+                case IMR_COMPOSITIONFONT: {
+                    // 输入法问「组字用什么字体」：回我们实际用的行高 + 系统 UI 字体。
+                    auto* lf = reinterpret_cast<LOGFONTW*>(lParam);
+                    if (lf == nullptr) break;
+                    if (fillImeCompositionFont(window, lf)) return TRUE;
+                    break;
+                }
                 default:
-                    // 未处理的请求（例如 IMR_DOCUMENTFEED 会在组字期间反复来）：
-                    // 只记前几条，免得真机日志被刷爆。
+                    // 未处理的请求：只记前几条，免得真机日志被刷爆。
                     if (window->imeRequestLogCount < 4) {
                         ++window->imeRequestLogCount;
                         composeknLog("ime: WM_IME_REQUEST what=%lu（未处理，交给 DefWindowProc）",
@@ -1286,10 +1477,16 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
     // 触摸通道默认开；COMPOSEKN_TOUCH=0 关掉（退回系统「触摸提升成鼠标」的老行为）。
     const char* touchEnv = getenv("COMPOSEKN_TOUCH");
     window->touchEnabled = !(touchEnv != nullptr && touchEnv[0] == '0');
+    // 文档馈送（IMR_DOCUMENTFEED/RECONVERTSTRING）默认开；万一某些输入法拿它做了
+    // 奇怪的事，COMPOSEKN_IME_DOCUMENTFEED=0 可以退回 v0.4.12 的行为（不回答）。
+    const char* docFeedEnv = getenv("COMPOSEKN_IME_DOCUMENTFEED");
+    window->imeDocumentFeedEnabled = !(docFeedEnv != nullptr && docFeedEnv[0] == '0');
     resolvePointerApis();
     composeknLog("composekn_win32_create: touch=%s pointerApi=%s",
                  window->touchEnabled ? "on" : "off",
                  g_getPointerInfo != nullptr ? "ok" : "missing");
+    composeknLog("composekn_win32_create: imeDocumentFeed=%s",
+                 window->imeDocumentFeedEnabled ? "on" : "off(COMPOSEKN_IME_DOCUMENTFEED=0)");
     window->hwnd = CreateWindowExW(
         0,
         kWindowClass,
@@ -1501,6 +1698,68 @@ extern "C" int32_t composekn_win32_ime_test_query_char_pos(
     out[1] = static_cast<int32_t>(pt.y);
     out[2] = static_cast<int32_t>(position.cLineHeight);
     out[3] = 1;
+    return 1;
+}
+
+/**
+ * 自检用：发一条 `IMR_DOCUMENTFEED`(0) / `IMR_RECONVERTSTRING`(1) / `IMR_COMPOSITIONFONT`(2)。
+ *
+ * 缓冲区由调用方给（[bufferChars] 个 UTF-16 字符；0 = 只给结构体本身，用来验
+ * IMM32 的两段式约定：我们先回 dwSize = 需要的字节数，输入法再带够缓冲来问）。
+ *
+ * out 至少 12 个 int：
+ *   [0] 消息返回值（1 = 我们处理了）
+ *   [1] dwSize  [2] dwStrLen  [3] dwStrOffset  [4] dwCompStrLen  [5] dwCompStrOffset
+ *   [6] dwTargetStrLen  [7] dwTargetStrOffset
+ *   [8] 字符串 code unit 校验和  [9] lfHeight（字体请求）  [10] 字符串长度
+ */
+extern "C" int32_t composekn_win32_ime_test_reconvert(
+    ComposeKNWin32Window* window, int32_t kind, int32_t bufferChars, int32_t* out) {
+    if (window == nullptr || window->hwnd == nullptr || out == nullptr) return 0;
+    for (int i = 0; i < 12; ++i) out[i] = 0;
+    if (bufferChars < 0) bufferChars = 0;
+    const size_t extra = static_cast<size_t>(bufferChars) * sizeof(WCHAR);
+    // 注意：LOGFONTW 比 RECONVERTSTRING 大（字体请求也会写整块），缓冲区取两者最大值。
+    const size_t base = sizeof(LOGFONTW) > sizeof(RECONVERTSTRING) ? sizeof(LOGFONTW)
+                                                                  : sizeof(RECONVERTSTRING);
+    std::vector<unsigned char> storage(base + extra + 2, 0);
+    auto* rec = reinterpret_cast<RECONVERTSTRING*>(storage.data());
+    rec->dwSize = static_cast<DWORD>(sizeof(RECONVERTSTRING) + extra);
+    const UINT request = static_cast<UINT>(
+        kind == 2 ? IMR_COMPOSITIONFONT : (kind == 1 ? IMR_RECONVERTSTRING : IMR_DOCUMENTFEED));
+    const LRESULT handled = SendMessageW(window->hwnd, WM_IME_REQUEST,
+                                         static_cast<WPARAM>(request),
+                                         reinterpret_cast<LPARAM>(storage.data()));
+    out[0] = handled != 0 ? 1 : 0;
+    if (kind == 2) {
+        auto* lf = reinterpret_cast<LOGFONTW*>(storage.data());
+        out[9] = static_cast<int32_t>(lf->lfHeight);
+        composeknLog("ime: [test] IMR_COMPOSITIONFONT -> handled=%d lfHeight=%d face=\"%s\"",
+                     out[0], out[9], wideToUtf8(lf->lfFaceName).c_str());
+        return 1;
+    }
+    out[1] = static_cast<int32_t>(rec->dwSize);
+    out[2] = static_cast<int32_t>(rec->dwStrLen);
+    out[3] = static_cast<int32_t>(rec->dwStrOffset);
+    out[4] = static_cast<int32_t>(rec->dwCompStrLen);
+    out[5] = static_cast<int32_t>(rec->dwCompStrOffset);
+    out[6] = static_cast<int32_t>(rec->dwTargetStrLen);
+    out[7] = static_cast<int32_t>(rec->dwTargetStrOffset);
+    std::wstring text;
+    if (rec->dwStrLen > 0 &&
+        static_cast<size_t>(rec->dwStrOffset) + static_cast<size_t>(rec->dwStrLen) * sizeof(WCHAR) <=
+            storage.size()) {
+        const wchar_t* chars =
+            reinterpret_cast<const wchar_t*>(storage.data() + rec->dwStrOffset);
+        text.assign(chars, chars + rec->dwStrLen);
+    }
+    int32_t sum = 0;
+    for (wchar_t c : text) sum += static_cast<int32_t>(c);
+    out[8] = sum;
+    out[10] = static_cast<int32_t>(text.size());
+    std::wstring shown = text.size() > 40 ? text.substr(0, 40) + L"…" : text;
+    composeknLog("ime: [test] reconvert kind=%d -> handled=%d strLen=%d sum=%d comp=%d@%d text=\"%s\"",
+                 kind, out[0], out[2], sum, out[4], out[5], wideToUtf8(shown).c_str());
     return 1;
 }
 

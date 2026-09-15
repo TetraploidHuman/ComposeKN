@@ -373,6 +373,18 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     fun imeTestSendCompositionMessage(start: Boolean): Unit =
         composekn_win32_ime_test_send_composition(native, if (start) 1 else 0)
 
+    /**
+     * 自检用：发一条 `IMR_DOCUMENTFEED`(kind=0) / `IMR_RECONVERTSTRING`(1) /
+     * `IMR_COMPOSITIONFONT`(2)，返回 C 侧填好的字段（见 `composekn_win32_ime_test_reconvert`）。
+     */
+    fun imeTestReconvert(kind: Int, bufferChars: Int): IntArray? = memScoped {
+        val out = allocArray<IntVar>(12)
+        if (composekn_win32_ime_test_reconvert(native, kind, bufferChars, out) == 0) {
+            return@memScoped null
+        }
+        IntArray(12) { out[it] }
+    }
+
     fun minimize() = composekn_win32_show(native, SW_WINDOWS_MINIMIZE)
     fun maximize() = composekn_win32_show(native, SW_WINDOWS_MAXIMIZE)
     fun restore() = composekn_win32_show(native, SW_WINDOWS_RESTORE)
@@ -427,6 +439,14 @@ private external fun composekn_win32_ime_test_query_char_pos(
 @SymbolName("composekn_win32_ime_test_send_composition")
 private external fun composekn_win32_ime_test_send_composition(window: COpaquePointer?, start: Int)
 
+@SymbolName("composekn_win32_ime_test_reconvert")
+private external fun composekn_win32_ime_test_reconvert(
+    window: COpaquePointer?,
+    kind: Int,
+    bufferChars: Int,
+    out: CPointer<IntVar>,
+): Int
+
 @SymbolName("composekn_win32_set_ime_caret_provider")
 private external fun composekn_win32_set_ime_caret_provider(
     callback: COpaquePointer?,
@@ -466,6 +486,73 @@ fun setWindowsImeCaretProvider(provider: ((charIndex: Int) -> IntArray?)?) {
         if (provider == null) null else imeCaretCallback, null,
     )
 }
+
+/**
+ * IMM32 的「文档快照」：`IMR_DOCUMENTFEED` / `IMR_RECONVERTSTRING` 要的东西。
+ *
+ * 偏移都是 UTF-16 code unit 偏移（= Compose 的 TextRange 偏移）；`-1` = 不存在。
+ * 输入法拿它做上下文候选排序和「重新转换」。
+ */
+data class WindowsImeDocument(
+    val text: String,
+    val selectionStart: Int,
+    val selectionEnd: Int,
+    val compositionStart: Int,
+    val compositionEnd: Int,
+)
+
+private var imeTextProvider: (() -> WindowsImeDocument?)? = null
+
+/**
+ * C 侧的入参 from/capacity + 出参（选区/组字范围）；返回写入的 code unit 数
+ * （capacity <= 0 时返回文档总长度）。
+ */
+private val imeTextCallback = staticCFunction<
+    COpaquePointer?, Int, CPointer<UShortVar>, Int,
+    CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, Int
+    > { _, from, buffer, capacity, selStart, selEnd, compStart, compEnd ->
+    val doc = imeTextProvider?.invoke()
+    if (doc == null) {
+        selStart.pointed.value = -1
+        selEnd.pointed.value = -1
+        compStart.pointed.value = -1
+        compEnd.pointed.value = -1
+        return@staticCFunction 0
+    }
+    selStart.pointed.value = doc.selectionStart
+    selEnd.pointed.value = doc.selectionEnd
+    compStart.pointed.value = doc.compositionStart
+    compEnd.pointed.value = doc.compositionEnd
+    if (capacity <= 0) return@staticCFunction doc.text.length
+    if (from < 0 || from >= doc.text.length) return@staticCFunction 0
+    val count = minOf(capacity, doc.text.length - from)
+    // 注意：`buffer[i].value` 在 K/N 上编译不过（UShortVar 的 value 接收者不匹配），
+    // 标准写法是 `(ptr + i)!!.pointed.value`。
+    for (i in 0 until count) {
+        (buffer + i)!!.pointed.value = doc.text[from + i].code.toUShort()
+    }
+    count
+}
+
+/**
+ * 注册「文档提供者」：IME 通过 `WM_IME_REQUEST` 要文档内容（上下文候选排序、
+ * 重新转换）时会**同步**回调它，所以要立刻返回。
+ *
+ * 回调返回 [WindowsImeDocument] 或 null（null = 没有活动文本会话）。
+ * 传 null 注销。
+ */
+fun setWindowsImeTextProvider(provider: (() -> WindowsImeDocument?)?) {
+    imeTextProvider = provider
+    composekn_win32_set_ime_text_provider(
+        if (provider == null) null else imeTextCallback, null,
+    )
+}
+
+@SymbolName("composekn_win32_set_ime_text_provider")
+private external fun composekn_win32_set_ime_text_provider(
+    callback: COpaquePointer?,
+    user: COpaquePointer?,
+)
 
 @SymbolName("composekn_win32_dpi_scale")
 internal external fun composekn_win32_dpi_scale(window: COpaquePointer?): Float

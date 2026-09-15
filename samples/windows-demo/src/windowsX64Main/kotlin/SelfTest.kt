@@ -1209,6 +1209,42 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                     "组字起点=$anchor 真实光标=$caret composing=${app.window.imeComposing}",
             )
         }
+        if (frame == 83) {
+            // ---- IMM32 文档馈送 / 组字字体（输入法通过这些请求拿"文档 + 组字范围"）----
+            // 此时文本框内容是 "CKni hao"，其中 "ni hao" 是组字区（偏移 2..8）。
+            // 注意：这些请求真机上是输入法**同步**问的（Wine 里没有输入法，只能我们自己发），
+            // 断言的也是"我们交给输入法的结构对不对"。
+            val docFed = app.window.imeTestReconvert(kind = 0, bufferChars = 512)
+            val expectedSum = probe.text.fold(0) { acc, c -> acc + c.code }
+            report.check(
+                "window/ime-document-feed-fills-document",
+                docFed != null && docFed[0] == 1 &&
+                    docFed[2] == probe.text.length && docFed[8] == expectedSum &&
+                    docFed[3] == 32 &&
+                    docFed[4] == 6 && docFed[5] == 4 &&
+                    docFed[6] == 6 && docFed[7] == 4,
+                "文本=${probe.text} " +
+                    "dwStrLen=${docFed?.get(2)}（期望 ${probe.text.length}）" +
+                    " sum=${docFed?.get(8)}（期望 $expectedSum）" +
+                    " dwStrOffset=${docFed?.get(3)}（期望 32=sizeof(RECONVERTSTRING)）" +
+                    " comp=${docFed?.get(4)}@${docFed?.get(5)}（期望 6@4）" +
+                    " target=${docFed?.get(6)}@${docFed?.get(7)}（期望 6@4）",
+            )
+            // 两段式：只给结构体大小的缓冲时，应当回"我需要多大"，而不是不回答。
+            val twoPhase = app.window.imeTestReconvert(kind = 0, bufferChars = 0)
+            report.check(
+                "window/ime-document-feed-two-phase",
+                twoPhase != null && twoPhase[0] == 1 && twoPhase[1] > 32,
+                "dwSize=32 的请求 -> handled=${twoPhase?.get(0)} dwSize=${twoPhase?.get(1)}（期望 1 / >32）",
+            )
+            // 组字字体：回一个带行高的 LOGFONT（lfHeight 用负值表示字符高度）。
+            val font = app.window.imeTestReconvert(kind = 2, bufferChars = 0)
+            report.check(
+                "window/ime-composition-font",
+                font != null && font[0] == 1 && font[9] < 0,
+                "IMR_COMPOSITIONFONT -> handled=${font?.get(0)} lfHeight=${font?.get(9)}（期望 1 / 负数）",
+            )
+        }
         if (frame == 84) {
             // 组字结束：立刻恢复如实回答（= 真实光标），不能还钉在组字起点。
             // 先结掉 Compose 侧的组字（composition 变 null），C 侧的 composing 由

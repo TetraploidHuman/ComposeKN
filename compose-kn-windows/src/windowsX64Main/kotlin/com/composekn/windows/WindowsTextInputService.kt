@@ -7,6 +7,7 @@ import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.text.input.CommitTextCommand
 import androidx.compose.ui.text.input.EditCommand
 import com.composekn.windows.internal.winlog
+import org.jetbrains.skiko.WindowsImeDocument
 import kotlinx.coroutines.awaitCancellation
 
 /**
@@ -137,6 +138,25 @@ internal class WindowsTextInputService {
             winlog("ime: caretRectForCompositionChar($charIndex) 异常，退回光标矩形：$t")
             return caret
         }
+    }
+
+    /**
+     * IMM32 的「文档快照」：`IMR_DOCUMENTFEED` / `IMR_RECONVERTSTRING` 要的东西
+     * （输入法拿它做上下文候选排序和「重新转换」）。
+     *
+     * 没有活动文本会话时返回 null —— C 侧会把它当作"没有文档"，请求照旧不回答。
+     */
+    fun imeDocument(): WindowsImeDocument? {
+        val request = activeRequest ?: return null
+        val value = request.value()
+        val composition = value.composition
+        return WindowsImeDocument(
+            text = value.text,
+            selectionStart = value.selection.min,
+            selectionEnd = value.selection.max,
+            compositionStart = composition?.start ?: -1,
+            compositionEnd = composition?.end ?: -1,
+        )
     }
 
     /**
