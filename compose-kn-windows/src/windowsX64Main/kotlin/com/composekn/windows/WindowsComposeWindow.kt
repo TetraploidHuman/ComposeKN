@@ -397,6 +397,19 @@ class WindowsComposeWindow(
     }
 
     /**
+     * 自检用：走**真实的** `WM_IME_REQUEST(IMR_QUERYCHARPOSITION)` 路径问一次
+     * 「组字串里第 [dwCharPos] 个字符在哪」（候选窗锚点塌缩逻辑在 C 侧，这条是
+     * 唯一能断言到 C 侧真答案的路）。返回 {x, y, lineHeight, 1}，客户区物理像素，
+     * pt 是字符/光标**底部**。
+     */
+    fun imeTestQueryCharPos(dwCharPos: Int): IntArray? = win32Window?.imeTestQueryCharPos(dwCharPos)
+
+    /** 自检用：合成一条 `WM_IME_STARTCOMPOSITION` / `WM_IME_ENDCOMPOSITION`。 */
+    fun imeTestSendCompositionMessage(start: Boolean) {
+        win32Window?.imeTestSendCompositionMessage(start)
+    }
+
+    /**
      * Begin window move (for title bar drag).
      */
     fun beginMove() {

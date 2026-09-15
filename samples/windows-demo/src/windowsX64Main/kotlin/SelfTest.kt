@@ -1163,6 +1163,57 @@ private fun runWindowTests(report: SelfTestReport) {
                 "value=${scrollState.value} maxValue=${scrollState.maxValue}",
             )
             report.check("window/frame-count", app.window.frameCount >= 78, "frames=${app.window.frameCount}")
+        }
+        // ---- IME 候选窗锚点：走**真实**的 WM_IME_REQUEST(IMR_QUERYCHARPOSITION) 路径 ----
+        //
+        // 背景（真机两轮反馈）：微软拼音在组字期间显然是用「光标那条查询」的结果摆候选窗，
+        // 所以只把 CFS_POINT/CFS_CANDIDATEPOS 设成组字起点没用（v0.4.10 实测仍然右移）。
+        // 现在 C 侧组字期间一律回答「组字串第 0 个字符」，把整串范围塌缩成一个点。
+        //
+        // 这里断言的是 C 侧真答案（组字起点 = 组字中任何 dwCharPos 的答案），
+        // 而 imeCaretRectForChar 那条路（如实映射）继续由逻辑阶段断言 —— 两条路
+        // 是分开的，不能互相替代。
+        if (frame == 80) {
+            app.window.imeTestSendCompositionMessage(start = true)   // 真 WM_IME_STARTCOMPOSITION
+            app.dispatchEvent(WindowsEvent.ImeStartEvent)
+            app.dispatchEvent(WindowsEvent.ImeCompositionEvent("ni hao"))
+        }
+        if (frame == 82) {
+            val composed = "ni hao"
+            val anchor = app.imeCaretRectForChar(0)
+            val caret = app.imeCaretRectForChar(composed.length)
+            val q0 = app.window.imeTestQueryCharPos(0)
+            val qEnd = app.window.imeTestQueryCharPos(composed.length)
+            report.check(
+                "window/ime-query-charpos-collapses-to-composition-start",
+                anchor != null && caret != null && caret[0] > anchor[0] &&
+                    q0 != null && qEnd != null &&
+                    abs(q0[0] - qEnd[0]) <= 2 && abs(q0[0] - anchor[0]) <= 3 &&
+                    app.window.imeComposing,
+                "组字中 dwCharPos=0 -> ${q0?.toList()} dwCharPos=$composed.length -> ${qEnd?.toList()} " +
+                    "组字起点=$anchor 真实光标=$caret composing=${app.window.imeComposing}",
+            )
+        }
+        if (frame == 84) {
+            // 组字结束：立刻恢复如实回答（= 真实光标），不能还钉在组字起点。
+            // 先结掉 Compose 侧的组字（composition 变 null），C 侧的 composing 由
+            // 真 WM_IME_ENDCOMPOSITION 同步关掉，然后问一个**非 0** 的 dwCharPos：
+            // 不在组字中时答案必须回到真实光标。
+            app.dispatchEvent(WindowsEvent.ImeEndEvent)
+            app.window.imeTestSendCompositionMessage(start = false)  // 真 WM_IME_ENDCOMPOSITION
+            val after = app.window.imeTestQueryCharPos(4)
+            val caretNow = app.imeCaretRectForChar(-1)
+            report.check(
+                "window/ime-query-charpos-honest-after-composition",
+                after != null && caretNow != null && abs(after[0] - caretNow[0]) <= 3 &&
+                    !app.window.imeComposing,
+                "组字结束 dwCharPos=4 -> ${after?.toList()}（应当回到真实光标 $caretNow）",
+            )
+            // 把刚插进去的 "ni hao" 删掉，保持后面的断言还是看到 "CK"
+            repeat(6) { keyPress(app, 0x08) }
+        }
+        if (frame == 88) {
+            report.checkEquals("window/ime-charpos-test-restores-text", "CK", probe.text)
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。
             driveFrames = false

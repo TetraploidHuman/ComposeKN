@@ -357,6 +357,22 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     fun imeTestCommit(text: String): Unit =
         text.useCString { composekn_win32_ime_test_commit(native, it) }
 
+    /**
+     * 自检用：走**真实**的 WM_IME_REQUEST(IMR_QUERYCHARPOSITION) 路径问一次
+     * 「组字串里第 [dwCharPos] 个字符在哪」。返回 {x, y, lineHeight, 1}（客户区
+     * 物理像素，pt 是光标底部）或 null（消息没被处理）。
+     */
+    fun imeTestQueryCharPos(dwCharPos: Int): IntArray? = memScoped {
+        val out = allocArray<IntVar>(4)
+        val handled = composekn_win32_ime_test_query_char_pos(native, dwCharPos, out)
+        if (handled == 0) return@memScoped null
+        intArrayOf(out[0], out[1], out[2], out[3])
+    }
+
+    /** 自检用：合成一条 WM_IME_STARTCOMPOSITION / WM_IME_ENDCOMPOSITION（Wine 里没有真 IME）。 */
+    fun imeTestSendCompositionMessage(start: Boolean): Unit =
+        composekn_win32_ime_test_send_composition(native, if (start) 1 else 0)
+
     fun minimize() = composekn_win32_show(native, SW_WINDOWS_MINIMIZE)
     fun maximize() = composekn_win32_show(native, SW_WINDOWS_MAXIMIZE)
     fun restore() = composekn_win32_show(native, SW_WINDOWS_RESTORE)
@@ -400,6 +416,16 @@ private external fun composekn_win32_ime_cancel_composition(window: COpaquePoint
 
 @SymbolName("composekn_win32_ime_test_commit")
 private external fun composekn_win32_ime_test_commit(window: COpaquePointer?, utf8: CPointer<ByteVar>)
+
+@SymbolName("composekn_win32_ime_test_query_char_pos")
+private external fun composekn_win32_ime_test_query_char_pos(
+    window: COpaquePointer?,
+    dwCharPos: Int,
+    out: CPointer<IntVar>,
+): Int
+
+@SymbolName("composekn_win32_ime_test_send_composition")
+private external fun composekn_win32_ime_test_send_composition(window: COpaquePointer?, start: Int)
 
 @SymbolName("composekn_win32_set_ime_caret_provider")
 private external fun composekn_win32_set_ime_caret_provider(

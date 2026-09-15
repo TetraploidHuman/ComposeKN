@@ -1861,3 +1861,63 @@ ime: IMR_QUERYCHARPOSITION dwCharPos=5 -> 366,1351     ← 组字 "k'n'n"
 ```
 ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 207,923 lineHeight=58
 ```
+
+### 17.16 候选窗锚点（三）：组字期间把整串组字文本「塌缩」成组字起点（v0.4.11）
+
+真机 v0.4.10 复测（**不崩了**，但候选窗**依旧**一路右移），日志把输入法问的东西全打出来了：
+
+```
+ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 230,914 lineHeight=48     ← 稳定
+ime: IMR_QUERYCHARPOSITION dwCharPos=4 -> 257,914 lineHeight=48
+ime: IMR_QUERYCHARPOSITION dwCharPos=11 -> 368,914 lineHeight=48    ← 随光标右移
+ime: IMR_QUERYCHARPOSITION dwCharPos=14 -> 405,914 lineHeight=48
+```
+
+推论链（这条值得记住，因为它是「IMM32 教科书语义」和「实测行为」不一致的典型）：
+
+1. `dwCharPos=0` 的答案（230）**一直是稳的** —— 我们的映射没问题；
+2. v0.4.10 已经把 `CFS_POINT` / `CFS_CANDIDATEPOS` 设成组字起点了，而 `ImmSet*` 两个调用
+   在自检里都是 `comp=1(err=0) cand=1(err=0)`（还伴随 `WM_IME_NOTIFY 0x000B/0x0009`）——
+   说明**调用本身是成功的**，但候选窗照样右移；
+3. 结论：微软拼音（Win11，TSF 输入法跑在 CUAS/兼容层里）的候选窗位置来自
+   **TSF 兼容层的 `GetTextExt`**，也就是我们的 `IMR_QUERYCHARPOSITION` 答案；它对
+   **光标**那条查询的结果敏感，而不是 `ImmSetCandidateWindow` 里我们设的点。
+
+修法：组字期间 `IMR_QUERYCHARPOSITION` **一律回答第 0 个字符**（`imeAnswerCharIndex()`），
+即让输入法看到「这串组字文本宽度为 0、就在组字起点」。这样无论它是按组字起点、还是按
+光标/范围右边缘来摆候选窗，算出来的点都是同一个 —— 候选窗钉在开始组字的位置。
+组字一结束立刻恢复如实回答（`IMR_QUERYCHARPOSITION` 的其它用途要真实矩形）。
+
+自检（`window` 阶段新增 3 条，全部走**真实消息路径**）：`imeTestSendCompositionMessage()`
+发真 `WM_IME_STARTCOMPOSITION`/`WM_IME_ENDCOMPOSITION`，`imeTestQueryCharPos(dwCharPos)`
+用 `SendMessageW(WM_IME_REQUEST, IMR_QUERYCHARPOSITION, …)` 问 C 侧（Wine 里也能跑）：
+
+```
+[20:10:51.288] ime: WM_IME_STARTCOMPOSITION（开始组字）
+[20:10:51.289] ime: WM_IME_NOTIFY code=0x000B          ← IMN_SETCOMPOSITIONWINDOW
+[20:10:51.289] ime: WM_IME_NOTIFY code=0x0009          ← IMN_SETCANDIDATEPOS
+[20:10:51.289] ime: ImmSet{Composition,Candidate}Window 锚点=52,96 composing=1 -> comp=1(err=0) cand=1(err=0)
+[20:10:51.322] ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 52,96 lineHeight=24
+[20:10:51.323] ime: IMR_QUERYCHARPOSITION dwCharPos=6 -> 52,96 lineHeight=24（组字中锚定起点；如实=98,96）
+[20:10:51.356] ime: WM_IME_ENDCOMPOSITION（组字结束）
+[20:10:51.356] ime: IMR_QUERYCHARPOSITION dwCharPos=4 -> 98,96 lineHeight=24
+```
+
+* `window/ime-query-charpos-collapses-to-composition-start`：组字中 `dwCharPos=0` 与
+  `dwCharPos=N` 答案必须相同（= 组字起点），且等于逻辑阶段那条如实映射的 `charIndex=0`；
+* `window/ime-query-charpos-honest-after-composition`：组字结束后 `dwCharPos=N` 必须回到
+  真实光标（不能还钉在起点）；
+* `window/ime-charpos-test-restores-text`：测试插进去的组字文本要清干净（不影响后续断言）。
+
+**顺带加的诊断**（都是为了「万一还不行，一次复现就能定位」）：
+
+* `WM_IME_NOTIFY` 的 code（判断 `ImmSet*` 到底有没有被输入法接受）；
+* `ImmSetCompositionWindow` / `ImmSetCandidateWindow` 的**返回值 + GetLastError**
+  （以前完全不看返回值 —— 失败的话我们会一直以为候选窗是自己摆好的）；
+* `ime: 组字期间系统小窗口位置变化 …`：组字期间枚举系统里「小的、可见的、不属于本进程」
+  的顶层窗口，只记 rect 变化的（限时 120ms/次、限 40 行）—— 候选窗真移了的话，日志里
+  会直接出现它的类名和坐标（不再靠猜）。Wine 里没有别的窗口，这几行通常不出现。
+* `IMR_QUERYCHARPOSITION` 那行现在带「如实=」的对照值，能一眼看出差了多少像素。
+
+已知限制：`COMPOSEKN_SELFTEST=all` 模式下性能契约那两条仍是已知会红（v0.4.7 起），
+判定全绿请分别跑 logic（90 条）/ window（28 条）。
