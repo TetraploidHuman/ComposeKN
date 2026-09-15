@@ -98,7 +98,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (118 checks, 0 failures)
+      SELFTEST: RESULT PASS (118 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (115 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -107,11 +108,12 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            IME 文本通道、**WM_IME_REQUEST 候选窗锚点（组字中塌缩到组字起点）**、
            干净退出、**性能契约**：静止不空转 / 跨线程刷新能唤醒 /
            动画按刷新率节流）（28 条）
-  all    = 两者都跑（118 条断言）
+  all    = 两者都跑（115 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
-           要开窗口）；另外性能契约那两条在 `all` 模式下已知会红（v0.4.7 起就有，
-           离屏阶段先跑过之后窗口阶段测动画帧率不准）。**判定全绿请分别跑
-           logic / window 两次**（scripts/test-windows-native.sh 就是这么跑的）。
+           要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
+           窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个
+           子阶段全是 0 帧；原因与取舍见 HANDOVER §17.17）——所以它不会红，但要看
+           真实的帧率/CPU 数据请单独跑 `window`。
 
 性能日志（排查 CPU/帧率时直接拷这个文件）：
   composekn-startup.log —— exe 同目录，含启动诊断 + 每秒一行 GALLERY-STATS

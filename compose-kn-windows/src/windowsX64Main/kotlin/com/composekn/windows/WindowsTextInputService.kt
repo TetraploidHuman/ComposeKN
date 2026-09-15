@@ -79,17 +79,30 @@ internal class WindowsTextInputService {
      * 候选窗是**钉在开始组字的位置**的。
      *
      * 实现：`request.focusedRectInRoot()` 是"光标（selection.max）在 root 里的矩形"，
-     * 而 `TextLayoutResult.getCursorRect(offset)` 给出同一坐标系里任意偏移的矩形 ——
-     * 两者相减就得到「目标字符相对光标」的位移。文本框到 root 的变换是平移
-     * （没有旋转/额外缩放），所以这个位移可以直接加到光标矩形上。
+     * `layout.getCursorRect(offset)` 给出同一排版里任意偏移的矩形 —— 两者相减得到
+     * 「排版原点在 root 里的位置」，再加到目标字符的矩形上。文本框到 root 是平移
+     * 变换，所以位移可以直接加。**位置沿用这套已验证的算法**（v0.4.11 真机确认
+     * 候选窗钉住了）。
+     *
+     * ⚠ 但**尺寸必须取 `getCursorRect()` 的**，不能沿用 `focusedRectInRoot()` 的：
+     * 真机实测后者在「组字串还是空的」和「已经有文本」两种状态下不是同一个矩形
+     * （高 58px vs 42px）—— IME 用 `pt.y + cLineHeight` 摆候选窗，尺寸一变，
+     * 候选窗刚弹出来就会上下跳 ~16px。
+     *
+     * 已知残留（±10px 级）：组字刚开始那一瞬间，位置本身还可能差 ~10px。
+     * 彻底修法是用 Compose 的 `unclippedTextOffsetInRoot`（文档写明是「排版 (0,0) 点
+     * 在 root 里的位置」，上游 iOS 路径就是拿它配 `getCursorRect` 用的）当原点；
+     * 但它在 legacy 输入路径下的实现是
+     * `textClippingRectInRoot.topLeft - innerTextFieldBounds.topLeft`，看着像"文本块相对
+     * 裁剪区的位置"而不是绝对坐标，本机（Linux + Wine，没有真输入法）无法验证到底是
+     * 哪种 —— 贸然换会让我们**已经钉对的**候选窗横移几十像素，所以先不动。
      */
     fun caretRectForCompositionChar(charIndex: Int): Rect? {
         val request = activeRequest ?: return null
         val caret = request.focusedRectInRoot() ?: return null
-        if (charIndex < 0) return caret
         try {
-            val composition = request.value().composition ?: return caret
             val layout = request.textLayoutResult() ?: return caret
+            val value = request.value()
             // ⚠ 这个函数是在 IME 的**同步**回调里跑的（WM_IME_REQUEST 的 SendMessage）：
             //   异常逃出去 = 进程崩。而且这里天然有一帧错位 ——
             //   TextFieldDelegate.onEditCommand() 会**立刻** session.updateState(newValue)
@@ -101,15 +114,24 @@ internal class WindowsTextInputService {
             //   所以偏移一律夹进 layout 自己的文本长度 —— 夹完之后答案依然正确：
             //   错位那一帧里「组字起点」在旧排版里也还是同一个位置。
             val layoutLength = layout.layoutInput.text.length
-            val value = request.value()
             val caretOffset = value.selection.max.coerceIn(0, layoutLength)
-            val targetOffset = (composition.start + charIndex).coerceIn(0, layoutLength)
-            if (targetOffset == caretOffset) return caret
+            val composition = value.composition
+            val targetOffset = when {
+                charIndex < 0 -> caretOffset       // 只要光标
+                composition == null -> caretOffset // 没在组字：按光标算（安全）
+                else -> (composition.start + charIndex).coerceIn(0, layoutLength)
+            }
             val localCaret = layout.getCursorRect(caretOffset)
             val localTarget = layout.getCursorRect(targetOffset)
             val dx = localTarget.left - localCaret.left
             val dy = localTarget.top - localCaret.top
-            return Rect(caret.left + dx, caret.top + dy, caret.right + dx, caret.bottom + dy)
+            // 位置 = 光标矩形 + 排版内位移；尺寸用排版自己的字符矩形（真正的行高）。
+            return Rect(
+                caret.left + dx,
+                caret.top + dy,
+                caret.left + dx + localTarget.width,
+                caret.top + dy + localTarget.height,
+            )
         } catch (t: Throwable) {
             // 兜底：任何意外都退回光标矩形，绝不把异常抛进 IME 的同步调用里。
             winlog("ime: caretRectForCompositionChar($charIndex) 异常，退回光标矩形：$t")

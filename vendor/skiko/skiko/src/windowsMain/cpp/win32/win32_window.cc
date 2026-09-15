@@ -385,8 +385,10 @@ static int32_t imeAnswerCharIndex(const ComposeKNWin32Window* window, int32_t dw
 //
 // 为什么要这个：真机上候选窗右移查了两轮都没修掉，而只看 IMR_QUERYCHARPOSITION
 // 的答案，分不清是「输入法压根没用我们的答案」还是「它用了另一个窗口自己摆」。
-// 这里在组字期间枚举系统里**小的、可见的、不属于本进程**的顶层窗口，只记 rect
-// 变化过的那几个（限时 120ms/次、限 40 行），真机复现一次就能对上号。
+// 这里在组字期间枚举系统里**小的、可见的、不属于本进程**的顶层窗口，只记
+// **上一次扫描里已经存在、这一次 rect 变了**的那些（新出现/刚消失的一律不报：
+// 真机实测，无关程序弹个 26x26 的小窗就会被误报成「候选窗位置变化」，噪音比信号
+// 还多）。限时 120ms/次、限 40 行，真机复现一次就能对上号。
 // ---------------------------------------------------------------------------
 struct ImeUiScanEntry {
     HWND hwnd;
@@ -432,7 +434,8 @@ static void logImeUiWindowMoves() {
         for (const ImeUiScanEntry& p : previous) {
             if (p.hwnd == e.hwnd) { old = &p; break; }
         }
-        if (old != nullptr && old->rect.left == e.rect.left && old->rect.top == e.rect.top &&
+        if (old == nullptr) continue;  // 新出现的窗口不报（无关程序弹个小窗就会误报）
+        if (old->rect.left == e.rect.left && old->rect.top == e.rect.top &&
             old->rect.right == e.rect.right && old->rect.bottom == e.rect.bottom) {
             continue;
         }
