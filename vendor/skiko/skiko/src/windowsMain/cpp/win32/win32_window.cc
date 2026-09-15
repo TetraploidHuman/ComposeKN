@@ -366,24 +366,25 @@ static void positionImeWindows(ComposeKNWin32Window* window) {
     if (window == nullptr || window->hwnd == nullptr) return;
     HIMC himc = ImmGetContext(window->hwnd);
     if (himc == nullptr) return;
-    // 组字窗（我们已用 ISC_SHOWUICOMPOSITIONWINDOW 让它不显示）跟光标；
-    // 候选窗锚在**组字串开头**（和原生应用一致，不跟着拼音往右跑）。
-    int32_t cx = 0, cy = 0, cw = 0, ch = 0;
-    imeCaretRect(window, -1, &cx, &cy, &cw, &ch);
-    POINT compositionPoint = { cx, cy + ch };
+    // ★ 经典 IMM32 语义：`CFS_POINT` 是**组字串的起点**（IME 从这一点开始画整串组字
+    //   文本，候选窗也相对它定位），**不是当前光标**。
+    //
+    //   我们以前把它设成「当前光标」（随拼音越打越靠右），于是候选窗跟着一路右移 ——
+    //   真机反馈 v0.4.9 仍然右移，就是这条。原生应用把它固定在组字起点，所以候选窗
+    //   停在开始组字的位置。组字文本由 Compose 自己内联画（IME 的组字窗已被
+    //   ISC_SHOWUICOMPOSITIONWINDOW 关掉），所以这个点只当锚点用。
+    const int32_t anchorIndex = window->imeComposing ? 0 : -1;
     int32_t ax = 0, ay = 0, aw = 0, ah = 0;
-    imeCaretRect(window, window->imeComposing ? 0 : -1, &ax, &ay, &aw, &ah);
+    imeCaretRect(window, anchorIndex, &ax, &ay, &aw, &ah);
     POINT anchorPoint = { ax, ay + ah };
-    const BOOL okComposition = ClientToScreen(window->hwnd, &compositionPoint);
-    const BOOL okAnchor = ClientToScreen(window->hwnd, &anchorPoint);
-    if (!okComposition || !okAnchor) {
+    if (!ClientToScreen(window->hwnd, &anchorPoint)) {
         ImmReleaseContext(window->hwnd, himc);
         return;
     }
     COMPOSITIONFORM composition;
     ZeroMemory(&composition, sizeof(composition));
     composition.dwStyle = CFS_POINT;
-    composition.ptCurrentPos = compositionPoint;
+    composition.ptCurrentPos = anchorPoint;
     ImmSetCompositionWindow(himc, &composition);
 
     CANDIDATEFORM candidate;
@@ -1008,9 +1009,9 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 case IMR_CANDIDATEWINDOW:
                 case IMR_COMPOSITIONWINDOW: {
                     // 应用在这个缓冲区里回填「候选窗/组字窗」的位置。
-                    // 候选窗锚在组字串开头，组字窗跟光标（与 positionImeWindows 一致）。
-                    const int32_t charIndex =
-                        (wParam == IMR_CANDIDATEWINDOW && window->imeComposing) ? 0 : -1;
+                    // 与 positionImeWindows 一致：组字中一律锚在**组字串起点**
+                    // （CFS_POINT/CFS_CANDIDATEPOS 的经典语义），不在组字中才跟光标。
+                    const int32_t charIndex = window->imeComposing ? 0 : -1;
                     int32_t x = 0, y = 0, w = 0, h = 0;
                     imeCaretRect(window, charIndex, &x, &y, &w, &h);
                     POINT pt = { x, y + h };

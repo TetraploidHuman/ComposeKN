@@ -6,6 +6,7 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.text.input.CommitTextCommand
 import androidx.compose.ui.text.input.EditCommand
+import com.composekn.windows.internal.winlog
 import kotlinx.coroutines.awaitCancellation
 
 /**
@@ -86,17 +87,34 @@ internal class WindowsTextInputService {
         val request = activeRequest ?: return null
         val caret = request.focusedRectInRoot() ?: return null
         if (charIndex < 0) return caret
-        val composition = request.value().composition ?: return caret
-        val layout = request.textLayoutResult() ?: return caret
-        val text = request.value().text
-        val caretOffset = request.value().selection.max.coerceIn(0, text.length)
-        val targetOffset = (composition.start + charIndex).coerceIn(0, text.length)
-        if (targetOffset == caretOffset) return caret
-        val localCaret = layout.getCursorRect(caretOffset)
-        val localTarget = layout.getCursorRect(targetOffset)
-        val dx = localTarget.left - localCaret.left
-        val dy = localTarget.top - localCaret.top
-        return Rect(caret.left + dx, caret.top + dy, caret.right + dx, caret.bottom + dy)
+        try {
+            val composition = request.value().composition ?: return caret
+            val layout = request.textLayoutResult() ?: return caret
+            // ⚠ 这个函数是在 IME 的**同步**回调里跑的（WM_IME_REQUEST 的 SendMessage）：
+            //   异常逃出去 = 进程崩。而且这里天然有一帧错位 ——
+            //   TextFieldDelegate.onEditCommand() 会**立刻** session.updateState(newValue)
+            //   （为了 setComposingText 之后 IME 马上能读到新文本，见 TextFieldDelegate.kt
+            //   的注释），但 textLayoutResult 要等**下一帧排版**才更新。于是这一小段
+            //   时间里 value 已经是新文本（长）、layout 还是旧的（短）。
+            //   TextLayoutResult.getCursorRect() 对超出**排版**长度的偏移会抛
+            //   IllegalArgumentException（真机实测：组字到 11 个字符时崩在这上面）。
+            //   所以偏移一律夹进 layout 自己的文本长度 —— 夹完之后答案依然正确：
+            //   错位那一帧里「组字起点」在旧排版里也还是同一个位置。
+            val layoutLength = layout.layoutInput.text.length
+            val value = request.value()
+            val caretOffset = value.selection.max.coerceIn(0, layoutLength)
+            val targetOffset = (composition.start + charIndex).coerceIn(0, layoutLength)
+            if (targetOffset == caretOffset) return caret
+            val localCaret = layout.getCursorRect(caretOffset)
+            val localTarget = layout.getCursorRect(targetOffset)
+            val dx = localTarget.left - localCaret.left
+            val dy = localTarget.top - localCaret.top
+            return Rect(caret.left + dx, caret.top + dy, caret.right + dx, caret.bottom + dy)
+        } catch (t: Throwable) {
+            // 兜底：任何意外都退回光标矩形，绝不把异常抛进 IME 的同步调用里。
+            winlog("ime: caretRectForCompositionChar($charIndex) 异常，退回光标矩形：$t")
+            return caret
+        }
     }
 
     /**

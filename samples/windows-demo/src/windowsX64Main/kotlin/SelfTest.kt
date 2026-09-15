@@ -831,6 +831,29 @@ private fun renderChecks(report: SelfTestReport) {
         anchorLong != null && charFourLong != null && charFourLong[0] > anchorLong[0],
         "第0个=$anchorLong 第4个=$charFourLong",
     )
+
+    // 回归（真机崩溃）：组字串**刚变长、还没排版**时，IME 会同步来问字符矩形。
+    // TextFieldDelegate.onEditCommand 会立刻 session.updateState(newValue)（这样
+    // setComposingText 之后 IME 就能读到新文本），但 textLayoutResult 要等下一帧 ——
+    // 于是 value 的长度 > layout 的长度，而 TextLayoutResult.getCursorRect() 对超出
+    // **排版**长度的偏移会抛 IllegalArgumentException；这个回调跑在 IME 的 SendMessage
+    // 里，异常逃出去就是进程崩（v0.4.9 真机：组字到 11 个字符时崩）。
+    val longComposition = "k'n'n'n'n'n"
+    app.dispatchEvent(WindowsEvent.ImeCompositionEvent(longComposition))
+    app.pumpDispatchers()
+    // 故意**不 render**：此刻 value 已是新文本、textLayoutResult 还是旧的
+    val raced = app.imeCaretRectForChar(longComposition.length)
+    report.check(
+        "ime/stale-layout-does-not-throw",
+        raced != null,
+        "长组字串查询=${raced}（value=${probe.text.length} 字符）",
+    )
+    val racedAnchor = app.imeCaretRectForChar(0)
+    report.check(
+        "ime/stale-layout-anchor-still-available",
+        racedAnchor != null && anchorShort != null && abs(racedAnchor[0] - anchorShort[0]) <= 4,
+        "错位帧锚点=$racedAnchor 正常帧锚点=$anchorShort",
+    )
     app.dispatchEvent(WindowsEvent.ImeEndEvent)
     app.pumpDispatchers()
     driver.render(800, 600, density = d, frames = 4)

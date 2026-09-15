@@ -1797,8 +1797,66 @@ v0.4.8 真机上中文输入已经可用，但用户发现一个细节：
 * 顺带把 `IMR_QUERYCHARPOSITION` 的日志限流（输入法每敲一个键会问好几次、答案还经常一样，
   真机日志会被它刷爆 —— 现在只在答案变化时记一行，上限 60 行）。
 
-自检：`logic` 88 条（+3 条候选窗锚点）、`window` 25 条；日志里那一行现在带上了
-`dwCharPos`，真机上可以直接看到输入法问的是第几个字符：
+### 17.15 候选窗锚点（二）：`CFS_POINT` 是**组字起点**不是光标；外加修一个真机崩溃（v0.4.10）
+
+> **v0.4.9 是坏版本**：它按 `dwCharPos` 回答是对的，但新加的 `getCursorRect()` 调用
+> 少了一层夹取，中文组字变长时会抛异常崩进程（真机复现）。已把它标记成 pre-release，
+> 用 v0.4.10。
+
+v0.4.9 真机复测：候选窗**仍然**往右滑，而且**崩了**。两条都定位到了。
+
+#### (1) 为什么按 `dwCharPos` 回答还是滑
+
+日志把输入法问的东西全打出来了（v0.4.9 起带 `dwCharPos`）：
+
+```
+ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 322,1355
+ime: IMR_QUERYCHARPOSITION dwCharPos=1 -> 322,1355     ← 组字 "k"
+ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 322,1345
+ime: IMR_QUERYCHARPOSITION dwCharPos=3 -> 338,1347     ← 组字 "k'n"
+ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 322,1351
+ime: IMR_QUERYCHARPOSITION dwCharPos=5 -> 366,1351     ← 组字 "k'n'n"
+```
+
+`dwCharPos=0` 的答案（322）**是稳的** —— 说明 v0.4.9 的映射没错，但候选窗用的是别的东西：
+**`ImmSetCompositionWindow` 的 `CFS_POINT`**。经典 IMM32 里 `CFS_POINT` 的语义是
+「**组字串的起点**」（IME 从这一点开始画整串组字文本，候选窗相对它定位），
+**不是当前光标**。我们一直把它设成当前光标（随拼音越打越靠右），候选窗自然跟着滑。
+
+修法：组字中 `CFS_POINT` / `CFS_CANDIDATEPOS` 全部锚在组字起点（`charIndex = 0`），
+不在组字中才回光标。组字文本是我们自己画的（IME 的组字窗已被
+`ISC_SHOWUICOMPOSITIONWINDOW` 关掉），所以这个点只当锚点用。
+
+#### (2) 崩溃：`getCursorRect()` 越界（真机组字到 11 个字符时）
+
+```
+!!! UNHANDLED EXCEPTION code=0x20474343 addr=...       ← Kotlin 异常逃到顶层
+```
+
+根因是**一帧的数据错位**，而且是框架**故意**造成的：
+
+* `TextFieldDelegate.onEditCommand()` 在应用完 IME 的编辑命令后会**立刻**
+  `session.updateState(newValue)`（源码注释：为了让 IME 在 `setComposingText` 之后马上
+  能读到新文本，否则输入法可能取消组字）；
+* 但 `textLayoutResult` 要等**下一帧排版**才更新。
+
+于是这一小段时间里：`request.value()` 已经是新文本（长），`textLayoutResult()` 还是旧的（短）。
+我们却用 `value()` 的长度去 clamp、然后拿偏移去问**旧的**排版：
+`TextLayoutResult.getCursorRect(offset)` 内部是 `requireIndexInRangeInclusiveEnd(offset)`，
+偏移超出就会抛 `IllegalArgumentException` —— 而这个回调是在 IME 的 `SendMessage` 里
+**同步**跑的，异常逃出去直接崩进程。
+
+修法（两层）：
+
+1. 偏移一律夹到 `layout.layoutInput.text.length`（**排版自己的**长度，不是 value 的长度）。
+   夹完之后答案依然正确：错位那一帧里「组字起点」在旧排版里也是同一个位置；
+2. 整个函数 `try/catch` 兜底，任何意外都退回光标矩形 —— 这个函数**绝不允许**抛异常。
+
+自检：`logic` 90 条（88 + 2：`ime/stale-layout-does-not-throw`、
+`ime/stale-layout-anchor-still-available` —— 前者故意「派发组字事件但**不 render**」，
+把「value 已更新、layout 还是旧的」那一帧固定下来复现崩溃；写这条断言之前我以为修复
+已经生效，结果它把「修复其实没应用」抓了个正着）、`window` 25 条；
+日志里那一行带上了 `dwCharPos`：
 
 ```
 ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 207,923 lineHeight=58
