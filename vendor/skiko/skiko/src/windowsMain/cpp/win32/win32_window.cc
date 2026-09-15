@@ -339,6 +339,25 @@ extern "C" void composekn_win32_set_ime_text_provider(ComposeKNImeTextFn fn, voi
     g_imeTextProviderUser = user;
 }
 
+// C++ -> Kotlin：「重新转换」时把输入法发来的 (字符串, 它在字符串里的目标范围) 映射回
+// **文档偏移**。只有映射成功（Kotlin 在文档里找到了那段文本）我们才会答应输入法的确认，
+// 然后把文档里对应的范围变成选区 —— 接下来那段组字就会替换掉原文本。
+//
+// 返回 1 = 映射成功（写回 [outStart, outEnd)），0 = 映射不了（我们会拒绝这次重转换，
+// 绝不动文本 —— 宁可"重新转换不生效"，也不要弄出重复文本）。
+typedef int32_t (*ComposeKNImeReconvertFn)(
+    void* user, const uint16_t* text, int32_t textLen,
+    int32_t targetOffsetInText, int32_t targetLen,
+    int32_t* outStart, int32_t* outEnd);
+
+static ComposeKNImeReconvertFn g_imeReconvertProvider = nullptr;
+static void* g_imeReconvertProviderUser = nullptr;
+
+extern "C" void composekn_win32_set_ime_reconvert_provider(ComposeKNImeReconvertFn fn, void* user) {
+    g_imeReconvertProvider = fn;
+    g_imeReconvertProviderUser = user;
+}
+
 static std::string wideToUtf8(const std::wstring& text) {
     if (text.empty()) return std::string();
     const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.data(),
@@ -1341,22 +1360,55 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     break;
                 }
                 case IMR_CONFIRMRECONVERTSTRING: {
-                    // 「重新转换」的确认步。确认之后输入法会开一段组字，而应用必须把
-                    // **原文本**变成选区交给这段组字替换 —— 否则文本会重复。这一步要
-                    // 改 Kotlin 侧的选区逻辑，而且只能在真机上验证，所以本轮**明确
-                    // 拒绝**（不处理 = 输入法取消重转换），只把它发来的内容记下来，
-                    // 作为下一轮实现 + 验证的依据。
+                    // 「重新转换」的确认步：输入法确认了它要重转换的范围。应用必须**先
+                    // 把原文本变成选区**，接下来那段组字才会替换它（否则文本会重复）。
+                    //
+                    // 安全策略：只在与文档能对上时答应 —— Kotlin 侧在文档里找这段文本，
+                    // 找到才回 1（并把范围写回来），我们就推一条「设选区」事件再回 TRUE；
+                    // 找不到就**拒绝**（不处理 = 输入法取消重转换），绝不动文本。
                     auto* rec = reinterpret_cast<RECONVERTSTRING*>(lParam);
-                    if (rec != nullptr && window->imeReconvertLogCount < 12) {
-                        ++window->imeReconvertLogCount;
-                        composeknLog(
-                            "ime: IMR_CONFIRMRECONVERTSTRING（本轮明确拒绝）dwSize=%lu "
-                            "dwStrLen=%lu comp=%lu@%lu target=%lu@%lu",
-                            (unsigned long)rec->dwSize, (unsigned long)rec->dwStrLen,
-                            (unsigned long)rec->dwCompStrLen, (unsigned long)rec->dwCompStrOffset,
-                            (unsigned long)rec->dwTargetStrLen, (unsigned long)rec->dwTargetStrOffset);
+                    if (rec == nullptr || g_imeReconvertProvider == nullptr) break;
+                    const DWORD strBytes = static_cast<DWORD>(sizeof(WCHAR)) * rec->dwStrLen;
+                    if (rec->dwStrLen == 0 || rec->dwStrOffset < sizeof(RECONVERTSTRING) ||
+                        static_cast<DWORD>(rec->dwStrOffset) + strBytes > rec->dwSize) {
+                        if (window->imeReconvertLogCount < 12) {
+                            ++window->imeReconvertLogCount;
+                            composeknLog(
+                                "ime: IMR_CONFIRMRECONVERTSTRING 结构不合法（dwSize=%lu dwStrLen=%lu "
+                                "dwStrOffset=%lu）-> 拒绝",
+                                (unsigned long)rec->dwSize, (unsigned long)rec->dwStrLen,
+                                (unsigned long)rec->dwStrOffset);
+                        }
+                        break;
                     }
-                    break;
+                    const auto* text = reinterpret_cast<const uint16_t*>(
+                        reinterpret_cast<const unsigned char*>(rec) + rec->dwStrOffset);
+                    const int32_t targetOffset =
+                        static_cast<int32_t>(rec->dwTargetStrOffset / sizeof(WCHAR));
+                    const int32_t targetLen = static_cast<int32_t>(rec->dwTargetStrLen);
+                    int32_t mappedStart = 0, mappedEnd = 0;
+                    const int32_t mapped = g_imeReconvertProvider(
+                        g_imeReconvertProviderUser, text, static_cast<int32_t>(rec->dwStrLen),
+                        targetOffset, targetLen, &mappedStart, &mappedEnd);
+                    composeknLog(
+                        "ime: IMR_CONFIRMRECONVERTSTRING dwStrLen=%lu comp=%lu@%lu target=%d@%d "
+                        "-> %s[%d,%d)",
+                        (unsigned long)rec->dwStrLen, (unsigned long)rec->dwCompStrLen,
+                        (unsigned long)rec->dwCompStrOffset, targetLen, targetOffset,
+                        mapped ? "接受" : "拒绝", mappedStart, mappedEnd);
+                    if (!mapped) break;   // 拒绝：交给 DefWindowProc
+                    // 让 Compose 先把这段原文本选中；随后的组字会替换掉它。
+                    // 注意：pushImeEvent() 会把 a 设成文本长度，这里要自己填范围 ——
+                    // 但**仍然要**往 imeTexts 里补一个空串，保持「事件 ↔ 文本」的
+                    // FIFO 一一对应（Kotlin 侧每条 IME 事件都会弹一次文本）。
+                    ComposeKNWin32Event e{};
+                    e.type = COMPOSEKN_WIN32_EVENT_IME_RECONVERT_SELECT;
+                    e.a = mappedStart;
+                    e.b = mappedEnd;
+                    e.state = window->imeComposing ? 1u : 0u;
+                    pushEvent(window, e);
+                    window->imeTexts.push_back(std::string());
+                    return TRUE;
                 }
                 case IMR_COMPOSITIONFONT: {
                     // 输入法问「组字用什么字体」：回我们实际用的行高 + 系统 UI 字体。
@@ -1761,6 +1813,39 @@ extern "C" int32_t composekn_win32_ime_test_reconvert(
     composeknLog("ime: [test] reconvert kind=%d -> handled=%d strLen=%d sum=%d comp=%d@%d text=\"%s\"",
                  kind, out[0], out[2], sum, out[4], out[5], wideToUtf8(shown).c_str());
     return 1;
+}
+
+/**
+ * 自检用：合成一条 `IMR_CONFIRMRECONVERTSTRING`（「重新转换」的确认步）。
+ *
+ * [utf8] 是输入法"发回来"的字符串，[targetOffsetInText]/[targetLen] 是它在字符串里的
+ * 目标范围（UTF-16 code unit）。返回 1 = 我们接受了（Kotlin 在文档里对上了），
+ * 0 = 拒绝（对不上/结构不合法）。
+ */
+extern "C" int32_t composekn_win32_ime_test_confirm_reconvert(
+    ComposeKNWin32Window* window, const char* utf8, int32_t targetOffsetInText, int32_t targetLen) {
+    if (window == nullptr || window->hwnd == nullptr || utf8 == nullptr) return 0;
+    const int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    if (wideLen <= 1) return 0;
+    std::vector<wchar_t> wide(static_cast<size_t>(wideLen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide.data(), wideLen);
+    const size_t textChars = static_cast<size_t>(wideLen - 1);
+    const size_t textBytes = textChars * sizeof(WCHAR);
+    std::vector<unsigned char> storage(sizeof(RECONVERTSTRING) + textBytes + 2, 0);
+    auto* rec = reinterpret_cast<RECONVERTSTRING*>(storage.data());
+    rec->dwSize = static_cast<DWORD>(storage.size());
+    rec->dwVersion = 0;
+    rec->dwStrLen = static_cast<DWORD>(textChars);
+    rec->dwStrOffset = static_cast<DWORD>(sizeof(RECONVERTSTRING));
+    rec->dwCompStrLen = static_cast<DWORD>(targetLen);
+    rec->dwCompStrOffset = static_cast<DWORD>(targetOffsetInText) * static_cast<DWORD>(sizeof(WCHAR));
+    rec->dwTargetStrLen = static_cast<DWORD>(targetLen);
+    rec->dwTargetStrOffset = rec->dwCompStrOffset;
+    std::memcpy(storage.data() + sizeof(RECONVERTSTRING), wide.data(), textBytes);
+    const LRESULT handled = SendMessageW(window->hwnd, WM_IME_REQUEST,
+                                         static_cast<WPARAM>(IMR_CONFIRMRECONVERTSTRING),
+                                         reinterpret_cast<LPARAM>(storage.data()));
+    return handled != 0 ? 1 : 0;
 }
 
 /**

@@ -45,6 +45,14 @@ typedef enum ComposeKNWin32EventType {
     COMPOSEKN_WIN32_EVENT_IME_UPDATE = 15,  /* WM_IME_COMPOSITION + GCS_COMPSTR（组字预览） */
     COMPOSEKN_WIN32_EVENT_IME_COMMIT = 16,  /* WM_IME_COMPOSITION + GCS_RESULTSTR（提交） */
     COMPOSEKN_WIN32_EVENT_IME_END = 17,     /* WM_IME_ENDCOMPOSITION */
+    /*
+     * 「重新转换」（再変換）的准备工作：IME 确认了要重转换的范围之后，应用必须先把
+     * **原文本变成选区**，接下来那段组字才会替换它（否则文本会重复）。
+     *
+     * 不带文本（但仍然会配对一个空串，保持「事件与文本 FIFO 一一对应」的约定）；
+     * 范围放在 a = 起始偏移、b = 结束偏移（UTF-16 code unit，文档坐标）。
+     */
+    COMPOSEKN_WIN32_EVENT_IME_RECONVERT_SELECT = 18,
 } ComposeKNWin32EventType;
 
 typedef struct ComposeKNWin32Event {

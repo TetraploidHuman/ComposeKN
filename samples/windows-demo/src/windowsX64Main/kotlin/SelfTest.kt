@@ -796,6 +796,42 @@ private fun renderChecks(report: SelfTestReport) {
     )
     report.checkEquals("ime/end-keeps-committed-text", "你好hao", probe.text)
 
+    // 2.7d 「重新转换」（再変換）：选区握手
+    //
+    // 输入法确认要重转换的范围之后，应用必须**先把原文本变成选区**，接下来那段组字
+    // （setComposingText）才会替换它 —— 不做这一步，组字会插到光标处，原文还在，
+    // 文本就重复了。这里覆盖两件事：
+    //   1) 范围映射：字符串能在文档里对上 -> 给出文档范围；对不上 -> null
+    //      （C 侧拿到 null 会**拒绝**这次重转换，绝不动文本）；
+    //   2) 事件落地：ImeReconvertSelectEvent 紧跟组字/提交 -> 原文被替换，不重复。
+    // 此刻文档是「你好hao」，光标在末尾（偏移 5）。
+    val mapped = app.mapReconvertRange("hao", targetOffsetInText = 0, targetLen = 3)
+    report.check(
+        "ime/reconvert-range-maps-to-document",
+        mapped != null && mapped[0] == 2 && mapped[1] == 5,
+        "「hao」-> ${mapped?.toList()}（期望 [2, 5]，文档是「你好hao」）",
+    )
+    report.check(
+        "ime/reconvert-range-refuses-unknown-text",
+        app.mapReconvertRange("zzz", targetOffsetInText = 0, targetLen = 3) == null,
+        "文档里没有的字符串必须返回 null（C 侧据此拒绝）",
+    )
+    // 握手：先选中 [2,5)（="hao"），再来一段组字 "hao" —— 文本必须**原地不变**。
+    app.dispatchEvent(WindowsEvent.ImeReconvertSelectEvent(start = 2, end = 5))
+    app.dispatchEvent(WindowsEvent.ImeStartEvent)
+    app.dispatchEvent(WindowsEvent.ImeCompositionEvent("hao"))
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals("ime/reconvert-composition-replaces-original", "你好hao", probe.text)
+    // 提交转换后的结果：原文本被替换，而不是"原文还在、又插一份"。
+    app.dispatchEvent(WindowsEvent.ImeCommitEvent("好"))
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals("ime/reconvert-commit-replaces-original", "你好好", probe.text)
+    app.dispatchEvent(WindowsEvent.ImeEndEvent)
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+
     // 2.7c 候选窗锚点：IME 用 dwCharPos 问「组字串里第几个字符」，
     //      候选窗问的是第 0 个 —— 所以它的答案必须是**开始组字的位置**，
     //      不能随着拼音越打越长往右滑（真机反馈：候选框跟着光标一路右移，
@@ -1263,7 +1299,34 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
             // 把刚插进去的 "ni hao" 删掉，保持后面的断言还是看到 "CK"
             repeat(6) { keyPress(app, 0x08) }
         }
+        if (frame == 86) {
+            // ---- 「重新转换」选区握手（走**真实** WM_IME_REQUEST(IMR_CONFIRMRECONVERTSTRING)）----
+            // 此时文本框是 "CK"、光标在末尾。输入法把 "CK" + 目标 [0,2) 发回来：
+            // 我们能对上 -> 接受，并先把 [0,2) 变成选区（随后那段组字会替换它）。
+            val accepted = app.window.imeTestConfirmReconvert("CK", 0, 2)
+            report.check(
+                "window/ime-reconvert-confirm-accepts-known-text",
+                accepted,
+                "文档「CK」+ 目标 [0,2) -> ${if (accepted) "接受" else "拒绝"}（期望接受）",
+            )
+            val refused = app.window.imeTestConfirmReconvert("zzz", 0, 3)
+            report.check(
+                "window/ime-reconvert-confirm-refuses-unknown-text",
+                !refused,
+                "文档里没有的字符串 -> ${if (refused) "接受" else "拒绝"}（期望拒绝）",
+            )
+            // 注意：上面的选选区事件是**排队**的（C 侧 FIFO），要到下一轮消息循环才落地 ——
+            // 这正是真实 IME 的顺序（确认 -> 选区 -> 组字），所以组字放在 frame==87 发。
+        }
+        if (frame == 87) {
+            app.dispatchEvent(WindowsEvent.ImeStartEvent)
+            app.dispatchEvent(WindowsEvent.ImeCompositionEvent("CK"))
+        }
         if (frame == 88) {
+            report.checkEquals("window/ime-reconvert-composition-no-duplicate", "CK", probe.text)
+            app.dispatchEvent(WindowsEvent.ImeCommitEvent("CK"))
+            app.dispatchEvent(WindowsEvent.ImeEndEvent)
+            report.checkEquals("window/ime-reconvert-commit-no-duplicate", "CK", probe.text)
             report.checkEquals("window/ime-charpos-test-restores-text", "CK", probe.text)
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。

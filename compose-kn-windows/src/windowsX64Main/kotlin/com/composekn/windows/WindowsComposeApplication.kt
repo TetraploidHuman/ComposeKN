@@ -3,6 +3,7 @@
 package com.composekn.windows
 
 import androidx.compose.ui.platform.DefaultArchitectureComponentsOwner
+import androidx.compose.ui.text.input.SetSelectionCommand
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.asComposeCanvas
 import androidx.compose.ui.platform.FrameRecomposer
@@ -19,6 +20,7 @@ import org.jetbrains.skiko.SkikoRenderDelegate
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.initWindowsMainThread
 import org.jetbrains.skiko.setWindowsImeCaretProvider
+import org.jetbrains.skiko.setWindowsImeReconvertProvider
 import org.jetbrains.skiko.setWindowsImeTextProvider
 import org.jetbrains.skiko.win32Log
 import com.composekn.windows.internal.winlog
@@ -188,6 +190,13 @@ class WindowsComposeApplication(
             )
         }
 
+    /**
+     * 自检用：「重新转换」的范围映射（见 [WindowsTextInputService.mapReconvertRange]）。
+     * 返回文档里的 `[start, end)`，映射不了返回 null。
+     */
+    fun mapReconvertRange(text: String, targetOffsetInText: Int, targetLen: Int): IntArray? =
+        textInputService.mapReconvertRange(text, targetOffsetInText, targetLen)
+
     /** 推进 Main dispatcher / 重组队列（离屏驱动时每帧调用一次）。 */
     fun pumpDispatchers() = flushMainUIDispatcher()
 
@@ -237,6 +246,11 @@ class WindowsComposeApplication(
         // IME 的文档馈送 / 重新转换：输入法通过 WM_IME_REQUEST 问「文档 + 组字范围」
         // 时会**同步**回调这里（上下文候选排序、重转换都要它）。
         setWindowsImeTextProvider { textInputService.imeDocument() }
+        // 「重新转换」确认时：把输入法发来的范围映射回文档偏移 —— 映射不了就返回 null，
+        // C 侧会拒绝这次重转换（宁可"不生效"，也不要重复文本）。
+        setWindowsImeReconvertProvider { text, targetOffset, targetLen ->
+            textInputService.mapReconvertRange(text, targetOffset, targetLen)
+        }
         // 文本会话结束 -> 取消 IME 组字（否则候选窗会赖在屏幕上）。
         textInputService.onSessionEnded = { window.imeCancelComposition() }
         win32Log("app: scene + content ready, starting window loop")
@@ -289,6 +303,16 @@ class WindowsComposeApplication(
             is WindowsEvent.ImeStartEvent -> {
                 // Compose 侧的文本会话在输入框聚焦时就开了，这里不需要额外动作。
                 winlog("event: IME 组字开始")
+            }
+            is WindowsEvent.ImeReconvertSelectEvent -> {
+                // 「重新转换」：先把原文本选中，随后那段组字（setComposingText）会替换它。
+                // 不做这一步的话，组字会插到光标处 —— 原文还在，文本就重复了。
+                val commands = listOf(SetSelectionCommand(event.start, event.end))
+                if (!textInputService.applyEditCommands(commands)) {
+                    winlog("event: 重转换选区被丢弃（没有活动文本会话）: ${event.start}..${event.end}")
+                } else {
+                    winlog("event: 重转换 -> 选中 ${event.start}..${event.end} 等待组字替换")
+                }
             }
             is WindowsEvent.ImeCompositionEvent,
             is WindowsEvent.ImeCommitEvent,

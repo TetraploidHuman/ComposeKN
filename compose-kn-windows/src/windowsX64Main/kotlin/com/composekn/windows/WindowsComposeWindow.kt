@@ -321,6 +321,10 @@ class WindowsComposeWindow(
                     win.imePopText()
                     onEvent(WindowsEvent.ImeEndEvent)
                 }
+                Win32Event.IME_RECONVERT_SELECT -> {
+                    win.imePopText()   // 这条不带文本，但仍然配对弹一个（FIFO 约定）
+                    onEvent(WindowsEvent.ImeReconvertSelectEvent(start = raw.a, end = raw.b))
+                }
                 Win32Event.SIZE -> onEvent(WindowsEvent.ResizeEvent(width = raw.a, height = raw.b))
                 Win32Event.MOVE -> onEvent(WindowsEvent.MoveEvent(x = raw.x.toInt(), y = raw.y.toInt()))
                 Win32Event.CLOSE -> onEvent(WindowsEvent.CloseEvent)
@@ -416,6 +420,10 @@ class WindowsComposeWindow(
      */
     fun imeTestReconvert(kind: Int, bufferChars: Int): IntArray? =
         win32Window?.imeTestReconvert(kind, bufferChars)
+
+    /** 自检用：合成一条 `IMR_CONFIRMRECONVERTSTRING`；true = 我们接受了这次重转换。 */
+    fun imeTestConfirmReconvert(text: String, targetOffset: Int, targetLen: Int): Boolean =
+        win32Window?.imeTestConfirmReconvert(text, targetOffset, targetLen) ?: false
 
     /**
      * Begin window move (for title bar drag).

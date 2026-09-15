@@ -98,19 +98,20 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (121 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (118 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (129 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (126 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
-           的位置和像素），不开窗口（90 条）
+           的位置和像素）、**重新转换的选区握手**，不开窗口（94 条）
   window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、
            IME 文本通道、**WM_IME_REQUEST 候选窗锚点（组字中塌缩到组字起点）**、
            **IMM32 文档馈送（IMR_DOCUMENTFEED 的答复结构和两段式约定）**、
-           **组字字体（IMR_COMPOSITIONFONT）**、干净退出、
+           **组字字体（IMR_COMPOSITIONFONT）**、
+           **重新转换（IMR_CONFIRMRECONVERTSTRING 的接受/拒绝 + 原文本不重复）**、干净退出、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
-           动画按刷新率节流）（31 条）
-  all    = 两者都跑（118 条断言）
+           动画按刷新率节流）（35 条）
+  all    = 两者都跑（126 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个

@@ -9,6 +9,7 @@ import androidx.compose.ui.text.input.EditCommand
 import com.composekn.windows.internal.winlog
 import org.jetbrains.skiko.WindowsImeDocument
 import kotlinx.coroutines.awaitCancellation
+import kotlin.math.abs
 
 /**
  * Text input service for Windows platform.
@@ -157,6 +158,57 @@ internal class WindowsTextInputService {
             compositionStart = composition?.start ?: -1,
             compositionEnd = composition?.end ?: -1,
         )
+    }
+
+    /**
+     * 「重新转换」：把输入法发来的 (字符串, 它在字符串里的目标范围) 映射回文档偏移。
+     *
+     * 输入法发来的东西有两种形态，两种都用"在文档里找这段字符串"解决：
+     *
+     *   a) 它把我们上次交给它的**那段窗口**原样发回来（最常见）：整个字符串就是文档的
+     *      一段，目标范围相对它；
+     *   b) 它只发来要重转换的那一小段（通常等于选区）。
+     *
+     * 候选按优先级挑（同优先级选离光标最近的）：
+     *   1. 与当前选区**逐字相等**的那一处（用户先选中再触发重转换 = 标准操作）；
+     *   2. 紧挨在光标左边结束的那一处（没选中，就在光标前重转换）；
+     *   3. 其它出现位置。
+     *
+     * 找不到、或范围越界 → 返回 null。C 侧据此**拒绝**这次重转换（输入法取消），
+     * 我们绝不在不能确定的情况下动文本 —— 宁可"重转换不生效"，也不要弄出重复文本。
+     */
+    fun mapReconvertRange(text: String, targetOffsetInText: Int, targetLen: Int): IntArray? {
+        val request = activeRequest ?: return null
+        if (text.isEmpty() || targetLen <= 0) return null
+        if (targetOffsetInText < 0 || targetOffsetInText + targetLen > text.length) return null
+        val value = request.value()
+        val doc = value.text
+        if (doc.isEmpty()) return null
+        val caret = value.selection.max.coerceIn(0, doc.length)
+        val selStart = value.selection.min.coerceIn(0, doc.length)
+        val selEnd = value.selection.max.coerceIn(0, doc.length)
+        var best = -1
+        var bestScore = Int.MAX_VALUE
+        var index = doc.indexOf(text)
+        while (index >= 0) {
+            val end = index + text.length
+            val rank = when {
+                selEnd > selStart && index == selStart && end == selEnd -> 0
+                end == caret -> 1
+                else -> 2
+            }
+            val score = rank * 1_000_000 + abs(index - caret)
+            if (score < bestScore) {
+                bestScore = score
+                best = index
+            }
+            index = doc.indexOf(text, index + 1)
+        }
+        if (best < 0) return null
+        val start = best + targetOffsetInText
+        val end = start + targetLen
+        if (start < 0 || end > doc.length) return null
+        return intArrayOf(start, end)
     }
 
     /**

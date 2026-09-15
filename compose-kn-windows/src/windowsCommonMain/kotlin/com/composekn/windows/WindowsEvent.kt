@@ -104,6 +104,16 @@ sealed class WindowsEvent {
     object ImeEndEvent : WindowsEvent()
 
     /**
+     * 「重新转换」（再変換）：输入法确认了要重转换的范围，应用要先把
+     * `[start, end)` 这段**原文本变成选区**，接下来那段组字才会替换它
+     * （不做这一步就会变成"原文还在、组字又插一份"）。
+     *
+     * 范围是文档坐标下的 UTF-16 code unit 偏移（由 C 侧的映射器给出，映射不了时
+     * C 侧根本不会答应这次重转换，所以这里拿到的一定是能对上的范围）。
+     */
+    data class ImeReconvertSelectEvent(val start: Int, val end: Int) : WindowsEvent()
+
+    /**
      * Window resize event.
      */
     data class ResizeEvent(

@@ -2011,6 +2011,13 @@ finished normally` 之后）以 `0xC0000005` 退出（`!!! UNHANDLED EXCEPTION`�
 在这台机器上无法进一步定位，也没有在真机复现过。**不要**把它和本次改动混为一谈，但也不装作
 它不存在。
 
+> **v0.5.1 时做过一次 A/B（同一台机器、交替跑 3 轮）**：v0.5.0 的 exe 也是 3 次里崩 2 次、
+> v0.5.1 是 3 次里崩 1 次 —— 崩溃位置和签名完全一样（都在 `app: window loop finished
+> normally` 之后、写地址是个奇数），**与 v0.5.1 的改动无关**，就是这个 Wine 侧的退出期
+> 不稳定。`logic` / `window` 分阶段跑（也就是 `scripts/test-windows-native.sh` 与真机的
+> 跑法）在各个版本上一直干净。`all` 只是一次性跑完两个阶段的便捷入口，看到 rc=5 先重跑
+> 一次；判定功能请用分阶段跑。
+
 ### 17.18 IMM32 补完（一）：文档馈送 / 重转换数据通道 / 组字字体 / 候选窗逐项（v0.5.0）
 
 v0.4.12 之后按计划补 IMM32 剩下的几块。这一版的原则：**能自检的都自检；只能在真机上验的，
@@ -2069,3 +2076,70 @@ window/ime-document-feed-two-phase        # 只给 32 字节 -> handled=1 且 dw
 1. 打字时**候选词质量**有没有变化（变了先 `COMPOSEKN_IME_DOCUMENTFEED=0` 对比）；
 2. 组字/提交/候选窗锚点是否照旧（回归）；
 3. "重新转换"目前**不工作**（明确拒绝），属已知状态。
+
+### 17.19 IMM32 补完（二）：把「重新转换」真正做出来 —— 选区握手（v0.5.1）
+
+§17.18 里"重新转换"只做了数据通道（文档馈送 + `RECONVERTSTRING` 的答复），确认那一步是
+**明确拒绝**的。这一版把它补上。
+
+#### 为什么需要"选区握手"
+
+IME 的再変換流程：
+
+1. 应用把文档 + 目标范围交给输入法（`IMR_DOCUMENTFEED`/`IMR_RECONVERTSTRING`，见 §17.18）；
+2. 输入法发 `IMR_CONFIRMRECONVERTSTRING` 确认它要重转换的范围；
+3. **应用把这段原文本变成选区**（这一步就是"握手"）；
+4. 输入法开一段组字；Compose 的 `setComposingText` **替换掉选区** —— 原文被组字接管，
+   用户此时选候选词改的就是原文。
+
+少了第 3 步，组字会插在光标处：**原文还在、又插一份**，文本重复。
+
+#### 安全策略：对不上就拒绝（宁可"不生效"，也不要重复文本）
+
+映射在 Kotlin 侧做（只有它知道文档）。输入法发回来的字符串有两种形态，都用"在文档里找这段
+字符串"解决：
+
+* a) 它把我们上次给它的**那段窗口**原样发回来（最常见）：整串就是文档的一段；
+* b) 它只发来要重转换的那一小段（通常等于选区）。
+
+候选按优先级挑（同级取离光标最近的）：①与当前选区**逐字相等**的那一处（先选中再触发重转换
+= 标准操作）；②紧挨光标左边结束的那一处；③其它出现位置。**找不到 → 返回 null → C 侧拒绝**
+这次重转换（输入法取消，我们一个字都不动）。
+
+事件顺序也是协议的一部分：C 侧在确认时推一条 `IME_RECONVERT_SELECT`（范围放在事件结构体的
+`a`/`b`；仍然配对一个空串，保持"事件 ↔ 文本"FIFO 一一对应），它**排在**输入法随后发的组字
+事件之前 → Kotlin 侧先 `SetSelectionCommand` 再 `setComposingText`，正好是 IME 要求的顺序。
+
+#### 自检（新增 8 条，logic 90→94、window 31→35）
+
+逻辑阶段（纯事件层，文档「你好hao」）：
+
+```
+ime/reconvert-range-maps-to-document        # 「hao」-> [2,5)
+ime/reconvert-range-refuses-unknown-text    # 文档里没有的字符串 -> null（拒绝）
+ime/reconvert-composition-replaces-original # 握手后的组字：文本原地不变（不重复）
+ime/reconvert-commit-replaces-original      # 提交转换结果：原文本被替换 -> 「你好好」
+```
+
+window 阶段（走真实 `WM_IME_REQUEST(IMR_CONFIRMRECONVERTSTRING)`）：
+
+```
+window/ime-reconvert-confirm-accepts-known-text    # 文档「CK」+ 目标 [0,2) -> 接受
+window/ime-reconvert-confirm-refuses-unknown-text  # 「zzz」-> 拒绝
+window/ime-reconvert-composition-no-duplicate
+window/ime-reconvert-commit-no-duplicate
+```
+
+C 侧日志（Wine 实测，就是这两行 + 事件落地）：
+
+```
+ime: IMR_CONFIRMRECONVERTSTRING dwStrLen=2 comp=2@0 target=2@0 -> 接受[0,2)
+ime: IMR_CONFIRMRECONVERTSTRING dwStrLen=3 comp=3@0 target=3@0 -> 拒绝[0,0)
+event: 重转换 -> 选中 0..2 等待组字替换
+```
+
+#### 仍然要真机验
+
+映射规则是**按协议推的**（本机没有输入法能驱动真流程）。真机上如果重转换不生效，日志里会有
+明确一行 `IMR_CONFIRMRECONVERTSTRING … -> 接受[..]/拒绝[..]`：出现"拒绝"就说明输入法发回来的
+形态不在上面三种之内 —— 把那一行发我，照着实测数据扩规则。

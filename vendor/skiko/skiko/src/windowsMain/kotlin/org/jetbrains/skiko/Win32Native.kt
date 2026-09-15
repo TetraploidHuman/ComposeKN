@@ -377,6 +377,12 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      * 自检用：发一条 `IMR_DOCUMENTFEED`(kind=0) / `IMR_RECONVERTSTRING`(1) /
      * `IMR_COMPOSITIONFONT`(2)，返回 C 侧填好的字段（见 `composekn_win32_ime_test_reconvert`）。
      */
+    /** 自检用：合成一条 `IMR_CONFIRMRECONVERTSTRING`；true = 我们接受了这次重转换。 */
+    fun imeTestConfirmReconvert(text: String, targetOffset: Int, targetLen: Int): Boolean =
+        text.useCString { utf8 ->
+            composekn_win32_ime_test_confirm_reconvert(native, utf8, targetOffset, targetLen) != 0
+        }
+
     fun imeTestReconvert(kind: Int, bufferChars: Int): IntArray? = memScoped {
         val out = allocArray<IntVar>(12)
         if (composekn_win32_ime_test_reconvert(native, kind, bufferChars, out) == 0) {
@@ -445,6 +451,14 @@ private external fun composekn_win32_ime_test_reconvert(
     kind: Int,
     bufferChars: Int,
     out: CPointer<IntVar>,
+): Int
+
+@SymbolName("composekn_win32_ime_test_confirm_reconvert")
+private external fun composekn_win32_ime_test_confirm_reconvert(
+    window: COpaquePointer?,
+    utf8: CPointer<ByteVar>,
+    targetOffsetInText: Int,
+    targetLen: Int,
 ): Int
 
 @SymbolName("composekn_win32_set_ime_caret_provider")
@@ -554,6 +568,45 @@ private external fun composekn_win32_set_ime_text_provider(
     user: COpaquePointer?,
 )
 
+private var imeReconvertProvider: ((String, Int, Int) -> IntArray?)? = null
+
+/**
+ * C 侧入参：IME 发来的字符串 + 它在字符串里的目标范围；出参：文档偏移。
+ * 返回 1 = 映射成功。
+ */
+private val imeReconvertCallback = staticCFunction<
+    COpaquePointer?, CPointer<UShortVar>, Int, Int, Int,
+    CPointer<IntVar>, CPointer<IntVar>, Int
+    > { _, text, textLen, targetOffset, targetLen, outStart, outEnd ->
+    if (textLen <= 0) return@staticCFunction 0
+    val chars = CharArray(textLen) { i -> (text + i)!!.pointed.value.toInt().toChar() }
+    val mapped = imeReconvertProvider?.invoke(chars.concatToString(), targetOffset, targetLen)
+    if (mapped == null || mapped.size < 2) return@staticCFunction 0
+    outStart.pointed.value = mapped[0]
+    outEnd.pointed.value = mapped[1]
+    1
+}
+
+/**
+ * 注册「重新转换范围映射器」：IME 确认要重转换的范围时会**同步**回调它，
+ * 返回 `intArrayOf(文档起始, 文档结束)` 才会答应这次重转换（返回 null = 拒绝，
+ * 输入法会取消重转换，我们绝不动文本）。
+ *
+ * 传 null 注销。
+ */
+fun setWindowsImeReconvertProvider(provider: ((String, Int, Int) -> IntArray?)?) {
+    imeReconvertProvider = provider
+    composekn_win32_set_ime_reconvert_provider(
+        if (provider == null) null else imeReconvertCallback, null,
+    )
+}
+
+@SymbolName("composekn_win32_set_ime_reconvert_provider")
+private external fun composekn_win32_set_ime_reconvert_provider(
+    callback: COpaquePointer?,
+    user: COpaquePointer?,
+)
+
 @SymbolName("composekn_win32_dpi_scale")
 internal external fun composekn_win32_dpi_scale(window: COpaquePointer?): Float
 
@@ -625,6 +678,12 @@ data class Win32Event(
         const val IME_UPDATE = 15
         const val IME_COMMIT = 16
         const val IME_END = 17
+
+        /**
+         * 「重新转换」（再変換）的准备：范围在 a = 起始、b = 结束（UTF-16 code unit，
+         * 文档坐标）。收到后要先把这段原文本选中，随后的组字才会替换它。
+         */
+        const val IME_RECONVERT_SELECT = 18
     }
 }
 
