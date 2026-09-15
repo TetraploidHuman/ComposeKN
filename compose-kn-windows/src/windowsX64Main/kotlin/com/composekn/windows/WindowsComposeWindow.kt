@@ -10,6 +10,7 @@ import org.jetbrains.skiko.win32Log
 import org.jetbrains.skiko.initWindowsMainThread
 import org.jetbrains.skiko.currentNanoTime
 import org.jetbrains.skiko.setMainUIDispatcherWakeUpHandler
+import org.jetbrains.skiko.setWindowsImeCaretProvider
 import com.composekn.windows.internal.MOD_ALT
 import com.composekn.windows.internal.MOD_CTRL
 import com.composekn.windows.internal.MOD_SHIFT
@@ -216,6 +217,9 @@ class WindowsComposeWindow(
             // 先摘掉回调再拆窗口：它们会 PostMessage（窗口没了就成了野指针）。
             layer.setRenderRequestHandler(null)
             setMainUIDispatcherWakeUpHandler(null)
+            // IME 光标回调也一样：它是注册在 C 侧的**全局**回调，窗口拆掉之后不能再被调用
+            // （真机上 WM_IME_REQUEST 可能在销毁过程中还剩一条）。
+            setWindowsImeCaretProvider(null)
             layer.detach()
             win.close()
         }
@@ -296,6 +300,27 @@ class WindowsComposeWindow(
                         )
                     )
                 }
+                // IME 的四条事件每一条都**必须**配对弹走一个字符串（C 侧是严格
+                // 一一对应的 FIFO，不管这条事件带不带文本）—— 漏弹一次，后面的
+                // 组字串/提交串就会整体错位一格。
+                Win32Event.IME_START -> {
+                    win.imePopText()
+                    onEvent(WindowsEvent.ImeStartEvent)
+                }
+                Win32Event.IME_UPDATE -> {
+                    val text = win.imePopText() ?: ""
+                    onEvent(WindowsEvent.ImeCompositionEvent(text))
+                }
+                Win32Event.IME_COMMIT -> {
+                    val text = win.imePopText()
+                    if (text != null && text.isNotEmpty()) {
+                        onEvent(WindowsEvent.ImeCommitEvent(text))
+                    }
+                }
+                Win32Event.IME_END -> {
+                    win.imePopText()
+                    onEvent(WindowsEvent.ImeEndEvent)
+                }
                 Win32Event.SIZE -> onEvent(WindowsEvent.ResizeEvent(width = raw.a, height = raw.b))
                 Win32Event.MOVE -> onEvent(WindowsEvent.MoveEvent(x = raw.x.toInt(), y = raw.y.toInt()))
                 Win32Event.CLOSE -> onEvent(WindowsEvent.CloseEvent)
@@ -353,6 +378,22 @@ class WindowsComposeWindow(
      */
     fun setTitle(title: String) {
         win32Window?.setTitle(title)
+    }
+
+    /** 走过的 IME 消息条数（0 = 系统没发 IME 消息；自检/真机排查用）。 */
+    val imeMessageCount: Int get() = win32Window?.imeMessageCount ?: 0
+
+    /** 当前是否正在组字。 */
+    val imeComposing: Boolean get() = win32Window?.imeComposing ?: false
+
+    /** 取消正在进行的 IME 组字（文本会话结束时调用）。 */
+    fun imeCancelComposition() {
+        win32Window?.imeCancelComposition()
+    }
+
+    /** 自检用：注入一条「IME 提交」事件（Wine 里没有真 IME）。 */
+    fun imeTestCommit(text: String) {
+        win32Window?.imeTestCommit(text)
     }
 
     /**

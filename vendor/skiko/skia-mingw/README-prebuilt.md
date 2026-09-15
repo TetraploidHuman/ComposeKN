@@ -21,7 +21,7 @@ ABI `_ZN8SkCanvas8drawRect...` 根本对不上）。
 ```
 skia-mingw-m150-b8e40a7c49/
 ├── manifest.json      # skia tag/commit、gcc/nixpkgs 版本、gpu_backends、每个文件的 sha256
-├── icudtl.dat         # Skia 的 ICU 数据（必须放在 exe 同目录）
+├── icudtl.dat         # Skia 的 ICU 数据（**构建期**被 .incbin 编进 exe，运行时不需要它）
 ├── libs/              # 22 个 Skia 静态库（libskia.a / libicu.a / ...）
 ├── runtime/           # 链接期需要的运行期/导入库
 │   ├── libmcfgthread.a    # nixpkgs mingw 工具链的线程库（libstdc++ 内联代码引用它）
@@ -100,5 +100,5 @@ sha256sum …/skia-mingw-<tag>.tar.zst | cut -d' ' -f1 > vendor/skiko/skia-mingw
 | shim 里的 `_onexit` | konan 的 `crt2.o` 里 `atexit` 调 `_onexit`，而 UCRT 导入库里的 `_onexit` 又回调 `atexit` → 无限递归，进程在 `__do_global_ctors` 阶段静默退出（无输出、退出码 1）。shim 必须排在所有 UCRT 导入库之前 |
 | `libmsvcrt.a` / `libucrtbase.a` 里删掉 `_onexit` 成员 | 同上，双保险 |
 | `libmcfgthread.a` | nixpkgs mingw 工具链用 mcfgthread 做线程模型，Skia 的内联代码会引用 `__mcfgthread_*` |
-| `icudtl.dat` | Skia 的 ICU 数据文件，运行时从 exe 同目录加载；缺了它文本排版直接失败 |
+| `icudtl.dat` | Skia 的 ICU 数据文件。**构建期**需要它（链接时用 `.incbin` 编进 exe 的 .rdata，见 `skiko/src/windowsMain/cpp/win32/win32_icu.cc`）；构建产物 exe 运行时不再需要同目录数据文件 |
 | **不要**给链接加 `-L<mingw lib dir>` | 否则 `-lmingw32` 会解析到精简版 `libmingw32.a`，缺 `mingw_app_type` / `__security_init_cookie` 等 7 个符号（konan 自带 sysroot 那份才有）。包里的库都用绝对路径给出 |

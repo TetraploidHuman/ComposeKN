@@ -18,7 +18,8 @@
 #   --only=<phase>  只跑某个阶段: logic|window|screenshot
 #
 # 环境变量：
-#   SKIA_MINGW_PREBUILT=<dir>  预编译 mingw-Skia 包（跳过 Skia 构建，icudtl.dat 从这里取）
+#   SKIA_MINGW_PREBUILT=<dir>  预编译 mingw-Skia 包（跳过 Skia 构建；icudtl.dat 在链接期被
+#                              直接编进 exe，测试运行时**不需要**同目录数据文件）
 #   SKIA_MINGW_WORK=<dir>      从源码构建时的 Skia 工作目录
 set -euo pipefail
 
@@ -29,11 +30,9 @@ SKIA_WORK="${SKIA_MINGW_WORK:-/mnt/hdd2/KtLLM/skia-mingw}"
 # 预编译包模式（CI 用，见 vendor/skiko/skia-mingw/README-prebuilt.md）：
 # 不构建 Skia，直接用下载好的静态库；icudtl.dat 也在包里。
 PREBUILT="${SKIA_MINGW_PREBUILT:-}"
-if [ -n "$PREBUILT" ]; then
-    ICUDTL="$PREBUILT/icudtl.dat"
-else
-    ICUDTL="$SKIA_WORK/skia/out/mingw/icudtl.dat"
-fi
+# 注意：这里**没有** icudtl.dat 的路径 —— ICU 数据已经在链接期编进 exe 了
+# （见 scripts/../vendor/skiko/skia-mingw/build-windows-native-demo.sh），
+# 测试必须有本事证明「只拷 exe 也能跑」，所以运行目录里故意不放数据文件。
 RUN_DIR="${COMPOSEKN_WINTEST_DIR:-/tmp/composekn-wintest}"
 export WINEPREFIX="${WINEPREFIX:-/mnt/hdd2/KtLLM/wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"
@@ -75,14 +74,14 @@ fi
 [ -n "$EXE_OVERRIDE" ] && EXE="$EXE_OVERRIDE"
 [ -f "$EXE" ] || { echo "找不到 $EXE（先用 build-windows-native-demo.sh 构建，或用 --exe= 指定）" >&2; exit 1; }
 
-# exe 必须和 icudtl.dat 同目录（SkLoadICU 找不到数据文件会导致文本排版失败）
+# 只拷 exe：**故意不**放 icudtl.dat。
+#
+# ICU 数据现在已经用 .incbin 编进 exe 了（见 vendor/skiko/skia-mingw/
+# build-windows-native-demo.sh 与 skiko/.../win32_icu.cc），所以这里放一份数据文件
+# 反而会掩盖「嵌入失效」—— 测试必须证明 exe 单文件就能跑。
 mkdir -p "$RUN_DIR"
 cp -f "$EXE" "$RUN_DIR/windows-demo.exe"
-if [ -f "$ICUDTL" ]; then
-    cp -f "$ICUDTL" "$RUN_DIR/icudtl.dat"
-else
-    info "警告: 找不到 icudtl.dat（$ICUDTL），文本排版可能失败"
-fi
+rm -f "$RUN_DIR/icudtl.dat"
 EXE_RUN="$RUN_DIR/windows-demo.exe"
 
 # wine 可执行文件的位置在不同发行版/包名之间来回变：
@@ -126,6 +125,8 @@ start_xvfb() {
 run_phase() {   # $1 = 阶段名, $2 = COMPOSEKN_SELFTEST 取值, $3 = 是否需要 X
     local name="$1" mode="$2" need_x="$3" log="$RUN_DIR/$1.log"
     info "阶段 $name (COMPOSEKN_SELFTEST=$mode)"
+    # 启动日志是 append 模式：先删掉，免得上一阶段的旧行让后面的断言假通过。
+    rm -f "$RUN_DIR/composekn-startup.log"
     [ "$need_x" = "1" ] && start_xvfb
     set +e
     # 每个阶段都加硬超时：自检挂住时立刻失败并打出「最后跑到哪一条断言」，
@@ -159,6 +160,24 @@ run_phase() {   # $1 = 阶段名, $2 = COMPOSEKN_SELFTEST 取值, $3 = 是否需
 # ------------------------------------------------- 1+2. logic + 离屏渲染
 if [ -z "$ONLY" ] || [ "$ONLY" = "logic" ]; then
     run_phase logic logic 0
+fi
+
+# ------------------------------------------------- 2.5 ICU 数据内嵌（单文件运行）
+#
+# 文本排版依赖 ICU 数据（10MB）。以前它是 exe 同目录的 icudtl.dat，发布物必须是
+# 两个文件、单独拷走 exe 就会崩；现在数据编在 exe 里（.incbin + 覆盖版 SkLoadICU）。
+# 这里直接查启动日志里的那一行 —— 它来自 win32_icu.cc，只有"真的用上内嵌数据"才会打印。
+if [ -z "$ONLY" ] || [ "$ONLY" = "logic" ]; then
+    STARTUP_LOG="$RUN_DIR/composekn-startup.log"
+    if grep -q 'icu: 使用内嵌数据初始化成功' "$STARTUP_LOG" 2>/dev/null; then
+        pass "icu: 内嵌数据初始化成功（exe 单文件可跑，无需 icudtl.dat）"
+    else
+        fail "icu: 启动日志里没有『使用内嵌数据初始化成功』（$STARTUP_LOG）—— 文本排版可能已经退回读文件"
+        grep -i 'icu\|SkLoadICU' "$STARTUP_LOG" 2>/dev/null | head -5 || true
+    fi
+    if [ -e "$RUN_DIR/icudtl.dat" ]; then
+        fail "icu: 运行目录里出现了 icudtl.dat（不该有：数据应当只在 exe 里）"
+    fi
 fi
 
 # ----------------------------------------------------------- 3. 真实窗口

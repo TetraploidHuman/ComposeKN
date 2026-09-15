@@ -419,6 +419,9 @@ class SelfTestReport {
 
     fun section(title: String) = line("SELFTEST --- $title ---")
 
+    /** 只打印一行诊断，**不计入**断言（真机排查时用）。 */
+    fun info(text: String) = line("SELFTEST info : $text")
+
     fun check(name: String, ok: Boolean, detail: String = "") {
         checks++
         if (ok) {
@@ -746,6 +749,56 @@ private fun renderChecks(report: SelfTestReport) {
     driver.render(800, 600, density = d, frames = 3)
     report.checkEquals("selection/backspace-deletes-selection", "", probe.text)
 
+    // 2.7b IME（组字 / 提交）
+    //
+    // 走的是**真实路径**：WindowsEvent.ImeXxx -> WindowsComposeApplication.handleEvent
+    // -> WindowsTextInputService -> Compose 的文本输入层（不是自己造一个假的）。
+    // 真机上的 IME 消息由 win32_window.cc 的 WM_IME_* 拆出来，Wine 里没有输入法，
+    // 所以这里从「事件已经到达 Kotlin」这一段开始测；C 侧那一段见 window 阶段的
+    // window/ime-commit-through-c-channel。
+    click(app, 700, contentTop + 44)  // 聚焦主输入框、光标到末尾
+    driver.render(800, 600, density = d, frames = 4)
+    probe.setText("")
+    driver.render(800, 600, density = d, frames = 4)
+
+    app.dispatchEvent(WindowsEvent.ImeStartEvent)
+    app.dispatchEvent(WindowsEvent.ImeCompositionEvent("ni hao"))
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals("ime/composing-text-visible", "ni hao", probe.text)
+    report.check(
+        "ime/composing-region-set",
+        probe.value.composition != null,
+        "composition=${probe.value.composition}",
+    )
+    app.dispatchEvent(WindowsEvent.ImeCommitEvent("你好"))
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals("ime/commit-replaces-composing-text", "你好", probe.text)
+    report.check(
+        "ime/commit-clears-composing-region",
+        probe.value.composition == null,
+        "composition=${probe.value.composition}",
+    )
+
+    // 组字被清空（输入法里按 ESC / 把拼音删光）：不能动已经上屏的文本
+    app.dispatchEvent(WindowsEvent.ImeCompositionEvent("hao"))
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    report.checkEquals("ime/second-composition-appends", "你好hao", probe.text)
+    app.dispatchEvent(WindowsEvent.ImeEndEvent)
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    report.check(
+        "ime/end-clears-composing-region",
+        probe.value.composition == null,
+        "composition=${probe.value.composition}",
+    )
+    report.checkEquals("ime/end-keeps-committed-text", "你好hao", probe.text)
+    // 清干净，后面的弹层/菜单断言依赖的背景不受影响
+    probe.setText("")
+    driver.render(800, 600, density = d, frames = 4)
+
     // 2.8 弹层（Popup）：独立图层必须画在同一张 surface 上，位置和尺寸都要对得上。
     // 弹层内容是唯一的亮紫色，於是「包围盒」就等于「弹层的位置 + 尺寸」。
     val noPopup = driver.render(800, 600, density = d, frames = 4)
@@ -991,7 +1044,27 @@ private fun runWindowTests(report: SelfTestReport) {
             report.checkEquals("window/ctrl-x-copies", "CK", app.window.nativeWindow?.clipboard)
             ctrlKey(app, 0x56) // Ctrl+V（粘贴）
         }
+        if (frame == 70) {
+            // IME：Wine 里没有真输入法（装不了），所以用 C 侧测试钩子注入一条「提交」
+            // 事件 —— 它走的是**和真实 WM_IME_COMPOSITION(GCS_RESULTSTR) 完全一样的
+            // 路径**：C 侧队列 -> UTF-8 文本通道 -> Kotlin Win32Event.IME_COMMIT ->
+            // WindowsEvent.ImeCommitEvent -> Compose 文本输入层。
+            // 于是「C 到 Kotlin 的字符串通道有没有接错」在自动化里是能被断言的。
+            // （注意：此时文本框里是 Ctrl+V 粘贴出来的 "CK"，光标在末尾。）
+            //
+            // 连注两条：C 侧「事件队列」和「文本队列」是两个 FIFO，必须严格一一对应。
+            // 只注一条的话错位一格也看不出来；两条不同内容就能把错位抓出来
+            // （错位时第一条文本会被当成第二条事件的文本）。
+            app.window.imeTestCommit("中")
+        }
+        if (frame == 72) {
+            app.window.imeTestCommit("文")
+        }
         if (frame == 74) {
+            report.checkEquals("window/ime-commit-through-c-channel", "CK中文", probe.text)
+            // 把注入的两个字符删掉，让后面的断言仍然看到 "CK"
+            keyPress(app, 0x08) // VK_BACK
+            keyPress(app, 0x08) // 两次：注入了「中文」两个字
             // 最大化回归（真机 bug）：无边框窗口客户区 = 窗口矩形，而 Windows 最大化
             // 会把窗口矩形按「不可见缩放边框」扩到屏幕外 → 客户区超出显示器，最右侧的
             // 关闭按钮被裁掉一半，且**只在最大化时**出现。
@@ -1009,6 +1082,12 @@ private fun runWindowTests(report: SelfTestReport) {
                 "window/touch-channel-enabled",
                 app.window.nativeWindow?.touchEnabled == true,
                 "touch=${app.window.nativeWindow?.touchEnabled}",
+            )
+            // IME 诊断（不作为失败条件）：Wine 里没有输入法，imeMessageCount 通常就是
+            // 注入的那条；真机上敲中文时这里应当持续增长 —— 用户排查时看这一行。
+            report.info(
+                "window/ime-diagnostics imeMessages=${app.window.imeMessageCount} " +
+                    "composing=${app.window.imeComposing} text=${probe.text}",
             )
         }
         if (frame == 78) {

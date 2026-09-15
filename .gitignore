@@ -14,3 +14,6 @@ vendor/skiko/skiko/dependencies/
 *.log
 hs_err_pid*.log
 .idea/
+
+# 构建期生成：icudtl.dat 内嵌数据（见 vendor/skiko/skia-mingw/build-windows-native-demo.sh）
+vendor/skiko/skiko/src/windowsMain/cpp/win32/win32_icu_data.generated.cpp

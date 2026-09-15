@@ -1584,3 +1584,155 @@ GALLERY-STATS: fps=59.8 frames/s=60 recompose(...)=+0/+0/+60/+60
 全没了），Kotlin 编译报的是 `java.lang.StackOverflowError` —— 一度被误判成
 Gradle/daemon 抽风。教训：**每次改完立刻核对行数/字节数**（`wc -l -c`），
 异常增长就先 `git checkout --` 复原再重做；编译报 StackOverflowError 时先怀疑文件本身。
+
+### 17.11 「对齐缺口」收尾三件：光标形状 / 横向滚轮 / 默认系统标题栏（v0.4.5、v0.4.6）
+
+用户拍板「先把和 Compose 多平台对不上的地方补齐」。逐条查上游代码确认「这是缺口，
+不是我们该自己发明的东西」，再照着上游的形状补：
+
+1. **光标形状（PointerIcon）—— v0.4.5**
+   * 上游 skiko 的 `PlatformContext.setPointerIcon` 默认实现是**空的**
+     （`PlatformContext.skiko.kt: fun setPointerIcon(pointerIcon: PointerIcon) = Unit`）；
+     JVM 桌面在 `ComposeSceneMediator.desktop.kt` 里把它接到 AWT cursor 上。
+     也就是说「K/N 宿主必须自己接」，`clickable` 默认请求 Hand 这件事 Compose 侧完全没变。
+   * 实现：`WindowsPlatformContext` 覆写 `setPointerIcon` → `PointerIcon{Default,Hand,Text,
+     Crosshair}` 映射成 Win32 光标种类（0=箭头 1=手 2=文本I型 3=十字）。
+     C 侧 `WM_SETCURSOR` 在 `HTCLIENT` 时**每次**都 `SetCursor(当前种类)` 并返回 TRUE ——
+     箭头是**类**光标，不这样做鼠标一动系统就把形状覆盖回去。
+   * 坑：mingw 的 `IDC_*` 是 `MAKEINTRESOURCE()`（窄字符），不能直接喂 `LoadCursorW`
+     （编译期就报类型错），改用系统资源 id 数值重建宽字符版。
+2. **横向滚轮（WM_MOUSEHWHEEL）—— v0.4.5**
+   * 原来只处理 `WM_MOUSEWHEEL`，横滑完全没反应，Kotlin 侧 `deltaX` 还是写死的 0。
+   * 桥接约定：`e.b = 0` 纵向 / `1` 横向；Kotlin 侧据此把 `delta` 派发成
+     `MouseWheelEvent(deltaX/deltaY)`。
+3. **默认改用系统标题栏（对齐 `Window()`）—— v0.4.6**
+   * 用户问「自绘标题栏和系统标题栏有什么区别」，比较之后拍板**对齐 Compose JVM**：
+     `Window()` 默认**有**系统标题栏（NC 交给 OS），`undecorated = true` 才是自绘。
+     我们原来只有自绘 CSD 一种形态 —— 这条是**默认行为**的缺口，比"少个功能"更严重。
+   * C 侧 `composekn_win32_create(title, dpW, dpH, undecorated)`：
+     `undecorated = false`（新默认）时 `WM_NCCALCSIZE` / `WM_NCHITTEST` /
+     `WM_GETMINMAXINFO` 三处**全部交回 DefWindowProc**：系统标题栏、缩放边缘、最大化、
+     Aero Snap、系统菜单、UIA、**触摸拖动**全归 OS。
+   * 日志加 `composekn_win32_create: decorations=system|none(CSD)` 便于对账。
+   * 顺带消掉「触摸屏拖不动标题栏」（自绘标题栏只能靠 `WM_NCLBUTTONDOWN` 模态移动循环，
+     那条路在触摸下不可靠）。
+   * **连锁影响（踩到了）**：默认值一翻，自检里所有「CSD 标题栏几何」断言都得显式传
+     `undecorated = true`（漏传第 4 处构造 → `window/click-reaches-compose expected=1 actual=0`）；
+     截图阶段的「标题栏必须是 #2D2D30」也得改成模式无关的判定（系统标题栏颜色由 DWM 决定）。
+
+### 17.12 跨屏（不同缩放）窗口尺寸/密度失真（v0.4.7，真机反馈）
+
+用户反馈：「把窗口拖到另一个显示器，就几乎占满全屏了，好像是因为另一个显示器分辨率
+低一些，就按像素设置窗口大小了？」
+
+* 根因**不是**分辨率换算，而是 `WM_DPICHANGED` **从来没被处理**。代码里那句
+  「多显示器/不同缩放交给 WM_DPICHANGED」当时只是**注释，没实现分支**。于是跨屏时：
+  1. `window->dpi` 一直是旧屏的 → dp/密度按错的值算（用户日志里拖到另一块屏后
+     `PERF-BANNER` 仍然 `dpi=2.0`），UI 文字/控件大小不对；
+  2. 没应用窗口管理器给出的**建议矩形**（它保证「逻辑尺寸不变、物理尺寸随新缩放重算」），
+     窗口保持旧**物理**尺寸 → 在缩放更小/分辨率更低的屏上就显得几乎占满全屏。
+* 修复：`WM_DPICHANGED` 里 `window->dpi = HIWORD(wParam)` + 按 `lParam` 的建议矩形
+  `SetWindowPos`，并打一行 `win32: WM_DPICHANGED -> dpi=… rect=…`。
+* **Kotlin 侧一行没改**：`SkiaLayer.contentScale` 本来就是实时读
+  `composekn_win32_dpi_scale`，而 `SetWindowPos` 触发的 `WM_SIZE` 会让
+  `scene.density = effectiveDensity()` 跟着更新 —— 能在 C 侧对齐系统语义就别在
+  Compose 侧打补丁。
+* **Wine/Xvfb 造不出多屏+不同缩放**，所以这条只有「真机拖屏 + 看日志」能验；
+  我把日志打点做成了可对账的形式。
+
+### 17.13 中文输入法（IMM32）+ ICU 数据内嵌进 exe（v0.4.8，真机反馈驱动）
+
+两条需求，用户一起提的：
+
+> 「接下来开始做 IMM32，然后把 icudtl 那个文件整合进去啊，不然每次都要解压，很麻烦」
+
+#### (1) 中文输入法：为什么必须自己接 IMM32
+
+真机现象：「能输入进去，但是 Windows 的输入法候选词会卡死（卡死了之后还是能输入）」。
+
+* 我们的文本框是 **Compose 自绘**的，系统侧**没有 EDIT 控件**。于是：
+  * IME 通过 `WM_IME_REQUEST(IMR_QUERYCHARPOSITION)`（Win8+ 的 TSF 兼容层）问
+    「正在组字的那几个字符在屏幕上的矩形」—— 不回答的话它只能退到 `GetCaretPos()`，
+    而我们根本没有 caret，返回值恒为 (0,0)：候选窗因此卡在错误的位置/不再跟着输入更新；
+  * 组字串（GCS_COMPSTR）与提交串（GCS_RESULTSTR）也得自己用
+    `ImmGetCompositionStringW` 取出来交给 Compose 的文本输入层。
+* **这不是"造轮子"，是上游行为的一部分**：AWT 在 `awt_Component.cpp` 里正是这么接的，
+  而 Compose 桌面的 JVM 版本走的就是 AWT（`DesktopTextInputService2` +
+  `InputMethodListener`/`InputMethodRequests`）。我们只是把「AWT 的 InputMethodEvent」
+  换成「IMM32 拆出来的四种事件」。
+
+实现（C 侧 `win32_window.cc` 的 IME 段）：
+
+| Windows | 干什么 |
+|---|---|
+| `WM_IME_SETCONTEXT` | `lParam &= ~ISC_SHOWUICOMPOSITIONWINDOW`：组字预览由 Compose 画（`setComposingText` 自带下划线），但**候选窗必须保留** |
+| `WM_IME_STARTCOMPOSITION` | 置组字标志 + 把候选窗/组字窗摆到光标下方 |
+| `WM_IME_COMPOSITION` | 读 `GCS_RESULTSTR` → `IME_COMMIT`；读 `GCS_COMPSTR`（`lParam == 0` 时也重读）→ `IME_UPDATE`；每次都重摆候选窗 |
+| `WM_IME_ENDCOMPOSITION` | `IME_END`（Compose 侧 `finishComposingText`） |
+| `WM_IME_REQUEST` | `IMR_QUERYCHARPOSITION`（填 pt/cLineHeight/rcDocument，返回 TRUE）+ `IMR_CANDIDATEWINDOW`/`IMR_COMPOSITIONWINDOW`（回填位置） |
+| `WM_KEYDOWN` 带 `VK_PROCESSKEY` | 用 `ImmGetVirtualKey()` 取回原始键码再派发（AWT 同款），否则 Compose 只收到一串"未知按键" |
+
+* 文本通道：事件结构体只有 int32 字段，字符串走**与事件一一配对、FIFO** 的
+  `composekn_win32_ime_pop_text()`（UTF-8）→ `WindowsEvent.Ime{Start,Composition,Commit,End}`。
+* 候选窗定位：C 侧需要在**同步**回调里拿到「光标在客户区物理像素下的矩形」，
+  于是新增 `composekn_win32_set_ime_caret_provider()`（对照 AWT 的
+  `InputMethodRequests.getTextLocation`）。Kotlin 侧提供者 = 
+  `WindowsTextInputService.caretRectInRoot()`（= `request.focusedRectInRoot()`）。
+* Kotlin → Compose 的映射是**纯函数** `imeEditCommands()`，语义逐字对齐上游桌面：
+  `commitText(text, 1)` / `setComposingText(text, 1)` / `finishComposingText()`。
+  放在 `windowsCommonMain` 是为了能被 linuxX64 单测覆盖（`WindowsImeCommandsTest`，8 条）。
+* **双保险（防"插入两次"）**：不同 IME/兼容层行为不一致 —— 有的把提交串只放在
+  `GCS_RESULTSTR` 里，有的随后还把同样的字符作为 `WM_CHAR` 再送一遍（现在能打字就是
+  靠这条）。所以 C 侧在提交时记下这批字符（`pendingCommitChars`），随后**逐字符比对**
+  的 `WM_CHAR` 直接丢掉；对不上就立刻停止去重（不会误伤正常输入）。
+* 会话结束时（输入框失焦）调 `composekn_win32_ime_cancel_composition()`
+  （`ImmNotifyIME(NI_COMPOSITIONSTR, CPS_CANCEL)`），否则输入法会一直停在「组字中」、
+  候选窗留在屏幕上不消失 —— 这是「候选词卡死」的另一种表现。
+* 链接：`-limm32`（新增到 `WindowsNativeLinkerPlugin`）。
+* 诊断日志（真机排查全靠它）：`ime: WM_IME_*` / `ime: 提交 "…"` / `ime: 组字 "…" cursor=…`
+  / `ime: IMR_QUERYCHARPOSITION -> x,y` / `ime: 丢弃重复的 WM_CHAR U+XXXX` /
+  `win32: IME context=ok isIME=1`。
+
+#### (2) ICU 数据内嵌：发布物从「exe + icudtl.dat」变成「单个 exe」
+
+* 上游 Windows 版 Skia 是从 **exe/模块同目录** mmap `icudtl.dat` 再
+  `udata_setCommonData()` 交给 ICU（`third_party/icu/SkLoadICU.cpp`），而
+  `SkUnicodes::ICU::Make()` 在 `SkLoadICU()` 失败时直接返回 nullptr → skiko 的
+  Shaper/ParagraphBuilder 拿到 nullptr 当场崩。实测：把 `icudtl.dat` 删掉，exe 在第一条
+  文本排版断言上**退出码 5**（其余 78 条逻辑断言全过）。所以数据文件必须在、且必须在
+  exe 同目录 —— 用户单独拷走 exe、或直接在 zip 里双击运行都会崩。
+* 做法（**不重编 Skia、不改上游源码**）：
+  1. 构建期 `build-windows-native-demo.sh` 生成
+     `skiko/src/windowsMain/cpp/win32/win32_icu_data.generated.cpp`（不入库），
+     用 `.incbin` 把 `icudtl.dat` 放进 `.rdata`，导出 `composekn_icudtl_data/_end`。
+     选 `.incbin` 而不是 C 数组：10MB 展开成数组是几十 MB 源码，而 `.incbin` 是
+     clang 自带汇编器的指令 —— **不需要任何额外工具链**（预编译模式下目标机器只有
+     JDK + konan，连 objcopy 都没有）。
+  2. `win32_icu.cc` 提供**同名符号 `SkLoadICU()`**（覆盖上游那个）：直接
+     `udata_setCommonData(内存)` + `udata_setFileAccess(UDATA_ONLY_PACKAGES)`。
+     上游那版在 `libicu.a` 里是**独立归档成员** `libicu.SkLoadICU.o`，只有链接器还缺
+     `SkLoadICU` 时才被拉进来；`win32_window.cc` 显式引用了 `SkLoadICU()`，
+     我们这份先从 nativeBridges 归档被拉进来，上游那个就不会被拉入。
+     （日志 `icu: 使用内嵌数据初始化成功（10468208 字节…）` 证明走的是我们这份。）
+  3. 顺带把旧流程里「cp icudtl.dat 到 exe 同目录」删掉，并让测试脚本**故意不放**数据
+     文件：exe 单文件必须自己跑起来（否则这个回归永远发现不了）。
+* 结果：exe 33.3MB → **43.8MB**（含 10.5MB 数据），发布 zip 只剩 exe + README。
+
+#### 自检
+
+```
+logic: RESULT PASS (85 checks)      # +7 条 IME（组字预览/提交/结束/清空）
+window: RESULT PASS (25 checks)     # +1 条 window/ime-commit-through-c-channel
+screenshot: 系统标题栏 + 880 色 + 60.7 fps
+icu: 内嵌数据初始化成功（exe 单文件可跑，无需 icudtl.dat）   # 新增外部断言
+```
+
+* `window/ime-commit-through-c-channel` 用 C 侧测试钩子
+  `composekn_win32_ime_test_commit()` 注入一条提交事件，走的路径与真实
+  `WM_IME_COMPOSITION(GCS_RESULTSTR)` **完全一致**（C 队列 → UTF-8 文本通道 →
+  `Win32Event.IME_COMMIT` → `WindowsEvent.ImeCommitEvent` → Compose 文本输入层），
+  于是「C 到 Kotlin 的字符串通道有没有接错」在自动化里是可断言的。
+* **Wine 里没有中文输入法（装不了），所以 IMM32 那一段（`ImmGetCompositionStringW`、
+  `IMR_QUERYCHARPOSITION` 的真实调用、候选窗位置）只能靠真机验证** —— 日志已经把
+  每一步都打成可对账的行，真机上敲一遍中文，把 `composekn-startup.log` 里的
+  `ime:` 行拷回来即可定位。

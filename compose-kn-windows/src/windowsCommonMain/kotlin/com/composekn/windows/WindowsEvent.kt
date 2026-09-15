@@ -78,6 +78,32 @@ sealed class WindowsEvent {
     ) : WindowsEvent()
 
     /**
+     * IME（IMM32）组字开始。
+     *
+     * 文本框是 Compose 自绘的，系统侧没有 EDIT 控件，所以组字/提交只能由宿主
+     * 从 IMM32 取出来交给 Compose 的文本输入层（见 WindowsTextInputService）。
+     * 这条事件目前只用于诊断（Compose 侧的文本会话在输入框获得焦点时就已经开了）。
+     */
+    object ImeStartEvent : WindowsEvent()
+
+    /**
+     * IME 组字串更新（WM_IME_COMPOSITION + GCS_COMPSTR）。
+     *
+     * [text] 是当前实际输入的内容（含拼音等未转换部分），要交给 Compose 的
+     * `setComposingText` 显示成带下划线的「组字中」文本；空串表示组字被清空。
+     */
+    data class ImeCompositionEvent(val text: String) : WindowsEvent()
+
+    /**
+     * IME 提交（WM_IME_COMPOSITION + GCS_RESULTSTR）：用户选定了候选词/上屏。
+     * [text] 是要插入文本框的最终文本。
+     */
+    data class ImeCommitEvent(val text: String) : WindowsEvent()
+
+    /** IME 组字结束（WM_IME_ENDCOMPOSITION，未提交）——需要把组字状态清掉。 */
+    object ImeEndEvent : WindowsEvent()
+
+    /**
      * Window resize event.
      */
     data class ResizeEvent(

@@ -516,6 +516,17 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
     target.compilations.all {
         compileTaskProvider.configure {
             dependsOn(hideSkiaSymbols)
+            // ComposeKN: `-include-binary <file>` 是当成**字符串**塞进 freeCompilerArgs 的，
+            // KGP 因此不会跟踪那些文件的内容 —— 于是 nativeBridges 归档（我们的 C++ 桥接，
+            // 见 CompileSkikoCppTask）重建之后，compileKotlin 仍被判成 UP-TO-DATE：
+            // klib 里嵌的还是**旧归档**，连带 linkReleaseExecutable 也 UP-TO-DATE，
+            // 结果是「只改了 C++ 时 exe 根本不会重新链接」——构建"成功"、行为没变。
+            // （本轮做 IME 时实测踩到：改了 win32_window.cc 的两个计数器，exe 里没有。）
+            // 这里把 allLibraries（22 个 Skia 归档 + nativeBridges 归档）显式声明成输入，
+            // 任何一个内容变了都会重新编译 klib 并重新链接。
+            // 注意：编译任务已经 dependsOn(hideSkiaSymbols) -> linkNativeBridges，
+            // 所以这里只声明输入、不需要再补依赖。
+            inputs.files(allLibraries)
         }
     }
 }

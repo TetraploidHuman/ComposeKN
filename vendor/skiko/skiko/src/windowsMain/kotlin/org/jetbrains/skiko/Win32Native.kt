@@ -329,6 +329,34 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
         )
     }
 
+    // ---- IME（IMM32）----
+
+    /**
+     * 弹出最近一个 IME 事件配对的 UTF-8 文本；队列空返回 null。
+     *
+     * 缓冲区大小按 4K 取：一次组字/提交不可能超过这个长度（真超了 C 侧会截断，
+     * 不会越界）。
+     */
+    fun imePopText(): String? = memScoped {
+        val buffer = allocArray<ByteVar>(IME_TEXT_BUFFER_SIZE)
+        val length = composekn_win32_ime_pop_text(native, buffer, IME_TEXT_BUFFER_SIZE)
+        if (length < 0) return@memScoped null
+        StringBytesDecoding(buffer, length)
+    }
+
+    /** 走过的 IME 消息条数（0 = 系统没发 IME 消息；排查输入法问题用）。 */
+    val imeMessageCount: Int get() = composekn_win32_ime_message_count(native)
+
+    /** 当前是否正在组字。 */
+    val imeComposing: Boolean get() = composekn_win32_ime_composing(native)
+
+    /** 取消正在进行的组字（文本会话结束时调用）。 */
+    fun imeCancelComposition(): Unit = composekn_win32_ime_cancel_composition(native)
+
+    /** 自检用：注入一条「IME 提交」事件（Wine 里没有真 IME）。 */
+    fun imeTestCommit(text: String): Unit =
+        text.useCString { composekn_win32_ime_test_commit(native, it) }
+
     fun minimize() = composekn_win32_show(native, SW_WINDOWS_MINIMIZE)
     fun maximize() = composekn_win32_show(native, SW_WINDOWS_MAXIMIZE)
     fun restore() = composekn_win32_show(native, SW_WINDOWS_RESTORE)
@@ -350,6 +378,64 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
 @SymbolName("composekn_win32_begin_move")
 internal external fun composekn_win32_begin_move(window: COpaquePointer?)
+
+/** IME 文本缓冲区大小（一次组字/提交的长度上限）。 */
+private const val IME_TEXT_BUFFER_SIZE = 4096
+
+@SymbolName("composekn_win32_ime_pop_text")
+private external fun composekn_win32_ime_pop_text(
+    window: COpaquePointer?,
+    buffer: CPointer<ByteVar>,
+    bufferSize: Int,
+): Int
+
+@SymbolName("composekn_win32_ime_message_count")
+private external fun composekn_win32_ime_message_count(window: COpaquePointer?): Int
+
+@SymbolName("composekn_win32_ime_composing")
+private external fun composekn_win32_ime_composing(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_ime_cancel_composition")
+private external fun composekn_win32_ime_cancel_composition(window: COpaquePointer?)
+
+@SymbolName("composekn_win32_ime_test_commit")
+private external fun composekn_win32_ime_test_commit(window: COpaquePointer?, utf8: CPointer<ByteVar>)
+
+@SymbolName("composekn_win32_set_ime_caret_provider")
+private external fun composekn_win32_set_ime_caret_provider(
+    callback: COpaquePointer?,
+    user: COpaquePointer?,
+)
+
+private var imeCaretProvider: (() -> IntArray?)? = null
+
+/** C 侧的 4 个出参（客户区物理像素下的 x/y/w/h）。 */
+private val imeCaretCallback = staticCFunction<
+    COpaquePointer?, CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, Unit
+    > { _, x, y, w, h ->
+    val rect = imeCaretProvider?.invoke()
+    if (rect != null && rect.size >= 4) {
+        x.pointed.value = rect[0]
+        y.pointed.value = rect[1]
+        w.pointed.value = rect[2]
+        h.pointed.value = rect[3]
+    }
+}
+
+/**
+ * 注册「文本框光标矩形提供者」：IME 需要把组字窗/候选窗摆到光标处时会**同步**
+ * 回调它（可能在 WM_IME_REQUEST 的 SendMessage 里），所以要立刻返回。
+ *
+ * 回调返回 `intArrayOf(x, y, w, h)`（客户区物理像素）或 null（没有光标 → C 侧
+ * 按 (0,0) 处理）。不注册的话候选窗只能落在窗口左上角 —— 真机上表现为
+ * 「候选词卡住 / 位置乱」。传 null 注销。
+ */
+fun setWindowsImeCaretProvider(provider: (() -> IntArray?)?) {
+    imeCaretProvider = provider
+    composekn_win32_set_ime_caret_provider(
+        if (provider == null) null else imeCaretCallback, null,
+    )
+}
 
 @SymbolName("composekn_win32_dpi_scale")
 internal external fun composekn_win32_dpi_scale(window: COpaquePointer?): Float
@@ -414,6 +500,14 @@ data class Win32Event(
         const val TOUCH_DOWN = 11
         const val TOUCH_MOVE = 12
         const val TOUCH_UP = 13
+        /*
+         * IME（IMM32）。事件本身不带文本：与之一一对应、顺序一致的 UTF-8 文本要用
+         * [Win32Window.imePopText] 取（见 win32_bridge.h 的 IME 段）。
+         */
+        const val IME_START = 14
+        const val IME_UPDATE = 15
+        const val IME_COMMIT = 16
+        const val IME_END = 17
     }
 }
 
@@ -437,6 +531,12 @@ private inline fun <R> String.useCString(block: (CPointer<ByteVar>) -> R): R {
     val buf = ByteArray(bytes.size + 1)   // 末尾保留 \0
     bytes.copyInto(buf)
     return buf.usePinned { block(it.addressOf(0)) }
+}
+
+/** 把 C 侧填好的 UTF-8 缓冲区（前 [length] 字节，非 NUL 结尾）解成 String。 */
+private fun StringBytesDecoding(bytes: CPointer<ByteVar>, length: Int): String {
+    if (length <= 0) return ""
+    return bytes.readBytes(length).decodeToString()
 }
 
 private fun StringBytesDecoding(bytes: ByteArray): String {

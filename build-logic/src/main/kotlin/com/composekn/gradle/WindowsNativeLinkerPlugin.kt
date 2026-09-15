@@ -40,6 +40,10 @@ class WindowsNativeLinkerPlugin : Plugin<Project> {
                 "-lcomctl32",
                 "-lcomdlg32",
                 "-lshell32",
+                // IME（IMM32）：ImmGetContext / ImmGetCompositionStringW /
+                // ImmSetCandidateWindow / ImmNotifyIME 等。文本框是 Compose 自绘的，
+                // 组字串和候选窗位置只能由宿主自己接（见 win32_window.cc 的 IME 段）。
+                "-limm32",
                 // GPU 后端（OpenGL/Ganesh，见 skiko windowsMain/cpp/win32/win32_gl.cc）：
                 // WGL 的 wglCreateContext / SwapBuffers / glViewport / glGetIntegerv 来自 opengl32。
                 // 软件路径不引用这些符号，静态链接器不会把 GL 目标文件拉进来，所以加它没有副作用。

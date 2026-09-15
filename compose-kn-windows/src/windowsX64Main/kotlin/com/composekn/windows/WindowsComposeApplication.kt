@@ -18,6 +18,7 @@ import org.jetbrains.skia.Canvas
 import org.jetbrains.skiko.SkikoRenderDelegate
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.initWindowsMainThread
+import org.jetbrains.skiko.setWindowsImeCaretProvider
 import org.jetbrains.skiko.win32Log
 import com.composekn.windows.internal.winlog
 
@@ -202,6 +203,21 @@ class WindowsComposeApplication(
 
         // Compose 的光标请求（clickable -> Hand 等）转成 Win32 光标。
         platformContext.cursorSink = { kind -> window.pointerIconKind = kind }
+
+        // IME：把文本框光标位置告诉 C 侧（WM_IME_REQUEST/IMR_QUERYCHARPOSITION 会
+        // **同步**问它，用来摆候选窗）。没有文本会话时返回 null，C 侧按 (0,0) 处理。
+        setWindowsImeCaretProvider {
+            textInputService.caretRectInRoot()?.let { rect ->
+                intArrayOf(
+                    rect.left.toInt(),
+                    rect.top.toInt(),
+                    rect.width.toInt(),
+                    rect.height.toInt(),
+                )
+            }
+        }
+        // 文本会话结束 -> 取消 IME 组字（否则候选窗会赖在屏幕上）。
+        textInputService.onSessionEnded = { window.imeCancelComposition() }
         win32Log("app: scene + content ready, starting window loop")
         try {
             window.run(onEvent = ::handleEvent)
@@ -248,6 +264,20 @@ class WindowsComposeApplication(
             }
             is WindowsEvent.TouchEvent -> {
                 scene.dispatchWindowsTouchEvent(event, inputState)
+            }
+            is WindowsEvent.ImeStartEvent -> {
+                // Compose 侧的文本会话在输入框聚焦时就开了，这里不需要额外动作。
+                winlog("event: IME 组字开始")
+            }
+            is WindowsEvent.ImeCompositionEvent,
+            is WindowsEvent.ImeCommitEvent,
+            is WindowsEvent.ImeEndEvent -> {
+                val commands = imeEditCommands(event)
+                if (commands != null && !textInputService.applyEditCommands(commands)) {
+                    // 组字/提交到达时没有活动文本会话（例如输入框刚失焦）：
+                    // 丢掉即可 —— 与 AWT 在 disableInput 之后丢弃 InputMethodEvent 一致。
+                    winlog("event: IME 事件被丢弃（没有活动文本会话）: $event")
+                }
             }
             is WindowsEvent.ResizeEvent -> {
                 winlog("event: resize ${event.width}x${event.height}")

@@ -14,6 +14,10 @@
 #         SKIA_MINGW_WORK=/mnt/hdd2/KtLLM/skia-mingw \
 #         nix-shell ./shell.nix --run ./vendor/skiko/skia-mingw/build-windows-native-demo.sh
 #      前置：先跑 build-skia-mingw.sh 生成 GNU-ABI 的 Skia 静态库。
+#
+# 两种模式都要求能拿到 icudtl.dat（预编译包里的 / skia/out/mingw/ 下的）：
+# 它会被 `.incbin` **编进 exe**，所以**构建产物运行时不需要**同目录的数据文件
+# （发布物只有一个 exe）。见下面第 4 步与 skiko 的 win32_icu.cc。
 #      本脚本负责 shim + 导入库修补 + 链接（Skia 本身由 build-skia-mingw.sh 构建）。
 set -euo pipefail
 
@@ -137,7 +141,59 @@ LIBS="$LIBS,$MINGW_W64_LIB/libntdll.a,$MINGW_W64_LIB/libmingwex.a"
 # 链接会报这 7 个未定义符号。上面这些库全部用绝对路径给出，不需要 -L。
 LIBDIRS=""
 
-# 4) 链接 K/N exe
+# 4) 把 icudtl.dat 嵌进 exe（不再要求 exe 同目录放这个 10MB 文件）
+#
+# 上游 Windows 版 Skia 是从 exe 同目录 mmap icudtl.dat 喂给 ICU 的（见
+# third_party/icu/SkLoadICU.cpp），于是发布物只能是「exe + icudtl.dat」两个文件：
+# 单独拷走 exe、或者直接在 zip 里双击运行（Explorer 只把 exe 解到临时目录）都会崩。
+#
+# 这里生成一份「用 .incbin 把数据放进 .rdata」的 .cpp 让 K/N 一起编译，
+# 运行时由 skiko/src/windowsMain/cpp/win32/win32_icu.cc 里覆盖版的 SkLoadICU()
+# 直接 udata_setCommonData(内存) —— 细节见那个文件。
+GEN_SRC="$REPO/vendor/skiko/skiko/src/windowsMain/cpp/win32/win32_icu_data.generated.cpp"
+
+ICUDTL=""
+if [ -n "$PREBUILT" ] && [ -f "$PREBUILT/icudtl.dat" ]; then
+    ICUDTL="$PREBUILT/icudtl.dat"
+elif [ -n "${SKIA_MINGW_WORK:-}" ] && [ -f "$SKIA_MINGW_WORK/skia/out/mingw/icudtl.dat" ]; then
+    ICUDTL="$SKIA_MINGW_WORK/skia/out/mingw/icudtl.dat"
+fi
+[ -n "$ICUDTL" ] || die "找不到 icudtl.dat（预编译包 $PREBUILT/ 或 \$SKIA_MINGW_WORK/skia/out/mingw/）"
+
+# 生成文件里的 .incbin 需要**绝对路径**（汇编器按进程工作目录解析相对路径，
+# 而汇编是 konan 在别的工作目录里跑的），反斜杠/引号要转义。
+ICUDTL_ABS="$(cd "$(dirname "$ICUDTL")" && pwd)/$(basename "$ICUDTL")"
+ICUDTL_ESC="${ICUDTL_ABS//\\/\\\\}"
+ICUDTL_ESC="${ICUDTL_ESC//\"/\\\"}"
+info "嵌入 icudtl.dat: $(du -h "$ICUDTL_ABS" | cut -f1) <- $ICUDTL_ABS"
+
+cat > "$GEN_SRC" <<EOF
+/*
+ * 自动生成（vendor/skiko/skia-mingw/build-windows-native-demo.sh）——
+ * **不要手改，也不要提交**（已列入 .gitignore）。
+ *
+ * 把 ICU 数据文件原样放进 exe 的 .rdata 段，符号由 win32_icu.cc 使用：
+ *   composekn_icudtl_data ... 第一个字节
+ *   composekn_icudtl_end  ... 最后一个字节之后一个字节
+ *
+ * 用 .incbin 而不是 C 数组：10MB 数据展开成数组会是几十 MB 的源码，
+ * 而 .incbin 是 clang 自带汇编器的指令，不需要任何额外工具链。
+ */
+extern "C" {
+__asm__(
+    ".section .rdata,\\"dr\\"\\n"
+    ".p2align 12\\n"
+    ".globl composekn_icudtl_data\\n"
+    "composekn_icudtl_data:\\n"
+    ".incbin \\"$ICUDTL_ESC\\"\\n"
+    ".globl composekn_icudtl_end\\n"
+    "composekn_icudtl_end:\\n"
+    ".text\\n"
+);
+}
+EOF
+
+# 5) 链接 K/N exe
 cd "$REPO"
 ./gradlew :samples:windows-demo:linkReleaseExecutableMingwX64 --no-daemon \
     -Pskiko.skia.mingw.dir="$SKIA_OUT" \
@@ -145,12 +201,18 @@ cd "$REPO"
     ${LIBDIRS:+-Pskiko.mingw.libDirs="$LIBDIRS"}
 
 EXE_DIR="$REPO/samples/windows-demo/build/bin/mingwX64/releaseExecutable"
-if [ -f "$PREBUILT/icudtl.dat" ]; then
-    # Skia 的 SkLoadICU 只在 exe 同目录找 icudtl.dat（找不到时文本排版会失败/崩溃）
-    cp -f "$PREBUILT/icudtl.dat" "$EXE_DIR/icudtl.dat"
-elif [ -f "${SKIA_MINGW_WORK:-}/skia/out/mingw/icudtl.dat" ]; then
-    cp -f "${SKIA_MINGW_WORK}/skia/out/mingw/icudtl.dat" "$EXE_DIR/icudtl.dat"
+# 旧流程会在这里 cp 一份 icudtl.dat；现在数据已经嵌在 exe 里了，
+# 留着反而会掩盖「嵌入没生效」——所以把它删掉，让 exe 必须靠自己。
+rm -f "$EXE_DIR/icudtl.dat"
+
+# 顺带粗检一下：exe 至少要比 icudtl.dat 大（数据显然没嵌进去时立刻失败，
+# 而不是等到运行期文本排版崩了才发现）
+icu_size="$(stat -c %s "$ICUDTL_ABS")"
+exe_size="$(stat -c %s "$EXE_DIR/windows-demo.exe")"
+if [ "$exe_size" -lt "$icu_size" ]; then
+    die "exe ($exe_size 字节) 比 icudtl.dat ($icu_size 字节) 还小，ICU 数据显然没嵌进去"
 fi
+info "exe $(du -h "$EXE_DIR/windows-demo.exe" | cut -f1)（含 $(du -h "$ICUDTL_ABS" | cut -f1) 的嵌入式 ICU 数据）"
 
 echo
 echo "==> 产物: $EXE_DIR/windows-demo.exe"

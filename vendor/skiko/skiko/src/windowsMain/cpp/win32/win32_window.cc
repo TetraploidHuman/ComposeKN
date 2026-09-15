@@ -6,6 +6,12 @@
 #include "win32_bridge.h"
 #include <windows.h>
 #include <windowsx.h>
+// IME（IMM32）：我们的文本框是 Compose 自绘的，不是系统 EDIT 控件，所以组字/
+// 候选窗的位置和文本都得宿主自己从 IMM32 取回来（对照 AWT 的 awt_Component.cpp）。
+#include <imm.h>
+// 上游的 SkLoadICU()（从 exe 同目录 mmap icudtl.dat）被 win32_icu.cc 里的同名版本
+// 覆盖；这里显式引用它，保证链接器把**我们那份**从归档里拉进来。
+#include "SkLoadICU.h"
 #include <cstdarg>
 #include <string>
 #include <cstdio>
@@ -130,6 +136,21 @@ struct ComposeKNWin32Window {
     bool undecorated = false;
     // 光标形状（0=箭头 1=手 2=文本I型 3=十字），由 Compose 的 PointerIcon 驱动。
     int cursorKind = 0;
+
+    // ---- IME（IMM32）状态 ----
+    // 与 IME 事件一一配对、FIFO 的 UTF-8 文本（事件结构体只有 int32 字段，塞不下字符串）。
+    std::vector<std::string> imeTexts;
+    // 正在组字（WM_IME_STARTCOMPOSITION .. WM_IME_ENDCOMPOSITION）
+    bool imeComposing = false;
+    // 走过的 IME 消息条数（自检/真机排查：0 说明系统根本没把 IME 消息发过来）
+    int32_t imeMessageCount = 0;
+    int imeSetContextLogCount = 0;
+    int imeProcessKeyLogCount = 0;
+    int imeRequestLogCount = 0;
+    // 「已经通过 GCS_RESULTSTR 提交过」的字符：如果 IME 又把它们作为 WM_CHAR
+    // 送一遍（不同 IME / 不同兼容层行为不一致），必须丢掉，否则文本会插入两次。
+    std::wstring pendingCommitChars;
+    DWORD pendingCommitTick = 0;
     // 最近一帧的像素缓存：缩放/重绘期间用来立刻重绘，避免白屏
     std::vector<unsigned char> frame;
     int frameW = 0;
@@ -250,6 +271,126 @@ static HCURSOR composeknLoadCursor(int kind) {
         case 3: return LoadCursorW(nullptr, composeknCursorRes(32515));  // IDC_CROSS
         default: return LoadCursorW(nullptr, composeknCursorRes(32512)); // IDC_ARROW
     }
+}
+
+// ---------------------------------------------------------------------------
+// IME（IMM32）
+//
+// 为什么必须自己接（真机反馈：「输入法候选词会卡死，但字还是能打进去」）：
+// 我们的文本框是 Compose 自绘的，系统侧没有任何 EDIT 控件，于是
+//   * IMECHARPOSITION / 候选窗位置：IME 通过 WM_IME_REQUEST(IMR_QUERYCHARPOSITION)
+//     问「组字字符在屏幕上的矩形」，不回答的话它只能拿 GetCaretPos() —— 我们根本
+//     没有 caret，永远是 (0,0)，候选窗就会卡在错误的位置/不再跟着输入更新；
+//   * 组字串与提交串：必须自己 ImmGetCompositionString() 取出来喂给 Compose 的
+//     文本输入层（见 WindowsTextInputService）。
+// 对照组：AWT 在 awt_Component.cpp 里正是这么做的，而 Compose 桌面的 JVM 版本
+// 走的就是 AWT —— 也就是说这条路径是上游行为的一部分，不是我们发明的。
+// ---------------------------------------------------------------------------
+
+// C++ -> Kotlin：问「文本框光标在客户区（物理像素）的位置」。
+typedef void (*ComposeKNImeCaretFn)(void* user, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
+static ComposeKNImeCaretFn g_imeCaretProvider = nullptr;
+static void* g_imeCaretProviderUser = nullptr;
+
+extern "C" void composekn_win32_set_ime_caret_provider(ComposeKNImeCaretFn fn, void* user) {
+    g_imeCaretProvider = fn;
+    g_imeCaretProviderUser = user;
+}
+
+static std::string wideToUtf8(const std::wstring& text) {
+    if (text.empty()) return std::string();
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.data(),
+                                          static_cast<int>(text.size()),
+                                          nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return std::string();
+    std::string out(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        out.data(), bytes, nullptr, nullptr);
+    return out;
+}
+
+/** 把 IME 事件和它配对的文本一起入队（两者顺序严格一致）。 */
+static void pushImeEvent(ComposeKNWin32Window* window, int32_t type, const std::wstring& text) {
+    ComposeKNWin32Event e{};
+    e.type = type;
+    e.a = static_cast<int32_t>(text.size());  // UTF-16 长度（诊断用）
+    e.state = window->imeComposing ? 1u : 0u;
+    pushEvent(window, e);
+    window->imeTexts.push_back(wideToUtf8(text));
+}
+
+/** ImmGetCompositionStringW 的包装（返回 UTF-16 字符串）。 */
+static std::wstring imeCompositionString(HIMC himc, DWORD index) {
+    const LONG bytes = ImmGetCompositionStringW(himc, index, nullptr, 0);
+    if (bytes <= 0) return std::wstring();
+    std::vector<wchar_t> buffer(static_cast<size_t>(bytes) / sizeof(wchar_t) + 1, L'\0');
+    const LONG copied = ImmGetCompositionStringW(himc, index, buffer.data(), bytes);
+    if (copied <= 0) return std::wstring();
+    return std::wstring(buffer.data(), static_cast<size_t>(copied) / sizeof(wchar_t));
+}
+
+/** Compose 侧光标矩形（客户区物理像素）；拿不到时返回 0 尺寸。 */
+static void imeCaretRect(ComposeKNWin32Window* window, int32_t* x, int32_t* y, int32_t* w, int32_t* h) {
+    *x = 0; *y = 0; *w = 0; *h = 0;
+    if (g_imeCaretProvider != nullptr) {
+        g_imeCaretProvider(g_imeCaretProviderUser, x, y, w, h);
+    }
+    (void)window;
+}
+
+/**
+ * 把 IME 的组字窗/候选窗摆到光标下方。
+ *
+ * 每次组字变化都要重新摆一次（光标可能随输入在文本框里移动），否则候选窗会
+ * 停在第一次的位置 —— 真机用户看到的就是「候选词卡住了」。
+ */
+static void positionImeWindows(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    HIMC himc = ImmGetContext(window->hwnd);
+    if (himc == nullptr) return;
+    int32_t x = 0, y = 0, w = 0, h = 0;
+    imeCaretRect(window, &x, &y, &w, &h);
+    POINT pt = { x, y + h };
+    if (!ClientToScreen(window->hwnd, &pt)) {
+        ImmReleaseContext(window->hwnd, himc);
+        return;
+    }
+    COMPOSITIONFORM composition;
+    ZeroMemory(&composition, sizeof(composition));
+    composition.dwStyle = CFS_POINT;
+    composition.ptCurrentPos = pt;
+    ImmSetCompositionWindow(himc, &composition);
+
+    CANDIDATEFORM candidate;
+    ZeroMemory(&candidate, sizeof(candidate));
+    candidate.dwIndex = 0;
+    candidate.dwStyle = CFS_CANDIDATEPOS;
+    candidate.ptCurrentPos = pt;
+    ImmSetCandidateWindow(himc, &candidate);
+    ImmReleaseContext(window->hwnd, himc);
+}
+
+/** 记下刚提交的字符串（如果 IME 之后又把它当 WM_CHAR 送一遍就丢掉）。 */
+static void rememberCommittedChars(ComposeKNWin32Window* window, const std::wstring& text) {
+    if (text.empty()) return;
+    window->pendingCommitChars.append(text);
+    window->pendingCommitTick = GetTickCount();
+}
+
+/** 这个 WM_CHAR 是不是「提交串的重复」？是的话消耗掉并返回 true。 */
+static bool consumeDuplicateCommittedChar(ComposeKNWin32Window* window, wchar_t ch) {
+    if (window->pendingCommitChars.empty()) return false;
+    if (GetTickCount() - window->pendingCommitTick > 1000) {
+        window->pendingCommitChars.clear();
+        return false;
+    }
+    if (window->pendingCommitChars.front() != ch) {
+        // 对不上（用户已经接着输入普通字符了）：不再去重，按正常输入处理。
+        window->pendingCommitChars.clear();
+        return false;
+    }
+    window->pendingCommitChars.erase(window->pendingCommitChars.begin());
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -514,9 +655,23 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
         case WM_SYSKEYDOWN:
         case WM_KEYUP:
         case WM_SYSKEYUP: {
+            uint32_t vk = static_cast<uint32_t>(wParam);
+            if (vk == VK_PROCESSKEY) {
+                // 组字期间 IME 会把按键「吃掉」并换成 VK_PROCESSKEY。AWT 的做法是
+                // 用 ImmGetVirtualKey 取回原始键码再继续派发（快捷键仍然有效），
+                // 否则 Compose 只会收到一串「未知按键」。
+                const uint32_t original = static_cast<uint32_t>(ImmGetVirtualKey(hwnd));
+                if (original != 0 && original != VK_PROCESSKEY) {
+                    vk = original;
+                }
+                if (window != nullptr && window->imeProcessKeyLogCount < 5) {
+                    ++window->imeProcessKeyLogCount;
+                    composeknLog("ime: VK_PROCESSKEY -> vk=0x%X", vk);
+                }
+            }
             ComposeKNWin32Event e{};
             e.type = COMPOSEKN_WIN32_EVENT_KEY;
-            e.button = static_cast<uint32_t>(wParam);
+            e.button = vk;
             e.state = (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) ? 1u : 0u;
             e.a = 0; // flags placeholder
             e.b = static_cast<int32_t>((lParam >> 16) & 0xFF);
@@ -526,10 +681,29 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
         }
         case WM_CHAR:
         case WM_UNICHAR: {
+            const wchar_t character = static_cast<wchar_t>(wParam);
+            if (window != nullptr && message == WM_CHAR &&
+                consumeDuplicateCommittedChar(window, character)) {
+                // 这条 WM_CHAR 就是刚才 GCS_RESULTSTR 里那个字符：IME 又送了一遍。
+                // 不丢掉的话文本会被插入两次（不同 IME/兼容层行为不一致，所以两边都要接）。
+                if (window->imeMessageCount <= 200) {
+                    composeknLog("ime: 丢弃重复的 WM_CHAR U+%04X（提交串已处理过）",
+                                 static_cast<unsigned>(character));
+                }
+                break;
+            }
+            // 注意：**故意不提 WM_IME_CHAR**。
+            //
+            // 有的 IME/兼容层把提交字符作为 WM_IME_CHAR 送来，而 DefWindowProc 会把它
+            // 变形成 WM_CHAR（现在"中文能打进去"靠的就是这条）。如果我们再自己把
+            // WM_IME_CHAR 也派发一遍，就会出现「一份字符、两条 CHAR 事件」——
+            // 而这时提交串**不在**去重列表里（IME 没走 GCS_RESULTSTR），
+            // 去重帮不上忙 → 文本会插入两次。保持原样最安全：
+            // WM_IME_CHAR 交给 DefWindowProc，我们只在 WM_CHAR 这一层去重。
             ComposeKNWin32Event e{};
             e.type = COMPOSEKN_WIN32_EVENT_CHAR;
             e.b = message == WM_UNICHAR ? static_cast<int32_t>(wParam)
-                                        : static_cast<int32_t>(static_cast<wchar_t>(wParam));
+                                        : static_cast<int32_t>(character);
             e.a = 0;
             e.modifiers = queryCurrentModifiers();
             pushEvent(window, e);
@@ -678,6 +852,153 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             // 否则系统会再合成一份鼠标消息，一次触摸变成两套输入。
             return 0;
         }
+        // ------------------------------------------------------------------
+        // IME（IMM32）消息。说明见上面 positionImeWindows 前的注释。
+        // ------------------------------------------------------------------
+        case WM_IME_SETCONTEXT: {
+            // 组字预览由 Compose 自己画（setComposingText 会让文本框带下划线），
+            // 所以请 IME 不要自己画组字窗口；
+            // **候选窗必须保留**（那是 IME 自己的窗口，清掉用户就看不到候选词了）
+            // —— 上游 AWT 的做法与此一致。
+            lParam &= ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW);
+            if (window != nullptr) ++window->imeMessageCount;
+            if (window != nullptr && window->imeSetContextLogCount < 8) {
+                ++window->imeSetContextLogCount;
+                composeknLog("ime: WM_IME_SETCONTEXT active=%d layout=%p ime=%d",
+                             wParam != 0 ? 1 : 0, (void*)GetKeyboardLayout(0),
+                             ImmIsIME(GetKeyboardLayout(0)) ? 1 : 0);
+            }
+            break;  // 交给 DefWindowProc（默认 IME 窗口过程）
+        }
+        case WM_IME_STARTCOMPOSITION: {
+            if (window != nullptr) {
+                window->imeComposing = true;
+                ++window->imeMessageCount;
+                composeknLog("ime: WM_IME_STARTCOMPOSITION（开始组字）");
+                // 组字一开始就把候选窗摆到光标处：很多 IME 在这条之后就画候选窗了。
+                positionImeWindows(window);
+                pushImeEvent(window, COMPOSEKN_WIN32_EVENT_IME_START, std::wstring());
+            }
+            return 0;
+        }
+        case WM_IME_COMPOSITION: {
+            if (window == nullptr) break;
+            ++window->imeMessageCount;
+            HIMC himc = ImmGetContext(hwnd);
+            if (himc == nullptr) {
+                composeknLog("ime: WM_IME_COMPOSITION 但 ImmGetContext() 返回 NULL");
+                break;
+            }
+            // lParam == 0 表示「只是属性/字体变了」，按「重读当前组字串」处理；
+            // 有 GCS_RESULTSTR 时说明这一段已经**提交**（用户选了候选词）。
+            const bool hasResult = (lParam & GCS_RESULTSTR) != 0;
+            bool hasComposition = (lParam & GCS_COMPSTR) != 0;
+            if (!hasResult && !hasComposition) hasComposition = true;
+            const std::wstring result = hasResult ? imeCompositionString(himc, GCS_RESULTSTR)
+                                                  : std::wstring();
+            const std::wstring composition = hasComposition ? imeCompositionString(himc, GCS_COMPSTR)
+                                                            : std::wstring();
+            const int compositionCursor = hasComposition
+                ? static_cast<int>(ImmGetCompositionStringW(himc, GCS_CURSORPOS, nullptr, 0))
+                : 0;
+            ImmReleaseContext(hwnd, himc);
+
+            if (!result.empty()) {
+                // 先记下这些字符：部分 IME 随后还会把它们作为 WM_CHAR 再送一遍，
+                // 那时必须丢掉（否则文本插入两次）。
+                rememberCommittedChars(window, result);
+                pushImeEvent(window, COMPOSEKN_WIN32_EVENT_IME_COMMIT, result);
+                composeknLog("ime: 提交 \"%s\"（%d 个 UTF-16）",
+                             wideToUtf8(result).c_str(), static_cast<int>(result.size()));
+            }
+            if (hasComposition) {
+                pushImeEvent(window, COMPOSEKN_WIN32_EVENT_IME_UPDATE, composition);
+                if (window->imeMessageCount <= 40) {
+                    composeknLog("ime: 组字 \"%s\" cursor=%d flags=0x%lX",
+                                 wideToUtf8(composition).c_str(), compositionCursor,
+                                 (unsigned long)lParam);
+                }
+            }
+            // 光标/候选窗位置每次都更新
+            positionImeWindows(window);
+            return 0;
+        }
+        case WM_IME_ENDCOMPOSITION: {
+            if (window != nullptr) {
+                window->imeComposing = false;
+                ++window->imeMessageCount;
+                composeknLog("ime: WM_IME_ENDCOMPOSITION（组字结束）");
+                pushImeEvent(window, COMPOSEKN_WIN32_EVENT_IME_END, std::wstring());
+            }
+            return 0;
+        }
+        case WM_IME_REQUEST: {
+            if (window == nullptr) break;
+            ++window->imeMessageCount;
+            switch (wParam) {
+                case IMR_QUERYCHARPOSITION: {
+                    // Win8+ 的 TSF 兼容层靠这条问「组字字符在屏幕上的矩形」。
+                    // 不处理它时 IME 只能拿 GetCaretPos()（恒为 0,0）—— 候选窗
+                    // 会卡在窗口左上角/不再更新，这正是真机反馈的现象。
+                    auto* charPos = reinterpret_cast<IMECHARPOSITION*>(lParam);
+                    if (charPos != nullptr) {
+                        int32_t x = 0, y = 0, w = 0, h = 0;
+                        imeCaretRect(window, &x, &y, &w, &h);
+                        POINT pt = { x, y + h };
+                        ClientToScreen(hwnd, &pt);
+                        RECT client;
+                        GetClientRect(hwnd, &client);
+                        POINT topLeft = { client.left, client.top };
+                        POINT bottomRight = { client.right, client.bottom };
+                        ClientToScreen(hwnd, &topLeft);
+                        ClientToScreen(hwnd, &bottomRight);
+                        charPos->pt = pt;
+                        charPos->cLineHeight = h > 0 ? static_cast<UINT>(h) : 20u;
+                        charPos->rcDocument = { topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
+                        composeknLog("ime: IMR_QUERYCHARPOSITION -> %ld,%ld lineHeight=%u",
+                                     (long)pt.x, (long)pt.y, charPos->cLineHeight);
+                        return TRUE;
+                    }
+                    break;
+                }
+                // 注意：这个值在微软 SDK 的 imm.h 里叫 IMR_CANDIDATEPOS，
+                // mingw-w64 的 imm.h 里叫 IMR_CANDIDATEWINDOW（同一数值 0x0002）。
+                case IMR_CANDIDATEWINDOW:
+                case IMR_COMPOSITIONWINDOW: {
+                    // 应用在这个缓冲区里回填「候选窗/组字窗」的位置。
+                    int32_t x = 0, y = 0, w = 0, h = 0;
+                    imeCaretRect(window, &x, &y, &w, &h);
+                    POINT pt = { x, y + h };
+                    ClientToScreen(hwnd, &pt);
+                    if (wParam == IMR_CANDIDATEWINDOW) {
+                        auto* form = reinterpret_cast<CANDIDATEFORM*>(lParam);
+                        if (form != nullptr) {
+                            form->dwStyle = CFS_CANDIDATEPOS;
+                            form->ptCurrentPos = pt;
+                            return TRUE;
+                        }
+                    } else {
+                        auto* form = reinterpret_cast<COMPOSITIONFORM*>(lParam);
+                        if (form != nullptr) {
+                            form->dwStyle = CFS_POINT;
+                            form->ptCurrentPos = pt;
+                            return TRUE;
+                        }
+                    }
+                    break;
+                }
+                default:
+                    // 未处理的请求（例如 IMR_DOCUMENTFEED 会在组字期间反复来）：
+                    // 只记前几条，免得真机日志被刷爆。
+                    if (window->imeRequestLogCount < 4) {
+                        ++window->imeRequestLogCount;
+                        composeknLog("ime: WM_IME_REQUEST what=%lu（未处理，交给 DefWindowProc）",
+                                     (unsigned long)wParam);
+                    }
+                    break;
+            }
+            break;
+        }
         case WM_CLOSE: {
             if (window) {
                 ComposeKNWin32Event e{};
@@ -744,6 +1065,12 @@ static int queryWindowDpi(HWND hwnd) {
 // 之前这里直接当物理像素用，结果 200% 缩放的屏幕上「1100x760」只会得到 550x380dp。
 extern "C" ComposeKNWin32Window* composekn_win32_create(
     const char* title, int width_dp, int height_dp, int undecorated) {
+    // ICU 数据已经嵌在 exe 里（见 win32_icu.cc）。这里同步跑一次有两个目的：
+    //   1) 文本排版之前数据一定就绪（不依赖 Skia 的惰性初始化时机）；
+    //   2) 让链接器必须解析 SkLoadICU —— 于是**我们那份**（win32_icu.cc 里的同名
+    //      覆盖版）会被从 nativeBridges 归档里拉进来，libicu.a 里上游那个
+    //      「从 exe 同目录 mmap icudtl.dat」的成员就不会被拉入。
+    SkLoadICU();
     enableDpiAwareness();
     HINSTANCE instance = GetModuleHandleW(nullptr);
     static bool classRegistered = false;
@@ -803,6 +1130,26 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
     ShowWindow(window->hwnd, SW_SHOWNORMAL);
     UpdateWindow(window->hwnd);
     maybeStartTestResize(window);
+
+    // IME：默认情况下窗口是关联着线程默认 IME 上下文的，直接 ImmGetContext 就能用；
+    // 万一取不到（某些环境下窗口类没拿到默认上下文），显式创建并关联一个。
+    {
+        HIMC context = ImmGetContext(window->hwnd);
+        bool created = false;
+        if (context == nullptr) {
+            context = ImmCreateContext();
+            if (context != nullptr) {
+                ImmAssociateContext(window->hwnd, context);
+                created = true;
+            }
+        } else {
+            ImmReleaseContext(window->hwnd, context);
+        }
+        HKL layout = GetKeyboardLayout(0);
+        composeknLog("win32: IME context=%s(created=%d) layout=%p isIME=%d",
+                     context != nullptr ? "ok" : "missing", created ? 1 : 0, (void*)layout,
+                     ImmIsIME(layout) ? 1 : 0);
+    }
     return window;
 }
 
@@ -879,6 +1226,64 @@ extern "C" bool composekn_win32_pop_event_flat(
     *b = e.b;
     *modifiers = e.modifiers;
     return true;
+}
+
+extern "C" int32_t composekn_win32_ime_pop_text(
+    ComposeKNWin32Window* window,
+    char* buffer,
+    int32_t buffer_size
+) {
+    if (window == nullptr || window->imeTexts.empty()) return -1;
+    std::string text = std::move(window->imeTexts.front());
+    window->imeTexts.erase(window->imeTexts.begin());
+    if (buffer == nullptr || buffer_size <= 0) return -1;
+    int32_t count = static_cast<int32_t>(text.size());
+    if (count > buffer_size - 1) count = buffer_size - 1;
+    if (count > 0) std::memcpy(buffer, text.data(), static_cast<size_t>(count));
+    buffer[count] = '\0';
+    return count;
+}
+
+extern "C" int32_t composekn_win32_ime_message_count(ComposeKNWin32Window* window) {
+    return window == nullptr ? 0 : window->imeMessageCount;
+}
+
+extern "C" bool composekn_win32_ime_composing(ComposeKNWin32Window* window) {
+    return window != nullptr && window->imeComposing;
+}
+
+/**
+ * 取消正在进行的组字（对应 ImmNotifyIME(NI_COMPOSITIONSTR, CPS_CANCEL)）。
+ *
+ * Compose 的文本会话结束（输入框失焦/被移除）时调用：不取消的话 IME 会一直停在
+ * 「组字中」，候选窗留在屏幕上不消失 —— 也是「候选词卡死」的一种表现。
+ */
+extern "C" void composekn_win32_ime_cancel_composition(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    window->pendingCommitChars.clear();
+    if (!window->imeComposing) return;
+    HIMC himc = ImmGetContext(window->hwnd);
+    if (himc == nullptr) return;
+    ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+    ImmReleaseContext(window->hwnd, himc);
+    composeknLog("ime: 取消组字（文本会话结束）");
+}
+
+/**
+ * 自检/真机排查用：直接往事件队列里塞一条「提交」事件，并把字符记为已提交，
+ * 从而验证从 C 侧文本通道 -> Kotlin -> Compose 的整条链路（Wine 里没有真 IME，
+ * 不能靠输入法驱动这条路）。
+ */
+extern "C" void composekn_win32_ime_test_commit(ComposeKNWin32Window* window, const char* utf8) {
+    if (window == nullptr || utf8 == nullptr) return;
+    const int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    if (wideLen <= 1) return;
+    std::vector<wchar_t> wide(static_cast<size_t>(wideLen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide.data(), wideLen);
+    const std::wstring text(wide.data(), static_cast<size_t>(wideLen - 1));
+    rememberCommittedChars(window, text);
+    pushImeEvent(window, COMPOSEKN_WIN32_EVENT_IME_COMMIT, text);
+    composeknLog("ime: [test] 注入提交 \"%s\"", utf8);
 }
 
 extern "C" void composekn_win32_present(

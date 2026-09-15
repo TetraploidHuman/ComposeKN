@@ -34,6 +34,17 @@ typedef enum ComposeKNWin32EventType {
     COMPOSEKN_WIN32_EVENT_TOUCH_DOWN = 11,
     COMPOSEKN_WIN32_EVENT_TOUCH_MOVE = 12,
     COMPOSEKN_WIN32_EVENT_TOUCH_UP = 13,
+    /*
+     * IME（IMM32）。这四条事件本身不携带文本（事件结构体只有 int32 字段），
+     * 与之一一对应、顺序一致的 UTF-8 文本要用 composekn_win32_ime_pop_text 取。
+     *
+     * 为什么单独开一条通道：文本框是 Compose 自绘的，系统侧没有 EDIT 控件，
+     * 组字串/提交串只能由宿主从 IMM32 取出来交给 Compose 的文本输入层。
+     */
+    COMPOSEKN_WIN32_EVENT_IME_START = 14,   /* WM_IME_STARTCOMPOSITION */
+    COMPOSEKN_WIN32_EVENT_IME_UPDATE = 15,  /* WM_IME_COMPOSITION + GCS_COMPSTR（组字预览） */
+    COMPOSEKN_WIN32_EVENT_IME_COMMIT = 16,  /* WM_IME_COMPOSITION + GCS_RESULTSTR（提交） */
+    COMPOSEKN_WIN32_EVENT_IME_END = 17,     /* WM_IME_ENDCOMPOSITION */
 } ComposeKNWin32EventType;
 
 typedef struct ComposeKNWin32Event {
@@ -181,6 +192,44 @@ void composekn_win32_set_cursor(ComposeKNWin32Window* window, int32_t kind);
 
 /** 触摸通道是否启用（COMPOSEKN_TOUCH=0 可关掉，退回系统「触摸提升成鼠标」的老行为）。 */
 bool composekn_win32_touch_enabled(ComposeKNWin32Window* window);
+
+// ---------------------------------------------------------------------------
+// IME（IMM32）
+// ---------------------------------------------------------------------------
+
+/**
+ * 弹出与最近一个 IME 事件配对的 UTF-8 文本（FIFO，与 COMPOSEKN_WIN32_EVENT_IME_*
+ * 事件严格一一对应；没有文本的事件也会推入一个空串）。
+ *
+ * 返回写入的字节数（不含结尾 NUL）；队列为空返回 -1。
+ */
+int32_t composekn_win32_ime_pop_text(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size);
+
+/**
+ * 注册「文本框光标矩形提供者」。
+ *
+ * IME 要把组字窗/候选窗摆到光标处时会**同步**回调它（可能发生在 WM_IME_REQUEST
+ * 的 SendMessage 里），回调必须立刻填好**客户区物理像素**下的光标矩形
+ * （x/y = 左上角，w/h = 尺寸）；拿不到就填 0。
+ *
+ * 不提供的话候选窗只能落在 (0,0)，表现为「候选词卡住/位置乱」。
+ */
+typedef void (*ComposeKNImeCaretFn)(
+    void* user, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
+void composekn_win32_set_ime_caret_provider(ComposeKNImeCaretFn fn, void* user);
+
+/** 取消正在进行的组字（Compose 文本会话结束时调用，见 ImmNotifyIME/CPS_CANCEL）。 */
+void composekn_win32_ime_cancel_composition(ComposeKNWin32Window* window);
+
+/** 走过的 IME 消息条数（0 = 系统根本没发 IME 消息；自检/真机排查用）。 */
+int32_t composekn_win32_ime_message_count(ComposeKNWin32Window* window);
+
+/** 当前是否正在组字。 */
+bool composekn_win32_ime_composing(ComposeKNWin32Window* window);
+
+/** 自检用：注入一条「IME 提交」事件（Wine 里没有真 IME，驱动不了这条路）。 */
+void composekn_win32_ime_test_commit(ComposeKNWin32Window* window, const char* utf8);
 
 /** ShowWindow wrapper: cmd 3=SW_MAXIMIZE 6=SW_MINIMIZE 9=SW_RESTORE 5=SW_SHOW */
 void composekn_win32_show(ComposeKNWin32Window* window, int cmd);
