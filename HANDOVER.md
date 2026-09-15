@@ -1718,6 +1718,21 @@ Gradle/daemon 抽风。教训：**每次改完立刻核对行数/字节数**（`
      文件：exe 单文件必须自己跑起来（否则这个回归永远发现不了）。
 * 结果：exe 33.3MB → **43.8MB**（含 10.5MB 数据），发布 zip 只剩 exe + README。
 
+#### 顺手修掉的一个**构建坑**：只改 C++ 时 exe 根本不会重新链接
+
+做 IME 时实测踩到：改了 `win32_window.cc` 里的一个计数器、脚本打印「==> 产物」、
+构建"成功"，但 exe 里没有那次改动（行为没变、日志也没变）。
+
+* 根因：`-include-binary <file>` 是以**字符串**塞进 `freeCompilerArgs` 的
+  （skiko 的 `NativeTasksConfiguration` 就是这么写的），KGP 因此不跟踪那个文件的
+  内容 —— `compileNativeBridgesWindowsX64` 重建归档之后，`compileKotlinMingwX64`
+  仍然被判成 UP-TO-DATE（klib 里嵌的还是**旧归档**），
+  `linkReleaseExecutableMingwX64` 也跟着 UP-TO-DATE：**整个链路静默不动**。
+* 修法：在 `NativeTasksConfiguration` 里把 `allLibraries`（22 个 Skia 归档 +
+  nativeBridges 归档）显式声明成 `compileTaskProvider` 的输入
+  （`inputs.files(allLibraries)`）。之后改任何一个 C++ 文件都会重新编译 klib
+  并重新链接 —— 不再需要手工删 klib"骗"Gradle。
+
 #### 自检
 
 ```
@@ -1736,3 +1751,20 @@ icu: 内嵌数据初始化成功（exe 单文件可跑，无需 icudtl.dat）   
   `IMR_QUERYCHARPOSITION` 的真实调用、候选窗位置）只能靠真机验证** —— 日志已经把
   每一步都打成可对账的行，真机上敲一遍中文，把 `composekn-startup.log` 里的
   `ime:` 行拷回来即可定位。
+
+#### `COMPOSEKN_SELFTEST=all`（一个进程里跑完两个阶段）的两个已知坑
+
+都**不是**本轮引入的（拿 v0.4.7 的发布包复现过一模一样的现象），记下来省得下次再查：
+
+1. **必须真的有一个显示**：`logic` 阶段不需要窗口，所以很容易忘了起 Xvfb，但 `all`
+   会接着跑 `window` 阶段 —— 没有 DISPLAY 时 Wine 的 `CreateWindowExW` 会在
+   `WM_CREATE` 之后直接 `WM_NCDESTROY` 销毁窗口并返回 NULL +
+   `GetLastError=183`（ERROR_ALREADY_EXISTS），表现为
+   `IllegalStateException: Failed to create Win32 window`。
+   **这两个阶段分开跑时不会暴露**（`window` 阶段本来就带着 X 跑），所以 CI 与
+   `scripts/test-windows-native.sh` 一直是分开跑的。
+2. **性能契约那两条在 `all` 模式下会红**：`window/perf-cross-thread-wake` 与
+   `window/perf-animation-fps`（离屏阶段先跑过之后，窗口阶段的动画期间渲染 0 帧）。
+   v0.4.7 的 `all` 是 `102 checks, 2 failures`，v0.4.8 是 `110 checks, 2 failures`
+   —— 同样两条。没深入定位（不影响真实使用），**判定"全绿"请用分开跑的
+   `scripts/test-windows-native.sh`**。
