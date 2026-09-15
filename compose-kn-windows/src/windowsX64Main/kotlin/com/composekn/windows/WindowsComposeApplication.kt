@@ -35,8 +35,14 @@ class WindowsComposeApplication(
     private val title: String,
     private val width: Int = 960,
     private val height: Int = 640,
+    /**
+     * false（默认）= 系统标题栏（对齐 Compose JVM 桌面 `Window()`）；
+     * true = 无边框 + Compose 自绘 CSD 标题栏（对应 `undecorated = true`）。
+     */
+    private val undecorated: Boolean = false,
 ) {
-    val window: WindowsComposeWindow = WindowsComposeWindow(title, width, height)
+    val window: WindowsComposeWindow =
+        WindowsComposeWindow(title, width, height, undecorated)
     private val inputState = WindowsInputState()
 
     /**
@@ -108,7 +114,7 @@ class WindowsComposeApplication(
      *
      * @param withChrome false 时不套 CSD 标题栏（纯内容渲染，便于像素断言）
      */
-    fun setContent(withChrome: Boolean = true, content: @Composable () -> Unit) {
+    fun setContent(withChrome: Boolean = undecorated, content: @Composable () -> Unit) {
         // 先给场景一个合理的初始尺寸，再装内容。
         //
         // 否则在「第一次 renderFrame 之前」到达的指针事件会让 sendPointerEvent
@@ -192,7 +198,7 @@ class WindowsComposeApplication(
      * Run the application with the given Compose content.
      */
     fun run(content: @Composable () -> Unit) {
-        setContent(withChrome = true, content = content)
+        setContent(withChrome = undecorated, content = content)
 
         // Compose 的光标请求（clickable -> Hand 等）转成 Win32 光标。
         platformContext.cursorSink = { kind -> window.pointerIconKind = kind }

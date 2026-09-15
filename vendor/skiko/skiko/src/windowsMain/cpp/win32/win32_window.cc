@@ -125,6 +125,9 @@ struct ComposeKNWin32Window {
     // 触摸（WM_POINTER）通道。COMPOSEKN_TOUCH=0 可整体关掉，退回「系统把触摸提升成鼠标」的老行为。
     bool touchEnabled = true;
     int touchLogCount = 0;
+    // false = 系统标题栏（Compose JVM 桌面 Window() 的默认形态：NC 全归 OS 管）；
+    // true = 无边框自绘 CSD（对应 JVM 的 undecorated = true）。
+    bool undecorated = false;
     // 光标形状（0=箭头 1=手 2=文本I型 3=十字），由 Compose 的 PointerIcon 驱动。
     int cursorKind = 0;
     // 最近一帧的像素缓存：缩放/重绘期间用来立刻重绘，避免白屏
@@ -296,7 +299,7 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             composeknLog("wndproc: WM_CREATE hwnd=%p", (void*)hwnd);
             break;
         case WM_NCHITTEST: {
-            if (window->hwnd == hwnd) {
+            if (window->undecorated && window->hwnd == hwnd) {
                 // Parent is our window; keep default edges for maximized/menus
                 if (IsZoomed(hwnd) || IsIconic(hwnd)) break;
                 LONG gx = GET_X_LPARAM(lParam);
@@ -328,6 +331,8 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             // 最大化尺寸严格取显示器工作区（客户区夹取的兜底见 WM_NCCALCSIZE）。
             // 老代码在 WM_NCHITTEST 里写了「Overshoot guard: ... handled by WM_GETMINMAXINFO」，
             // 但这个分支当时根本没实现 —— 于是最大化时窗口可以被扩大到屏幕外。
+            // 系统标题栏模式下这些全是 OS 的事，别插手（插手反而会算错客户区）
+            if (!window->undecorated) break;
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
             const int minDim = edgeMargin(window) * 2 + 1;
             if (mmi->ptMinTrackSize.x < minDim) mmi->ptMinTrackSize.x = minDim;
@@ -359,6 +364,7 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             //   右侧一点画面被裁切」，而且只有最大化时出现，因为普通状态下窗口矩形
             //   就是客户区）。老代码 `rgrc[0].top += 8` 是只治上边、还写死了 96dpi 的
             //   硬编码补丁，左右下完全没治，所以这个 bug 一直没关掉。
+            if (!window->undecorated) break;
             if (wParam != 0 && IsZoomed(hwnd)) {
                 NCCALCSIZE_PARAMS* nc = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
                 HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -711,7 +717,8 @@ static int queryWindowDpi(HWND hwnd) {
 // width/height 的单位是 **dp（逻辑像素）**，与 Compose 桌面的
 // `WindowState(size = DpSize(...))` 一致；物理尺寸在内部按 DPI 换算。
 // 之前这里直接当物理像素用，结果 200% 缩放的屏幕上「1100x760」只会得到 550x380dp。
-extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int width_dp, int height_dp) {
+extern "C" ComposeKNWin32Window* composekn_win32_create(
+    const char* title, int width_dp, int height_dp, int undecorated) {
     enableDpiAwareness();
     HINSTANCE instance = GetModuleHandleW(nullptr);
     static bool classRegistered = false;
@@ -736,6 +743,8 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(const char* title, int w
     ComposeKNWin32Window* window = new ComposeKNWin32Window();
     window->width = width;
     window->height = height;
+    window->undecorated = undecorated != 0;
+    composeknLog("composekn_win32_create: decorations=%s", window->undecorated ? "none(CSD)" : "system");
     // 触摸通道默认开；COMPOSEKN_TOUCH=0 关掉（退回系统「触摸提升成鼠标」的老行为）。
     const char* touchEnv = getenv("COMPOSEKN_TOUCH");
     window->touchEnabled = !(touchEnv != nullptr && touchEnv[0] == '0');

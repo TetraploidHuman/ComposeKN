@@ -15,7 +15,12 @@ import org.jetbrains.skia.impl.NativePointer
  * skiko's compileNativeBridges into the final executable.
  */
 @SymbolName("composekn_win32_create")
-internal external fun composekn_win32_create(title: CPointer<ByteVar>, width: Int, height: Int): COpaquePointer?
+internal external fun composekn_win32_create(
+    title: CPointer<ByteVar>,
+    width: Int,
+    height: Int,
+    undecorated: Int,
+): COpaquePointer?
 
 @SymbolName("composekn_win32_destroy")
 internal external fun composekn_win32_destroy(window: COpaquePointer?)
@@ -177,8 +182,9 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      * `WindowState(size = DpSize(...))` 一致：C 侧会按系统 DPI 换算成物理像素，
      * 建完再用窗口所在显示器的 DPI 校正一次。
      */
-    constructor(title: String, width: Int = 960, height: Int = 640) :
-        this(ensureCreated(title, width, height))
+    /** [undecorated] true = 无边框自绘 CSD；默认 false = 系统标题栏（对齐 Compose JVM 的 Window()）。 */
+    constructor(title: String, width: Int = 960, height: Int = 640, undecorated: Boolean = false) :
+        this(ensureCreated(title, width, height, undecorated))
 
     /** 物理像素 / 逻辑像素。窗口客户区按逻辑像素上报，渲染表面用物理像素。 */
     val dpiScale: Float
@@ -411,9 +417,9 @@ data class Win32Event(
     }
 }
 
-private fun ensureCreated(title: String, width: Int, height: Int): COpaquePointer =
+private fun ensureCreated(title: String, width: Int, height: Int, undecorated: Boolean): COpaquePointer =
     title.useCString { p ->
-        val native = composekn_win32_create(p, width, height)
+        val native = composekn_win32_create(p, width, height, if (undecorated) 1 else 0)
         checkNotNull(native) { "Failed to create Win32 window (title=$title)" }
         native
     }

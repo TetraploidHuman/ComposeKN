@@ -69,6 +69,7 @@ import androidx.compose.ui.window.PopupProperties
 import com.composekn.windows.MouseButton
 import com.composekn.windows.TouchPhase
 import com.composekn.windows.WindowsComposeApplication
+import com.composekn.windows.WindowsComposeWindow
 import com.composekn.windows.WindowsEvent
 import com.composekn.windows.WindowsInputState
 import com.composekn.windows.charToCodePoint
@@ -543,7 +544,15 @@ private fun renderChecks(report: SelfTestReport) {
 
     val probe = InteractionProbe()
     val scrollState = ScrollState(0)
-    val app = WindowsComposeApplication(title = "ComposeKN Selftest", width = 800, height = 600)
+    // 注意：自检几乎全部断言都建立在「32dp 自绘 CSD 标题栏」的几何上
+    // （render/chrome-*、contentTop 等），所以这里显式用 undecorated = true 跑 CSD 模式。
+    // **默认形态是系统标题栏**（对齐 Compose JVM 的 Window()），由下面那条断言兜住。
+    report.check(
+        "window/default-decoration-is-system",
+        WindowsComposeWindow(title = "probe", width = 100, height = 100).isDecorated,
+        "默认应为系统标题栏（isDecorated=true）",
+    )
+    val app = WindowsComposeApplication(title = "ComposeKN Selftest", width = 800, height = 600, undecorated = true)
     app.setContent(withChrome = true) { DeterministicTestScreen(probe, scrollState) }
     // 同一个 driver：帧时钟跨调用单调递增（动画/惯性滚动依赖这一点）
     val driver = OffscreenDriver(app)
@@ -786,7 +795,7 @@ private fun renderChecks(report: SelfTestReport) {
 
     // 2.10 画廊本身必须能渲染（组件覆盖面最大的那条路径）
     val galleryProbe = GalleryProbe()
-    val galleryApp = WindowsComposeApplication(title = "gallery", width = 960, height = 700)
+    val galleryApp = WindowsComposeApplication(title = "gallery", width = 960, height = 700, undecorated = true)
     galleryApp.setContent(withChrome = false) { ComponentGallery(galleryProbe, galleryApp.window) }
     val galleryFrame = renderOffscreen(galleryApp, 960, 700, density = 1f, frames = 3)
     report.check(
@@ -801,7 +810,7 @@ private fun renderChecks(report: SelfTestReport) {
     // LazyColumn 抛 "measured with an infinity maximum height constraints" →
     // 真机上窗口刚出现就崩。这里故意在渲染前派一个鼠标事件。
     val earlyProbe = InteractionProbe()
-    val earlyApp = WindowsComposeApplication(title = "early", width = 400, height = 300)
+    val earlyApp = WindowsComposeApplication(title = "early", width = 400, height = 300, undecorated = true)
     val earlyError = try {
         earlyApp.setContent(withChrome = true) { LazyScreen(earlyProbe) }
         earlyApp.dispatchEvent(WindowsEvent.MouseMoveEvent(x = 200, y = 150))
@@ -857,7 +866,10 @@ private fun runWindowTests(report: SelfTestReport) {
     report.section("window")
     val probe = InteractionProbe()
     val scrollState = ScrollState(0)
-    val app = WindowsComposeApplication(title = "ComposeKN Selftest", width = 900, height = 600)
+    // 同样显式 CSD：下面的点击/剪贴板坐标全都含 32dp 标题栏偏移。
+    val app = WindowsComposeApplication(
+        title = "ComposeKN Selftest", width = 900, height = 600, undecorated = true,
+    )
     var clipboardValue: String? = null
     var clickedAt = Pair(0, 0)
 

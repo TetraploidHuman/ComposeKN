@@ -235,12 +235,23 @@ EOSH
 
     if grep -q SHOT-OK "$RUN_DIR/shot.out" && [ -s "$SHOT" ]; then
         pass "screenshot: 窗口已抓取（$(stat -c%s "$SHOT") bytes）"
-        # 标题栏（左上角）应当是 CSD 深色 #2D2D30
+        # 标题栏：默认是**系统标题栏**（对齐 Compose JVM 的 Window()），
+        # 颜色由 DWM/系统主题决定（浅色主题下是浅色）——所以不能再写死 #2D2D30。
+        # 这里改成模式无关的判定：顶部条带必须是一根**均匀的**横条，且与内容区颜色不同
+        #（即"确实画了一根标题栏"，而不是内容铺到顶 或 空白/花屏）。
         TITLE_PX="$(convert "$SHOT" -format '%[pixel:p{8,8}]' info: 2>/dev/null || echo '?')"
+        MID_PX="$(convert "$SHOT" -format '%[pixel:p{8,300}]' info: 2>/dev/null || echo '?')"
+        STRIP_PX="$(convert "$SHOT" -format '%[pixel:p{200,4}]' info: 2>/dev/null || echo '?')"
         COLORS="$(convert "$SHOT" -format '%k' info: 2>/dev/null || echo 0)"
         case "$TITLE_PX" in
-            *45,45,48*|*2D2D30*|*srgb\(45,45,48\)*) pass "screenshot: 标题栏颜色 = $TITLE_PX" ;;
-            *) fail "screenshot: 标题栏颜色异常 ($TITLE_PX, 期望 #2D2D30)" ;;
+            # CSD（undecorated = true）：自绘深色标题栏
+            *45,45,48*|*2D2D30*|*srgb\(45,45,48\)*) pass "screenshot: 标题栏颜色 = $TITLE_PX（自绘 CSD）" ;;
+            # 系统标题栏：DWM 画的，只要与内容区不同色、且顶部横条均匀即可
+            *) if [ "$TITLE_PX" != "$MID_PX" ] && [ "$TITLE_PX" = "$STRIP_PX" ]; then
+                   pass "screenshot: 系统标题栏 = $TITLE_PX（内容区 $MID_PX）"
+               else
+                   fail "screenshot: 顶部疑似没有标题栏 / 不均匀 (top=$TITLE_PX strip=$STRIP_PX content=$MID_PX)"
+               fi ;;
         esac
         if [ "$COLORS" -ge 200 ] 2>/dev/null; then
             pass "screenshot: 颜色数 $COLORS（界面确实画出了内容，不是空白窗口）"

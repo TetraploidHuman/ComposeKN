@@ -66,7 +66,8 @@ void composekn_win32_set_render_tick(ComposeKNRenderTickFn fn, void* user);
 void composekn_win32_begin_move(ComposeKNWin32Window* window);
 
 /** Create a top-level Win32 window. Returns NULL on failure. */
-ComposeKNWin32Window* composekn_win32_create(const char* title, int width, int height);
+ComposeKNWin32Window* composekn_win32_create(
+    const char* title, int width_dp, int height_dp, int undecorated);
 void composekn_win32_destroy(ComposeKNWin32Window* window);
 
 /** Pump pending Win32 messages. Returns false when the app should quit. */

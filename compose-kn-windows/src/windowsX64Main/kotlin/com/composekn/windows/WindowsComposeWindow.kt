@@ -44,6 +44,12 @@ class WindowsComposeWindow(
     private val title: String,
     private val width: Int = 960,
     private val height: Int = 640,
+    /**
+     * false（默认）= 系统标题栏，对齐 Compose JVM 桌面的 `Window()`：
+     * 拖动/双击最大化/Aero Snap/系统菜单/触摸拖拽/无障碍全部由 OS 负责。
+     * true = 无边框（对应 JVM 的 `undecorated = true`），标题栏由 Compose 自绘。
+     */
+    val undecorated: Boolean = false,
 ) {
     val layer = SkiaLayer()
 
@@ -91,6 +97,9 @@ class WindowsComposeWindow(
 
     private var win32Window: Win32Window? = null
 
+    /** 窗口是否真的无边框（系统标题栏模式下为 false）。 */
+    val isDecorated: Boolean get() = !undecorated
+
     /**
      * Compose 请求的光标形状（0=箭头 1=手 2=文本 I 型 3=十字）。
      *
@@ -110,7 +119,7 @@ class WindowsComposeWindow(
         win32Log("run: enter")
         initWindowsMainThread()
         win32Log("run: create Win32 window ${width}x$height")
-        val win = Win32Window(title, width, height)
+        val win = Win32Window(title, width, height, undecorated)
         win32Window = win
         println("WindowsComposeWindow: created window '$title' (${win.width}x${win.height})")
         win32Log("run: window created ok ${win.width}x${win.height}")
