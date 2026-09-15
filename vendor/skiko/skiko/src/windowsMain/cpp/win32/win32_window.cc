@@ -327,6 +327,31 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             }
             break;
         }
+        case WM_DPICHANGED: {
+            // 跨显示器（缩放不同）时 Windows 会发这条：我们必须
+            //   1) 更新自己的 dpi —— 否则 dp/密度一直是旧屏的（真机日志：拖到另一块屏后
+            //      PERF-BANNER 仍然 dpi=2.0，UI 按错误缩放画）；
+            //   2) 应用 lParam 给出的**建议矩形** —— 它保证「逻辑尺寸不变、物理尺寸随新
+            //      缩放重算」。不照做的话窗口会保持旧物理尺寸，在分辨率更低/缩放更小的屏上
+            //      就显得几乎占满全屏（用户反馈的现象）。
+            const int newDpi = HIWORD(wParam);
+            if (newDpi > 0) window->dpi = newDpi;
+            auto* suggested = reinterpret_cast<RECT*>(lParam);
+            if (suggested != nullptr) {
+                composeknLog(
+                    "win32: WM_DPICHANGED -> dpi=%d rect=%d,%d %dx%d",
+                    newDpi,
+                    static_cast<int>(suggested->left), static_cast<int>(suggested->top),
+                    static_cast<int>(suggested->right - suggested->left),
+                    static_cast<int>(suggested->bottom - suggested->top));
+                SetWindowPos(hwnd, nullptr,
+                             suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            break;
+        }
         case WM_GETMINMAXINFO: {
             // 最大化尺寸严格取显示器工作区（客户区夹取的兜底见 WM_NCCALCSIZE）。
             // 老代码在 WM_NCHITTEST 里写了「Overshoot guard: ... handled by WM_GETMINMAXINFO」，
