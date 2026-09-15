@@ -69,6 +69,37 @@ internal class WindowsTextInputService {
     fun caretRectInRoot(): Rect? = activeRequest?.focusedRectInRoot()
 
     /**
+     * 「组字串里第 [charIndex] 个字符」的矩形（Compose 根坐标）；[charIndex] < 0 表示
+     * 只要当前光标矩形。
+     *
+     * 为什么必须区分：IME 在 `IMR_QUERYCHARPOSITION` 里用 `dwCharPos` 指定它想问哪个
+     * 字符 —— **候选窗问的是组字串开头（dwCharPos=0）**。以前我们一律回"当前光标"，
+     * 于是拼音越打越长、光标越靠右，候选窗就跟着一路往右滑；原生 Windows 应用里
+     * 候选窗是**钉在开始组字的位置**的。
+     *
+     * 实现：`request.focusedRectInRoot()` 是"光标（selection.max）在 root 里的矩形"，
+     * 而 `TextLayoutResult.getCursorRect(offset)` 给出同一坐标系里任意偏移的矩形 ——
+     * 两者相减就得到「目标字符相对光标」的位移。文本框到 root 的变换是平移
+     * （没有旋转/额外缩放），所以这个位移可以直接加到光标矩形上。
+     */
+    fun caretRectForCompositionChar(charIndex: Int): Rect? {
+        val request = activeRequest ?: return null
+        val caret = request.focusedRectInRoot() ?: return null
+        if (charIndex < 0) return caret
+        val composition = request.value().composition ?: return caret
+        val layout = request.textLayoutResult() ?: return caret
+        val text = request.value().text
+        val caretOffset = request.value().selection.max.coerceIn(0, text.length)
+        val targetOffset = (composition.start + charIndex).coerceIn(0, text.length)
+        if (targetOffset == caretOffset) return caret
+        val localCaret = layout.getCursorRect(caretOffset)
+        val localTarget = layout.getCursorRect(targetOffset)
+        val dx = localTarget.left - localCaret.left
+        val dy = localTarget.top - localCaret.top
+        return Rect(caret.left + dx, caret.top + dy, caret.right + dx, caret.bottom + dy)
+    }
+
+    /**
      * 把一组编辑命令交给当前文本会话（IME 的组字/提交都走这里）。
      *
      * 会话已经结束（输入框失焦）时返回 false，调用方据此决定是否记日志/丢弃。

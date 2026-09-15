@@ -207,16 +207,21 @@ int32_t composekn_win32_ime_pop_text(
     ComposeKNWin32Window* window, char* buffer, int32_t buffer_size);
 
 /**
- * 注册「文本框光标矩形提供者」。
+ * 注册「文本框字符矩形提供者」。
  *
- * IME 要把组字窗/候选窗摆到光标处时会**同步**回调它（可能发生在 WM_IME_REQUEST
- * 的 SendMessage 里），回调必须立刻填好**客户区物理像素**下的光标矩形
+ * IME 要把组字窗/候选窗摆到字符处时会**同步**回调它（可能发生在 WM_IME_REQUEST
+ * 的 SendMessage 里），回调必须立刻填好**客户区物理像素**下的矩形
  * （x/y = 左上角，w/h = 尺寸）；拿不到就填 0。
+ *
+ * charIndex 语义（对应 IMECHARPOSITION.dwCharPos）：
+ *   * >= 0：组字串里第 charIndex 个字符的矩形 —— 候选窗一般问第 0 个，所以候选窗
+ *           会钉在**开始组字的位置**，不随着拼音越打越长往右跑；
+ *   * < 0 ：不在组字中（或只是要「当前光标」）——回当前光标矩形。
  *
  * 不提供的话候选窗只能落在 (0,0)，表现为「候选词卡住/位置乱」。
  */
 typedef void (*ComposeKNImeCaretFn)(
-    void* user, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
+    void* user, int32_t charIndex, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
 void composekn_win32_set_ime_caret_provider(ComposeKNImeCaretFn fn, void* user);
 
 /** 取消正在进行的组字（Compose 文本会话结束时调用，见 ImmNotifyIME/CPS_CANCEL）。 */

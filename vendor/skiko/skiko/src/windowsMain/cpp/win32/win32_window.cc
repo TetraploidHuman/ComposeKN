@@ -147,6 +147,11 @@ struct ComposeKNWin32Window {
     int imeSetContextLogCount = 0;
     int imeProcessKeyLogCount = 0;
     int imeRequestLogCount = 0;
+    // IMR_QUERYCHARPOSITION 的日志限流（答案不变就不重复打）
+    int imeCharPosLogCount = 0;
+    int32_t imeCharPosLastIndex = -1;
+    LONG imeCharPosLastX = 0;
+    LONG imeCharPosLastY = 0;
     // 「已经通过 GCS_RESULTSTR 提交过」的字符：如果 IME 又把它们作为 WM_CHAR
     // 送一遍（不同 IME / 不同兼容层行为不一致），必须丢掉，否则文本会插入两次。
     std::wstring pendingCommitChars;
@@ -287,8 +292,16 @@ static HCURSOR composeknLoadCursor(int kind) {
 // 走的就是 AWT —— 也就是说这条路径是上游行为的一部分，不是我们发明的。
 // ---------------------------------------------------------------------------
 
-// C++ -> Kotlin：问「文本框光标在客户区（物理像素）的位置」。
-typedef void (*ComposeKNImeCaretFn)(void* user, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
+// C++ -> Kotlin：问「文本框里某个字符在客户区（物理像素）的位置」。
+//
+// charIndex 的语义（对齐 IMECHARPOSITION.dwCharPos）：
+//   * >= 0：组字串里第 charIndex 个字符的矩形。IME 用 dwCharPos 指定它想问哪个字符，
+//           而**候选窗通常问第 0 个**（组字串开头）—— 所以候选窗应当**钉在开始组字
+//           的位置**，不跟着拼音越打越长往右跑（原生 Windows 应用就是这么表现的；
+//           我们以前一律回光标矩形，于是候选窗一路向右滑）。
+//   * < 0 ：没有具体字符（不在组字中）——回当前光标矩形。
+typedef void (*ComposeKNImeCaretFn)(
+    void* user, int32_t charIndex, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
 static ComposeKNImeCaretFn g_imeCaretProvider = nullptr;
 static void* g_imeCaretProviderUser = nullptr;
 
@@ -329,11 +342,16 @@ static std::wstring imeCompositionString(HIMC himc, DWORD index) {
     return std::wstring(buffer.data(), static_cast<size_t>(copied) / sizeof(wchar_t));
 }
 
-/** Compose 侧光标矩形（客户区物理像素）；拿不到时返回 0 尺寸。 */
-static void imeCaretRect(ComposeKNWin32Window* window, int32_t* x, int32_t* y, int32_t* w, int32_t* h) {
+/**
+ * Compose 侧「字符矩形」（客户区物理像素）；[charIndex] < 0 表示要当前光标矩形。
+ * 拿不到时返回 0 尺寸。
+ */
+static void imeCaretRect(
+    ComposeKNWin32Window* window, int32_t charIndex,
+    int32_t* x, int32_t* y, int32_t* w, int32_t* h) {
     *x = 0; *y = 0; *w = 0; *h = 0;
     if (g_imeCaretProvider != nullptr) {
-        g_imeCaretProvider(g_imeCaretProviderUser, x, y, w, h);
+        g_imeCaretProvider(g_imeCaretProviderUser, charIndex, x, y, w, h);
     }
     (void)window;
 }
@@ -348,24 +366,31 @@ static void positionImeWindows(ComposeKNWin32Window* window) {
     if (window == nullptr || window->hwnd == nullptr) return;
     HIMC himc = ImmGetContext(window->hwnd);
     if (himc == nullptr) return;
-    int32_t x = 0, y = 0, w = 0, h = 0;
-    imeCaretRect(window, &x, &y, &w, &h);
-    POINT pt = { x, y + h };
-    if (!ClientToScreen(window->hwnd, &pt)) {
+    // 组字窗（我们已用 ISC_SHOWUICOMPOSITIONWINDOW 让它不显示）跟光标；
+    // 候选窗锚在**组字串开头**（和原生应用一致，不跟着拼音往右跑）。
+    int32_t cx = 0, cy = 0, cw = 0, ch = 0;
+    imeCaretRect(window, -1, &cx, &cy, &cw, &ch);
+    POINT compositionPoint = { cx, cy + ch };
+    int32_t ax = 0, ay = 0, aw = 0, ah = 0;
+    imeCaretRect(window, window->imeComposing ? 0 : -1, &ax, &ay, &aw, &ah);
+    POINT anchorPoint = { ax, ay + ah };
+    const BOOL okComposition = ClientToScreen(window->hwnd, &compositionPoint);
+    const BOOL okAnchor = ClientToScreen(window->hwnd, &anchorPoint);
+    if (!okComposition || !okAnchor) {
         ImmReleaseContext(window->hwnd, himc);
         return;
     }
     COMPOSITIONFORM composition;
     ZeroMemory(&composition, sizeof(composition));
     composition.dwStyle = CFS_POINT;
-    composition.ptCurrentPos = pt;
+    composition.ptCurrentPos = compositionPoint;
     ImmSetCompositionWindow(himc, &composition);
 
     CANDIDATEFORM candidate;
     ZeroMemory(&candidate, sizeof(candidate));
     candidate.dwIndex = 0;
     candidate.dwStyle = CFS_CANDIDATEPOS;
-    candidate.ptCurrentPos = pt;
+    candidate.ptCurrentPos = anchorPoint;
     ImmSetCandidateWindow(himc, &candidate);
     ImmReleaseContext(window->hwnd, himc);
 }
@@ -940,10 +965,15 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     // Win8+ 的 TSF 兼容层靠这条问「组字字符在屏幕上的矩形」。
                     // 不处理它时 IME 只能拿 GetCaretPos()（恒为 0,0）—— 候选窗
                     // 会卡在窗口左上角/不再更新，这正是真机反馈的现象。
+                    //
+                    // 必须**按 dwCharPos 回答**：输入法问的是"组字串里第几个字符"，
+                    // 候选窗一般问第 0 个。以前一律回"当前光标"矩形，于是拼音越打越长、
+                    // 光标越靠右，候选窗就跟着一路往右滑（真机反馈 vs 原生应用不一致）。
                     auto* charPos = reinterpret_cast<IMECHARPOSITION*>(lParam);
                     if (charPos != nullptr) {
+                        const int32_t charIndex = static_cast<int32_t>(charPos->dwCharPos);
                         int32_t x = 0, y = 0, w = 0, h = 0;
-                        imeCaretRect(window, &x, &y, &w, &h);
+                        imeCaretRect(window, charIndex, &x, &y, &w, &h);
                         POINT pt = { x, y + h };
                         ClientToScreen(hwnd, &pt);
                         RECT client;
@@ -955,8 +985,20 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                         charPos->pt = pt;
                         charPos->cLineHeight = h > 0 ? static_cast<UINT>(h) : 20u;
                         charPos->rcDocument = { topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
-                        composeknLog("ime: IMR_QUERYCHARPOSITION -> %ld,%ld lineHeight=%u",
-                                     (long)pt.x, (long)pt.y, charPos->cLineHeight);
+                        // 输入法每敲一个键会问好几次，且答案经常一样：只在答案变化时
+                        // 记一行（并设上限），否则真机日志会被它刷爆。
+                        if (window->imeCharPosLogCount < 60 &&
+                            (charIndex != window->imeCharPosLastIndex ||
+                             pt.x != window->imeCharPosLastX ||
+                             pt.y != window->imeCharPosLastY)) {
+                            ++window->imeCharPosLogCount;
+                            window->imeCharPosLastIndex = charIndex;
+                            window->imeCharPosLastX = pt.x;
+                            window->imeCharPosLastY = pt.y;
+                            composeknLog(
+                                "ime: IMR_QUERYCHARPOSITION dwCharPos=%d -> %ld,%ld lineHeight=%u",
+                                charIndex, (long)pt.x, (long)pt.y, charPos->cLineHeight);
+                        }
                         return TRUE;
                     }
                     break;
@@ -966,8 +1008,11 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 case IMR_CANDIDATEWINDOW:
                 case IMR_COMPOSITIONWINDOW: {
                     // 应用在这个缓冲区里回填「候选窗/组字窗」的位置。
+                    // 候选窗锚在组字串开头，组字窗跟光标（与 positionImeWindows 一致）。
+                    const int32_t charIndex =
+                        (wParam == IMR_CANDIDATEWINDOW && window->imeComposing) ? 0 : -1;
                     int32_t x = 0, y = 0, w = 0, h = 0;
-                    imeCaretRect(window, &x, &y, &w, &h);
+                    imeCaretRect(window, charIndex, &x, &y, &w, &h);
                     POINT pt = { x, y + h };
                     ClientToScreen(hwnd, &pt);
                     if (wParam == IMR_CANDIDATEWINDOW) {

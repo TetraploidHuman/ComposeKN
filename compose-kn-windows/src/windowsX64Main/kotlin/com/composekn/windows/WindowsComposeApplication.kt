@@ -170,6 +170,23 @@ class WindowsComposeApplication(
     /** 派发一个（真实或合成的）平台事件。 */
     fun dispatchEvent(event: WindowsEvent) = handleEvent(event)
 
+    /**
+     * 自检用：直接问一次「组字串里第 [charIndex] 个字符在哪」。
+     *
+     * 走的正是 IME 那条路（PlatformTextInputMethodRequest 的光标矩形 + 文本排版），
+     * 用来断言「dwCharPos=0 的答案在拼音变长之后**不变**」（候选窗不该往右滑）。
+     * 返回 [x, y, w, h]（客户区物理像素）或 null。
+     */
+    fun imeCaretRectForChar(charIndex: Int): IntArray? =
+        textInputService.caretRectForCompositionChar(charIndex)?.let { rect ->
+            intArrayOf(
+                rect.left.toInt(),
+                rect.top.toInt(),
+                rect.width.toInt(),
+                rect.height.toInt(),
+            )
+        }
+
     /** 推进 Main dispatcher / 重组队列（离屏驱动时每帧调用一次）。 */
     fun pumpDispatchers() = flushMainUIDispatcher()
 
@@ -206,8 +223,8 @@ class WindowsComposeApplication(
 
         // IME：把文本框光标位置告诉 C 侧（WM_IME_REQUEST/IMR_QUERYCHARPOSITION 会
         // **同步**问它，用来摆候选窗）。没有文本会话时返回 null，C 侧按 (0,0) 处理。
-        setWindowsImeCaretProvider {
-            textInputService.caretRectInRoot()?.let { rect ->
+        setWindowsImeCaretProvider { charIndex ->
+            textInputService.caretRectForCompositionChar(charIndex)?.let { rect ->
                 intArrayOf(
                     rect.left.toInt(),
                     rect.top.toInt(),

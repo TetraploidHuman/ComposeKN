@@ -795,6 +795,47 @@ private fun renderChecks(report: SelfTestReport) {
         "composition=${probe.value.composition}",
     )
     report.checkEquals("ime/end-keeps-committed-text", "你好hao", probe.text)
+
+    // 2.7c 候选窗锚点：IME 用 dwCharPos 问「组字串里第几个字符」，
+    //      候选窗问的是第 0 个 —— 所以它的答案必须是**开始组字的位置**，
+    //      不能随着拼音越打越长往右滑（真机反馈：候选框跟着光标一路右移，
+    //      而原生 Windows 应用里它是钉在开始位置的）。
+    probe.setText("")
+    driver.render(800, 600, density = d, frames = 4)
+    click(app, 700, contentTop + 44)
+    driver.render(800, 600, density = d, frames = 4)
+    app.dispatchEvent(WindowsEvent.ImeStartEvent)
+    app.dispatchEvent(WindowsEvent.ImeCompositionEvent("ni"))
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    val anchorShort = app.imeCaretRectForChar(0)
+    val charOneShort = app.imeCaretRectForChar(1)
+    report.check(
+        "ime/anchor-available",
+        anchorShort != null && charOneShort != null,
+        "anchor=$anchorShort char1=$charOneShort",
+    )
+    // 拼音变长：组字串开头的位置**不能动**
+    app.dispatchEvent(WindowsEvent.ImeCompositionEvent("nihao"))
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    val anchorLong = app.imeCaretRectForChar(0)
+    val charFourLong = app.imeCaretRectForChar(4)
+    report.check(
+        "ime/anchor-stays-at-composition-start",
+        anchorShort != null && anchorLong != null && abs(anchorShort[0] - anchorLong[0]) <= 2,
+        "短拼音=$anchorShort 长拼音=$anchorLong",
+    )
+    report.check(
+        "ime/char-index-maps-rightward",
+        anchorLong != null && charFourLong != null && charFourLong[0] > anchorLong[0],
+        "第0个=$anchorLong 第4个=$charFourLong",
+    )
+    app.dispatchEvent(WindowsEvent.ImeEndEvent)
+    app.pumpDispatchers()
+    driver.render(800, 600, density = d, frames = 4)
+    probe.setText("")
+    driver.render(800, 600, density = d, frames = 4)
     // 清干净，后面的弹层/菜单断言依赖的背景不受影响
     probe.setText("")
     driver.render(800, 600, density = d, frames = 4)

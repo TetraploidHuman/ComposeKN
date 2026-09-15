@@ -407,13 +407,13 @@ private external fun composekn_win32_set_ime_caret_provider(
     user: COpaquePointer?,
 )
 
-private var imeCaretProvider: (() -> IntArray?)? = null
+private var imeCaretProvider: ((charIndex: Int) -> IntArray?)? = null
 
-/** C 侧的 4 个出参（客户区物理像素下的 x/y/w/h）。 */
+/** C 侧的入参 charIndex + 4 个出参（客户区物理像素下的 x/y/w/h）。 */
 private val imeCaretCallback = staticCFunction<
-    COpaquePointer?, CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, Unit
-    > { _, x, y, w, h ->
-    val rect = imeCaretProvider?.invoke()
+    COpaquePointer?, Int, CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, CPointer<IntVar>, Unit
+    > { _, charIndex, x, y, w, h ->
+    val rect = imeCaretProvider?.invoke(charIndex)
     if (rect != null && rect.size >= 4) {
         x.pointed.value = rect[0]
         y.pointed.value = rect[1]
@@ -423,14 +423,18 @@ private val imeCaretCallback = staticCFunction<
 }
 
 /**
- * 注册「文本框光标矩形提供者」：IME 需要把组字窗/候选窗摆到光标处时会**同步**
+ * 注册「文本框字符矩形提供者」：IME 需要把组字窗/候选窗摆到字符处时会**同步**
  * 回调它（可能在 WM_IME_REQUEST 的 SendMessage 里），所以要立刻返回。
  *
- * 回调返回 `intArrayOf(x, y, w, h)`（客户区物理像素）或 null（没有光标 → C 侧
- * 按 (0,0) 处理）。不注册的话候选窗只能落在窗口左上角 —— 真机上表现为
- * 「候选词卡住 / 位置乱」。传 null 注销。
+ * 回调返回 `intArrayOf(x, y, w, h)`（客户区物理像素）或 null（没有 → C 侧按
+ * (0,0) 处理）；入参 `charIndex` 对应 IMECHARPOSITION.dwCharPos：
+ * `>= 0` = 组字串里第几个字符（候选窗一般问第 0 个 → 候选窗钉在开始组字的位置），
+ * `< 0` = 只要当前光标。
+ *
+ * 不注册的话候选窗只能落在窗口左上角 —— 真机上表现为「候选词卡住 / 位置乱」。
+ * 传 null 注销。
  */
-fun setWindowsImeCaretProvider(provider: (() -> IntArray?)?) {
+fun setWindowsImeCaretProvider(provider: ((charIndex: Int) -> IntArray?)?) {
     imeCaretProvider = provider
     composekn_win32_set_ime_caret_provider(
         if (provider == null) null else imeCaretCallback, null,

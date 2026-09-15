@@ -1768,3 +1768,38 @@ icu: 内嵌数据初始化成功（exe 单文件可跑，无需 icudtl.dat）   
    v0.4.7 的 `all` 是 `102 checks, 2 failures`，v0.4.8 是 `110 checks, 2 failures`
    —— 同样两条。没深入定位（不影响真实使用），**判定"全绿"请用分开跑的
    `scripts/test-windows-native.sh`**。
+
+### 17.14 候选窗锚点：按 `dwCharPos` 回答（v0.4.9，真机回归反馈）
+
+v0.4.8 真机上中文输入已经可用，但用户发现一个细节：
+
+> 「中文候选框是跟着光标位置走的，但是我看其他应用是候选框的位置是光标的初始位置，
+>   后续的拼音待选是不会移动候选框位置的？」
+
+对。`WM_IME_REQUEST(IMR_QUERYCHARPOSITION)` 的 `lParam`（`IMECHARPOSITION`）里有一个
+**`dwCharPos`**：输入法问的是「**组字串里第几个字符**在屏幕哪儿」。v0.4.8 我们无视它、
+一律回「当前光标矩形」——于是拼音越打越长、光标越靠右，候选窗就跟着一路往右滑。
+原生 Windows 应用的候选窗是钉在**开始组字的位置**（输入法问的通常是 `dwCharPos = 0`）。
+
+修法：
+
+* C 侧把 `dwCharPos` 传进光标回调（回调签名加 `charIndex`；`< 0` = 只要当前光标）；
+* `ImmSetCandidateWindow` 也改成锚在组字串开头（组字窗仍跟光标，那个窗口我们已经让它不显示）；
+* Kotlin 侧新增 `WindowsTextInputService.caretRectForCompositionChar(charIndex)`：
+  `focusedRectInRoot()` 是「光标（selection.max）在 root 里的矩形」，而
+  `TextLayoutResult.getCursorRect(offset)` 给出同一坐标系里任意偏移的矩形，两者相减就得到
+  「目标字符相对光标」的位移，再加到光标矩形上 —— 于是 `charIndex = 0` 的答案在拼音变长时
+  **保持不变**，正是原生表现。（文本框到 root 的变换是平移，所以这个位移可以直接相加。）
+* 自动化断言（离屏、不需要真机输入法）：
+  * `ime/anchor-stays-at-composition-start`：组字串从 `ni` 变成 `nihao` 之后，
+    `charIndex=0` 的答案不能动（±2px）；
+  * `ime/char-index-maps-rightward`：`charIndex=4` 必须在 `charIndex=0` 右边。
+* 顺带把 `IMR_QUERYCHARPOSITION` 的日志限流（输入法每敲一个键会问好几次、答案还经常一样，
+  真机日志会被它刷爆 —— 现在只在答案变化时记一行，上限 60 行）。
+
+自检：`logic` 88 条（+3 条候选窗锚点）、`window` 25 条；日志里那一行现在带上了
+`dwCharPos`，真机上可以直接看到输入法问的是第几个字符：
+
+```
+ime: IMR_QUERYCHARPOSITION dwCharPos=0 -> 207,923 lineHeight=58
+```
