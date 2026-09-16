@@ -2232,3 +2232,61 @@ dwCharPos=7 -> 130,924（组字中锚定起点；如实=210,879）
 这次的 profile 全是 `窗口=1368x850`（全程最大化），而 v0.4.x 那几次是 `1087x725` ——
 `update 3.5~3.8 / draw 1.3~1.8 / present 2.6~4.7ms` 是更大表面的数字，与 `1.5/0.8/3.2~4.5`
 **不可比**。做性能对比必须保持窗口尺寸一致。
+
+### 17.22 探针实测：MS 拼音的 DOCUMENTFEED 第二步给的是**未初始化结构**（v0.5.4）
+
+真机跑 `COMPOSEKN_IME_DOCUMENTFEED=2`（探针模式）打了几组词。**探针假设成立**，但结论是
+"这条路走不通"：
+
+```
+[23:57:49.236] ime: WM_IME_REQUEST what=7(DOCUMENTFEED) lParam=NULL -> 回 TRUE（探针模式…）
+[23:57:49.237] ime: WM_IME_REQUEST what=7(DOCUMENTFEED) 收到 dwSize=1 dwStrLen=993710342                 comp=0@913768972 target=993644807@2147484876
+```
+
+* 我们对 NULL 回 TRUE 之后 **1ms 后它确实又发了一次**，并且**带了 lParam** ——
+  所以"NULL = 先探一下你支不支持、支持我再带缓冲区来"这个协议解释是**对的**；
+* 但第二次那个 `RECONVERTSTRING` **完全没初始化**：`dwSize=1`、`dwStrLen≈9.9 亿`、
+  `comp/target` 偏移全是垃圾值（多次组字都是这样，且每次都不同）；
+* 按 MWSDK 的约定 `dwSize` 是"结构 + 字符串缓冲区的总字节数"，这里我们**无法知道缓冲区多大** ——
+  往里写就是**越界写**。所以正确的行为是**什么都不写、不处理**（老行为），
+  而不是"猜一个大小填进去"。
+
+**因此：文档馈送对微软拼音实际上不可用**（它不给我们可用的缓冲区），这条实验到此为止：
+
+* 默认保持 `COMPOSEKN_IME_DOCUMENTFEED=1`（只在给了可信缓冲区时才回答）→ 对 MS 拼音等于
+  "不回答"，与 v0.4.12 行为一致；
+* `=2` 的探针模式保留（换别的输入法/以后复验时还能用），但不再指望它；
+* `fillReconvertString()` 的两段式逻辑本身没问题（自检里用可信结构覆盖 ✓），只是真实输入法
+  不给这个机会。
+
+#### v0.5.4 顺手补的安全护栏
+
+真机实测暴露出一个**潜在越界写**：老代码在"缓冲区不够"时会写 `rec->dwSize = needed`，而那时
+`dwSize` 可能是垃圾值 1（= 缓冲区可能比 4 字节还小）。现在加护栏：
+
+```cpp
+if (rec != nullptr && rec->dwSize < sizeof(RECONVERTSTRING)) {
+    // 未初始化结构 -> 不写、不处理（连 dwSize 那 4 个字节都不写）
+    break;
+}
+```
+
+自检新增 `window/ime-document-feed-ignores-bogus-dwsize`（dwSize=1 的结构 -> handled=0），
+window 36→37。
+
+#### 顺手修掉一条偶发假失败（与 IME 无关）
+
+打包 exe 复测时 `interaction/mouse-drag-does-not-scroll` 偶发红过一次（`before=466 after=480`）。
+根因：这条断言紧跟"触摸拖动会滚动"之后，而**触摸甩动（fling）还会继续跑若干帧** —— 取基准值
+时 fling 没停，测到的位移是它的余量。修法：取基准值前先把 fling 跑停（`driver.render(frames=1)`
+循环，值不变即停，上限 120 帧）。修完连跑 5 次 logic 全绿。
+
+#### 同一份日志里其它已确认的东西
+
+* 锚点依旧稳：`dwCharPos=0 -> 64,1093`、`dwCharPos=6 -> 64,1093`、下一段 `130,1095` /
+  `163,1095`（每段组字内 x 不动，"如实"值一路漂）；
+* `WM_IME_NOTIFY 0x000A`（IMN_SETCOMPOSITIONFONT）+ `ImmSet{…} font=1`：组字字体仍被接受；
+* 全程没有 `CONFIRMRECONVERTSTRING`（没触发重转换）、没有 `COMPOSITIONFONT` 拉取、没有
+  候选窗/组字窗请求；
+* 干净退出；这一次**全程最大化**（`窗口=1368x850`），`update 2.7~3.2 / draw 1.3~1.7 /
+  present 3.6~5.5ms`（合计 ~8-10ms，仍在 59Hz 的 16.9ms 预算内），但与 1087x725 的数字不可比。

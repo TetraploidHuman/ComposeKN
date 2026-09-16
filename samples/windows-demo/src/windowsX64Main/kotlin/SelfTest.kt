@@ -681,6 +681,16 @@ private fun renderChecks(report: SelfTestReport) {
     app.debugTouchTrace = false
     // 反证：同样轨迹用**鼠标**事件走一遍，不应该滚动（否则说明上面那条测的其实是
     // 鼠标路径，触摸通道根本没被测到）。
+    //
+    // ⚠ 先让**触摸甩动（fling）**停稳再取基准值：fling 会继续跑若干帧，之前偶发
+    // 测到的是它剩下的位移（真机/CI 上出现过 before=466 after=480 的假失败）。
+    var settleFrames = 0
+    while (settleFrames < 120) {
+        val v = scrollState.value
+        driver.render(800, 600, density = d, frames = 1)
+        settleFrames++
+        if (scrollState.value == v) break
+    }
     val beforeMouseDrag = scrollState.value
     mouseDrag(app, 400, 560, 300)
     driver.render(800, 600, density = d, frames = 4)
@@ -1274,6 +1284,14 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                 "window/ime-document-feed-null-not-claimed",
                 nullProbe != null && nullProbe[0] == 0,
                 "lParam=NULL 的 DOCUMENTFEED -> handled=${nullProbe?.get(0)}（默认期望 0 = 不声称支持）",
+            )
+            // dwSize 不可信（真机探针实测：MS 拼音第二次调用给的是**未初始化**结构，
+            // dwSize=1、偏移全是垃圾）-> 必须"不写、不处理"（写 dwSize 都可能越界）。
+            val bogus = app.window.imeTestReconvert(kind = 0, bufferChars = -2)
+            report.check(
+                "window/ime-document-feed-ignores-bogus-dwsize",
+                bogus != null && bogus[0] == 0,
+                "dwSize=1 的结构 -> handled=${bogus?.get(0)}（期望 0 = 不写不处理）",
             )
             // 两段式：只给结构体大小的缓冲时，应当回"我需要多大"，而不是不回答。
             val twoPhase = app.window.imeTestReconvert(kind = 0, bufferChars = 0)

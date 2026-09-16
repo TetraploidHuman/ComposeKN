@@ -1402,6 +1402,18 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                             }
                         }
                         if (window->imeDocumentFeedMode == 0) break;   // 完全不答
+                        if (rec != nullptr && rec->dwSize < sizeof(RECONVERTSTRING)) {
+                            // 真机（MS 拼音，探针模式）实测：在 NULL 之后它确实会带一个
+                            // RECONVERTSTRING 回来，但那个结构**完全没初始化** ——
+                            // dwSize=1、dwStrLen/偏移全是垃圾值。这种情况下**绝不能**
+                            // 往它里面写任何东西（我们不知道缓冲区到底多大，写 dwSize
+                            // 那 4 个字节就可能越界）。
+                            composeknLog(
+                                "ime: IMR_%s 的 dwSize=%lu < sizeof(RECONVERTSTRING)（未初始化"
+                                "结构）-> 不写、不处理",
+                                name, (unsigned long)rec->dwSize);
+                            break;
+                        }
                         if (rec == nullptr) {
                             // 探针模式：告诉输入法"我支持文档馈送"，看它会不会带缓冲区再来。
                             if (window->imeDocumentFeedMode == 2) return TRUE;
@@ -1837,7 +1849,9 @@ extern "C" int32_t composekn_win32_ime_test_reconvert(
     if (window == nullptr || window->hwnd == nullptr || out == nullptr) return 0;
     for (int i = 0; i < 12; ++i) out[i] = 0;
     // bufferChars < 0：lParam 直接传 NULL（真机 MS 拼音就是这么发的，用来测我们的策略）
+    // bufferChars == -2：lParam 给一个 dwSize 明显不合法（=1）的结构，测"不可信就不写"
     const bool nullBuffer = bufferChars < 0;
+    const bool bogusSize = bufferChars == -2;
     if (nullBuffer) bufferChars = 0;
     const size_t extra = static_cast<size_t>(bufferChars) * sizeof(WCHAR);
     // 注意：LOGFONTW 比 RECONVERTSTRING 大（字体请求也会写整块），缓冲区取两者最大值。
@@ -1845,7 +1859,7 @@ extern "C" int32_t composekn_win32_ime_test_reconvert(
                                                                   : sizeof(RECONVERTSTRING);
     std::vector<unsigned char> storage(base + extra + 2, 0);
     auto* rec = reinterpret_cast<RECONVERTSTRING*>(storage.data());
-    rec->dwSize = static_cast<DWORD>(sizeof(RECONVERTSTRING) + extra);
+    rec->dwSize = bogusSize ? 1u : static_cast<DWORD>(sizeof(RECONVERTSTRING) + extra);
     const UINT request = static_cast<UINT>(
         kind == 2 ? IMR_COMPOSITIONFONT : (kind == 1 ? IMR_RECONVERTSTRING : IMR_DOCUMENTFEED));
     const LRESULT handled = SendMessageW(
