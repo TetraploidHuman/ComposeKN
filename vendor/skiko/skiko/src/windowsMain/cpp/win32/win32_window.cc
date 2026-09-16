@@ -158,6 +158,11 @@ struct ComposeKNWin32Window {
     // IMM32 重转换/文档馈送的诊断限流 + 开关（COMPOSEKN_IME_DOCUMENTFEED=0 退回旧行为）
     int imeReconvertLogCount = 0;
     bool imeDocumentFeedEnabled = true;
+    // COMPOSEKN_IME_COMPOSITION_FONT=0 时不告诉输入法组字字体（真机 A/B 用：
+    // 观察 ImmSetCompositionFont 会不会影响输入法自己的行为，比如还问不问文档馈送）
+    bool imeCompositionFontEnabled = true;
+    // 已经见过并处理的 IMR_* 请求位掩码（每种只记一行日志）
+    DWORD imeRequestSeenMask = 0;
     // 「已经通过 GCS_RESULTSTR 提交过」的字符：如果 IME 又把它们作为 WM_CHAR
     // 送一遍（不同 IME / 不同兼容层行为不一致），必须丢掉，否则文本会插入两次。
     std::wstring pendingCommitChars;
@@ -631,7 +636,7 @@ static void positionImeWindows(ComposeKNWin32Window* window) {
     // 失败不算错（Wine 的 imm32 是 stub；真机上拿不到字体会照样工作）。
     LOGFONTW logFont;
     BOOL fontOk = FALSE;
-    if (fillImeCompositionFont(window, &logFont)) {
+    if (window->imeCompositionFontEnabled && fillImeCompositionFont(window, &logFont)) {
         fontOk = ImmSetCompositionFontW(himc, &logFont);
     }
 
@@ -671,6 +676,22 @@ static void positionImeWindows(ComposeKNWin32Window* window) {
                 (unsigned long)candidateErr, static_cast<int>(fontOk));
         }
     }
+}
+
+/**
+ * 记一行「这个 IMR_* 请求第一次出现」（每种只记一次）。
+ *
+ * 为什么需要：真机上输入法到底问哪些请求，直接决定我们该实现什么 —— 之前只有
+ * "未处理"分支会记日志，处理了的分支反而看不见。比如 v0.5.1 真机日志里
+ * `IMR_DOCUMENTFEED` 一次都没出现，得先确认是"输入法不问"还是"我们实现后它不问了"。
+ */
+static void logImeRequestOnce(ComposeKNWin32Window* window, WPARAM what, const char* name) {
+    if (window == nullptr || what > 31) return;
+    const DWORD bit = 1u << static_cast<DWORD>(what);
+    if ((window->imeRequestSeenMask & bit) != 0) return;
+    window->imeRequestSeenMask |= bit;
+    composeknLog("ime: WM_IME_REQUEST what=%lu(%s) 首次出现（已处理）",
+                 (unsigned long)what, name);
 }
 
 /** 记下刚提交的字符串（如果 IME 之后又把它当 WM_CHAR 送一遍就丢掉）。 */
@@ -1284,6 +1305,7 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                         charPos->rcDocument = { topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
                         // 输入法每敲一个键会问好几次，且答案经常一样：只在答案变化时
                         // 记一行（并设上限），否则真机日志会被它刷爆。
+                        logImeRequestOnce(window, wParam, "QUERYCHARPOSITION");
                         if (window->imeCharPosLogCount < 60 &&
                             (dwCharPos != window->imeCharPosLastIndex ||
                              pt.x != window->imeCharPosLastX ||
@@ -1315,6 +1337,9 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     // 应用在这个缓冲区里回填「候选窗/组字窗」的位置。
                     // 与 positionImeWindows 一致：组字中一律锚在**组字串起点**，
                     // 不在组字中才跟光标（见 imeAnswerCharIndex）。
+                    logImeRequestOnce(window, wParam,
+                                      wParam == IMR_CANDIDATEWINDOW ? "CANDIDATEWINDOW"
+                                                                    : "COMPOSITIONWINDOW");
                     const int32_t charIndex = imeAnswerCharIndex(window, -1);
                     int32_t x = 0, y = 0, w = 0, h = 0;
                     imeCaretRect(window, charIndex, &x, &y, &w, &h);
@@ -1342,6 +1367,9 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     // 输入法要「文档 + 组字/目标范围」：上下文候选排序和「重新转换」
                     // 都要它。我们交一段窗口（组字/选区前后各 128 字），缓冲不够时
                     // 按两段式约定把 dwSize 改成需要的大小再回 TRUE。
+                    logImeRequestOnce(window, wParam,
+                                      wParam == IMR_DOCUMENTFEED ? "DOCUMENTFEED"
+                                                                 : "RECONVERTSTRING");
                     auto* rec = reinterpret_cast<RECONVERTSTRING*>(lParam);
                     if (rec == nullptr) break;
                     if (window->imeReconvertLogCount < 8) {
@@ -1366,6 +1394,7 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     // 安全策略：只在与文档能对上时答应 —— Kotlin 侧在文档里找这段文本，
                     // 找到才回 1（并把范围写回来），我们就推一条「设选区」事件再回 TRUE；
                     // 找不到就**拒绝**（不处理 = 输入法取消重转换），绝不动文本。
+                    logImeRequestOnce(window, wParam, "CONFIRMRECONVERTSTRING");
                     auto* rec = reinterpret_cast<RECONVERTSTRING*>(lParam);
                     if (rec == nullptr || g_imeReconvertProvider == nullptr) break;
                     const DWORD strBytes = static_cast<DWORD>(sizeof(WCHAR)) * rec->dwStrLen;
@@ -1414,6 +1443,8 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     // 输入法问「组字用什么字体」：回我们实际用的行高 + 系统 UI 字体。
                     auto* lf = reinterpret_cast<LOGFONTW*>(lParam);
                     if (lf == nullptr) break;
+                    logImeRequestOnce(window, wParam, "COMPOSITIONFONT");
+                    if (!window->imeCompositionFontEnabled) break;
                     if (fillImeCompositionFont(window, lf)) return TRUE;
                     break;
                 }
@@ -1533,12 +1564,16 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
     // 奇怪的事，COMPOSEKN_IME_DOCUMENTFEED=0 可以退回 v0.4.12 的行为（不回答）。
     const char* docFeedEnv = getenv("COMPOSEKN_IME_DOCUMENTFEED");
     window->imeDocumentFeedEnabled = !(docFeedEnv != nullptr && docFeedEnv[0] == '0');
+    const char* compFontEnv = getenv("COMPOSEKN_IME_COMPOSITION_FONT");
+    window->imeCompositionFontEnabled = !(compFontEnv != nullptr && compFontEnv[0] == '0');
     resolvePointerApis();
     composeknLog("composekn_win32_create: touch=%s pointerApi=%s",
                  window->touchEnabled ? "on" : "off",
                  g_getPointerInfo != nullptr ? "ok" : "missing");
-    composeknLog("composekn_win32_create: imeDocumentFeed=%s",
-                 window->imeDocumentFeedEnabled ? "on" : "off(COMPOSEKN_IME_DOCUMENTFEED=0)");
+    composeknLog("composekn_win32_create: imeDocumentFeed=%s imeCompositionFont=%s",
+                 window->imeDocumentFeedEnabled ? "on" : "off(COMPOSEKN_IME_DOCUMENTFEED=0)",
+                 window->imeCompositionFontEnabled ? "on"
+                                                   : "off(COMPOSEKN_IME_COMPOSITION_FONT=0)");
     window->hwnd = CreateWindowExW(
         0,
         kWindowClass,
