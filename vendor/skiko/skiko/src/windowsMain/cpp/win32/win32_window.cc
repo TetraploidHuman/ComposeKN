@@ -157,7 +157,14 @@ struct ComposeKNWin32Window {
     int imeSetFormLogCount = 0;
     // IMM32 重转换/文档馈送的诊断限流 + 开关（COMPOSEKN_IME_DOCUMENTFEED=0 退回旧行为）
     int imeReconvertLogCount = 0;
-    bool imeDocumentFeedEnabled = true;
+    // 文档馈送（IMR_DOCUMENTFEED / IMR_RECONVERTSTRING）的处理模式：
+    //   0 = 完全不回答（COMPOSEKN_IME_DOCUMENTFEED=0）
+    //   1 = 只在输入法给了缓冲区时回答（默认）
+    //   2 = 缓冲区为 NULL 时也回 TRUE 的**探针**（看输入法会不会带缓冲区再来一次）
+    // 真机实测（MS 拼音）：它发的 IMR_DOCUMENTFEED 是 **lParam = NULL** 的，
+    // 所以默认模式下我们什么都不回 —— 这正是 v0.5.1 日志里"看不到它"的原因
+    // （当时连"请求到了"都没记，见 §17.21）。
+    int imeDocumentFeedMode = 1;
     // COMPOSEKN_IME_COMPOSITION_FONT=0 时不告诉输入法组字字体（真机 A/B 用：
     // 观察 ImmSetCompositionFont 会不会影响输入法自己的行为，比如还问不问文档馈送）
     bool imeCompositionFontEnabled = true;
@@ -690,7 +697,7 @@ static void logImeRequestOnce(ComposeKNWin32Window* window, WPARAM what, const c
     const DWORD bit = 1u << static_cast<DWORD>(what);
     if ((window->imeRequestSeenMask & bit) != 0) return;
     window->imeRequestSeenMask |= bit;
-    composeknLog("ime: WM_IME_REQUEST what=%lu(%s) 首次出现（已处理）",
+    composeknLog("ime: WM_IME_REQUEST what=%lu(%s) 首次出现",
                  (unsigned long)what, name);
 }
 
@@ -1367,24 +1374,41 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     // 输入法要「文档 + 组字/目标范围」：上下文候选排序和「重新转换」
                     // 都要它。我们交一段窗口（组字/选区前后各 128 字），缓冲不够时
                     // 按两段式约定把 dwSize 改成需要的大小再回 TRUE。
-                    logImeRequestOnce(window, wParam,
-                                      wParam == IMR_DOCUMENTFEED ? "DOCUMENTFEED"
-                                                                 : "RECONVERTSTRING");
-                    auto* rec = reinterpret_cast<RECONVERTSTRING*>(lParam);
-                    if (rec == nullptr) break;
-                    if (window->imeReconvertLogCount < 8) {
-                        ++window->imeReconvertLogCount;
-                        composeknLog(
-                            "ime: WM_IME_REQUEST what=%lu(%s) 收到 dwSize=%lu dwStrLen=%lu "
-                            "comp=%lu@%lu target=%lu@%lu",
-                            (unsigned long)wParam,
-                            wParam == IMR_DOCUMENTFEED ? "DOCUMENTFEED" : "RECONVERTSTRING",
-                            (unsigned long)rec->dwSize, (unsigned long)rec->dwStrLen,
-                            (unsigned long)rec->dwCompStrLen, (unsigned long)rec->dwCompStrOffset,
-                            (unsigned long)rec->dwTargetStrLen, (unsigned long)rec->dwTargetStrOffset);
+                    {
+                        const char* name = wParam == IMR_DOCUMENTFEED ? "DOCUMENTFEED"
+                                                                     : "RECONVERTSTRING";
+                        logImeRequestOnce(window, wParam, name);
+                        auto* rec = reinterpret_cast<RECONVERTSTRING*>(lParam);
+                        if (window->imeReconvertLogCount < 12) {
+                            ++window->imeReconvertLogCount;
+                            if (rec == nullptr) {
+                                // 真机（MS 拼音）实测就是这一种：没有缓冲区。
+                                composeknLog(
+                                    "ime: WM_IME_REQUEST what=%lu(%s) lParam=NULL -> %s",
+                                    (unsigned long)wParam, name,
+                                    window->imeDocumentFeedMode == 2
+                                        ? "回 TRUE（探针模式，看输入法会不会带缓冲区再来）"
+                                        : "不处理（没有缓冲区可填）");
+                            } else {
+                                composeknLog(
+                                    "ime: WM_IME_REQUEST what=%lu(%s) 收到 dwSize=%lu "
+                                    "dwStrLen=%lu comp=%lu@%lu target=%lu@%lu",
+                                    (unsigned long)wParam, name,
+                                    (unsigned long)rec->dwSize, (unsigned long)rec->dwStrLen,
+                                    (unsigned long)rec->dwCompStrLen,
+                                    (unsigned long)rec->dwCompStrOffset,
+                                    (unsigned long)rec->dwTargetStrLen,
+                                    (unsigned long)rec->dwTargetStrOffset);
+                            }
+                        }
+                        if (window->imeDocumentFeedMode == 0) break;   // 完全不答
+                        if (rec == nullptr) {
+                            // 探针模式：告诉输入法"我支持文档馈送"，看它会不会带缓冲区再来。
+                            if (window->imeDocumentFeedMode == 2) return TRUE;
+                            break;
+                        }
+                        if (fillReconvertString(window, rec)) return TRUE;
                     }
-                    if (!window->imeDocumentFeedEnabled) break;   // COMPOSEKN_IME_DOCUMENTFEED=0
-                    if (fillReconvertString(window, rec)) return TRUE;
                     break;
                 }
                 case IMR_CONFIRMRECONVERTSTRING: {
@@ -1563,7 +1587,13 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
     // 文档馈送（IMR_DOCUMENTFEED/RECONVERTSTRING）默认开；万一某些输入法拿它做了
     // 奇怪的事，COMPOSEKN_IME_DOCUMENTFEED=0 可以退回 v0.4.12 的行为（不回答）。
     const char* docFeedEnv = getenv("COMPOSEKN_IME_DOCUMENTFEED");
-    window->imeDocumentFeedEnabled = !(docFeedEnv != nullptr && docFeedEnv[0] == '0');
+    if (docFeedEnv != nullptr && docFeedEnv[0] == '0') {
+        window->imeDocumentFeedMode = 0;
+    } else if (docFeedEnv != nullptr && (docFeedEnv[0] == '2' || docFeedEnv[0] == 'p')) {
+        window->imeDocumentFeedMode = 2;   // probe
+    } else {
+        window->imeDocumentFeedMode = 1;
+    }
     const char* compFontEnv = getenv("COMPOSEKN_IME_COMPOSITION_FONT");
     window->imeCompositionFontEnabled = !(compFontEnv != nullptr && compFontEnv[0] == '0');
     resolvePointerApis();
@@ -1571,7 +1601,9 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
                  window->touchEnabled ? "on" : "off",
                  g_getPointerInfo != nullptr ? "ok" : "missing");
     composeknLog("composekn_win32_create: imeDocumentFeed=%s imeCompositionFont=%s",
-                 window->imeDocumentFeedEnabled ? "on" : "off(COMPOSEKN_IME_DOCUMENTFEED=0)",
+                 window->imeDocumentFeedMode == 0 ? "off(COMPOSEKN_IME_DOCUMENTFEED=0)"
+                 : window->imeDocumentFeedMode == 2 ? "probe(NULL 也回 TRUE)"
+                                                    : "on",
                  window->imeCompositionFontEnabled ? "on"
                                                    : "off(COMPOSEKN_IME_COMPOSITION_FONT=0)");
     window->hwnd = CreateWindowExW(
@@ -1804,7 +1836,9 @@ extern "C" int32_t composekn_win32_ime_test_reconvert(
     ComposeKNWin32Window* window, int32_t kind, int32_t bufferChars, int32_t* out) {
     if (window == nullptr || window->hwnd == nullptr || out == nullptr) return 0;
     for (int i = 0; i < 12; ++i) out[i] = 0;
-    if (bufferChars < 0) bufferChars = 0;
+    // bufferChars < 0：lParam 直接传 NULL（真机 MS 拼音就是这么发的，用来测我们的策略）
+    const bool nullBuffer = bufferChars < 0;
+    if (nullBuffer) bufferChars = 0;
     const size_t extra = static_cast<size_t>(bufferChars) * sizeof(WCHAR);
     // 注意：LOGFONTW 比 RECONVERTSTRING 大（字体请求也会写整块），缓冲区取两者最大值。
     const size_t base = sizeof(LOGFONTW) > sizeof(RECONVERTSTRING) ? sizeof(LOGFONTW)
@@ -1814,9 +1848,9 @@ extern "C" int32_t composekn_win32_ime_test_reconvert(
     rec->dwSize = static_cast<DWORD>(sizeof(RECONVERTSTRING) + extra);
     const UINT request = static_cast<UINT>(
         kind == 2 ? IMR_COMPOSITIONFONT : (kind == 1 ? IMR_RECONVERTSTRING : IMR_DOCUMENTFEED));
-    const LRESULT handled = SendMessageW(window->hwnd, WM_IME_REQUEST,
-                                         static_cast<WPARAM>(request),
-                                         reinterpret_cast<LPARAM>(storage.data()));
+    const LRESULT handled = SendMessageW(
+        window->hwnd, WM_IME_REQUEST, static_cast<WPARAM>(request),
+        nullBuffer ? 0 : reinterpret_cast<LPARAM>(storage.data()));
     out[0] = handled != 0 ? 1 : 0;
     if (kind == 2) {
         auto* lf = reinterpret_cast<LOGFONTW*>(storage.data());

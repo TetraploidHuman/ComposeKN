@@ -1266,6 +1266,15 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                     " comp=${docFed?.get(4)}@${docFed?.get(5)}（期望 6@4）" +
                     " target=${docFed?.get(6)}@${docFed?.get(7)}（期望 6@4）",
             )
+            // 真机（MS 拼音）实测：它发的 IMR_DOCUMENTFEED 是 **lParam = NULL** 的。
+            // 默认策略是"没有缓冲区就不声称支持"（不处理 = 老行为，什么都不改），
+            // 只有 COMPOSEKN_IME_DOCUMENTFEED=2（探针模式）才会对 NULL 回 TRUE。
+            val nullProbe = app.window.imeTestReconvert(kind = 0, bufferChars = -1)
+            report.check(
+                "window/ime-document-feed-null-not-claimed",
+                nullProbe != null && nullProbe[0] == 0,
+                "lParam=NULL 的 DOCUMENTFEED -> handled=${nullProbe?.get(0)}（默认期望 0 = 不声称支持）",
+            )
             // 两段式：只给结构体大小的缓冲时，应当回"我需要多大"，而不是不回答。
             val twoPhase = app.window.imeTestReconvert(kind = 0, bufferChars = 0)
             report.check(
