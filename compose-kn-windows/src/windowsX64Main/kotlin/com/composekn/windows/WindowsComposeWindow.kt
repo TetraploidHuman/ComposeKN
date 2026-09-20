@@ -278,6 +278,10 @@ class WindowsComposeWindow(
                             Win32Event.TOUCH_UP -> TouchPhase.Up
                             else -> TouchPhase.Move
                         },
+                        // C 侧把触摸事件时间放在 a（归一化成进程内毫秒，见 win32_window.cc
+                        // 的 touchTimeBase）：速度估计器必须拿到真实事件时间，否则
+                        // 同一帧里的多条更新会共用「派发时刻」，算出假甩动。
+                        timeMillis = raw.a.toLong(),
                     )
                 )
                 Win32Event.KEY -> onEvent(

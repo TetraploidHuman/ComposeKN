@@ -48,6 +48,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -55,6 +56,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.input.pointer.isCtrlPressed
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.isPrimaryPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
 import androidx.compose.ui.platform.ClipboardManager
@@ -162,6 +164,15 @@ private const val PINCH_Y_DP = 320
 private const val PINCH_W_DP = 200
 private const val PINCH_H_DP = 140
 
+/**
+ * 「事件时间戳」探针的位置：左边缘、性能文字（16,240）下方、底部滚动区（y 480）上方的
+ * 空档。**同样不画任何像素**（只做命中测试），免得干扰别处的像素断言。
+ */
+private const val TIME_PROBE_X_DP = 16
+private const val TIME_PROBE_Y_DP = 300
+private const val TIME_PROBE_W_DP = 260
+private const val TIME_PROBE_H_DP = 120
+
 class InteractionProbe {
     var clicked by mutableStateOf(false)
     var clickCount by mutableStateOf(0)
@@ -198,6 +209,18 @@ class InteractionProbe {
 
     /** 收到多少次 transformable 手势回调（0 说明事件根本没到控件）。 */
     var pinchEvents by mutableStateOf(0)
+
+    /**
+     * Compose 指针输入层看到的最后一个事件的 `uptimeMillis`。
+     *
+     * 这是「触摸事件带没带真实事件时间」的端到端证据（§17.24）：宿主必须把
+     * `WindowsEvent.TouchEvent.timeMillis` 一路喂进 `sendPointerEvent(timeMillis=…)`；
+     * 否则 Compose 拿到的是「派发时刻」，而同一帧里到达的多条 WM_POINTERUPDATE
+     * 会共用同一个毫秒 —— 速度估计器（Lsq2，按时间轴二次拟合）时间轴被压扁，
+     * 就会算出凭空的甩动速度（真机表现：松手后内容自己跳一段）。
+     */
+    var lastPointerUptime by mutableStateOf(-1L)
+    var lastPointerPosition by mutableStateOf(Offset.Zero)
 
     /** 性能自检：true 时界面进入「一直在动画」的状态（withFrameNanos 每帧 +1）。 */
     var animate by mutableStateOf(false)
@@ -358,6 +381,26 @@ private fun DeterministicTestScreen(
                             probe.pinchEvents++
                         },
                     ),
+            )
+
+            // 事件时间戳探针：把 Compose 指针输入层看到的 `uptimeMillis` 记下来。
+            // 不消费事件、不画像素 —— 只是「宿主到底喂了什么时间给我」的观测点（§17.24）。
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = TIME_PROBE_X_DP.dp, y = TIME_PROBE_Y_DP.dp)
+                    .size(TIME_PROBE_W_DP.dp, TIME_PROBE_H_DP.dp)
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val e = awaitPointerEvent()
+                                e.changes.forEach { change ->
+                                    probe.lastPointerUptime = change.uptimeMillis
+                                    probe.lastPointerPosition = change.position
+                                }
+                            }
+                        }
+                    },
             )
 
             // 底部滚动区（滚轮测试）。
@@ -778,6 +821,114 @@ private fun renderChecks(report: SelfTestReport) {
     )
     // 触摸抬起后不能留下"卡住"的触点，否则后续滚动会被当成多指手势
     report.checkEquals("interaction/touch-pointers-released", 0, app.activeTouchCount)
+
+    // 2.6d 触摸事件必须带**真实事件时间**（§17.24 的修复）。
+    //
+    // 宿主以前不给时间戳：`sendPointerEvent` 用默认的「派发时刻」，而窗口循环是「先把
+    // 消息泵里的触摸事件一次全部派发、再渲染一帧」—— 同一帧里到达的多条
+    // WM_POINTERUPDATE 于是共用同一个毫秒。Compose 的甩动速度估计器（Lsq2，按时间轴
+    // 做二次拟合）时间轴被压扁，就会算出凭空的甩动速度：真机上表现为**松手后内容
+    // 自己跳一段**（嵌套滚动时这个假速度还会经 nestedScroll 交给父列表，整页跟着跳）。
+    //
+    // 两条断言：
+    //   (1) 事件时间**原样到达 Compose 的指针输入层**（端到端，去掉 timeMillis 就翻）；
+    //   (2) 「拖完按住不动 ~190ms 再松手」不能有甩动（真机上的"跳变"就是这个假速度
+    //       的表象：手指已经停了，列表却自己滑一段）。
+    // 手势的每一步都记进 trace（`阶段:scrollState.value`），失败时能直接看出是
+    // "压根没滚动"还是"滚了但甩动不对"。
+    val gestureTrace = StringBuilder()
+    fun touchAt(id: Long, timeMs: Long, x: Int, y: Int, phase: TouchPhase) {
+        app.dispatchEvent(
+            WindowsEvent.TouchEvent(
+                pointerId = id,
+                x = x,
+                y = y,
+                phase = phase,
+                timeMillis = timeMs,
+            ),
+        )
+        gestureTrace.append(",").append(phase.name.take(1)).append(":${scrollState.value}")
+    }
+    // 把底部滚动区送回顶部并等平滑滚动动画停稳（新手势需要确定的起点）。
+    fun resetScrollToTop() {
+        wheel(app, 400, 540, deltaY = 400)
+        wheel(app, 400, 540, deltaY = 400)
+        var last = -1
+        var stable = 0
+        var guard = 0
+        while (guard++ < 240 && stable < 4) {
+            driver.render(800, 600, density = d, frames = 1)
+            val v = scrollState.value
+            stable = if (v == last) stable + 1 else 0
+            last = v
+        }
+    }
+
+    // (1) 事件时间戳必须**原样到达 Compose 的指针输入层**。
+    //
+    // 这是本轮修复的端到端回归网：探针（测试屏里一个不画像素的 pointerInput Box）记下
+    // `PointerInputChange.uptimeMillis`，它必须等于宿主派发时带的事件时间（探针记的是
+    // 最后到的那个事件 = 抬手的 4258）。一旦有人把 `sendPointerEvent(timeMillis = …)`
+    // 去掉，Compose 拿到的是「派发时刻」—— 同一帧里到达的多条 WM_POINTERUPDATE 会共用
+    // 同一个毫秒，速度估计器时间轴被压扁，就会算出凭空的甩动速度（真机：松手后内容
+    // 自己跳一段，§17.24）。
+    // y 要加 CSD 标题栏高度：场景坐标里标题栏占顶部 32dp（和别的用例一样）
+    val probeX = ((TIME_PROBE_X_DP + 20) * d).toInt()
+    val probeY = contentTop + ((TIME_PROBE_Y_DP + 20) * d).toInt()
+    touchAt(101L, 4242L, probeX, probeY, TouchPhase.Down)
+    driver.render(800, 600, density = d, frames = 1)
+    touchAt(101L, 4258L, probeX, probeY, TouchPhase.Up)
+    driver.render(800, 600, density = d, frames = 1)
+    report.check(
+        "interaction/touch-event-time-reaches-compose",
+        probe.lastPointerUptime == 4258L && probe.lastPointerPosition == Offset(20f, 20f),
+        "探针记录到 uptimeMillis=${probe.lastPointerUptime}（期望 4258 = 抬手事件带的" +
+            "timeMillis；若退化成「派发时刻」会是一个很大的系统毫秒数）" +
+            " pos=${probe.lastPointerPosition}（探针内的局部 20,20 = 命中位置也对）",
+    )
+
+    // (2) 同样的位移，但拖完按住不动 ~190ms 再松手：**不能有甩动**
+    //     （有 = 假速度 = 真机上的"跳变"）。
+    //
+    // ⚠ harness 现象（§17.24 有记录，尚未定位）：合成事件下**第一遍**触摸手势有可能
+    // 被整段吞掉 —— 实测每个事件都只有 `dispatchedToAPointerInputModifier`、没有
+    // "移动被消费"（TOUCHDBG 里 result=1），拖动也就完全没生效。所以同一套手势跑两遍、
+    // 断言第二遍，并把两遍的数字都写进失败信息（真机不受这个现象影响；两遍都被吞掉时
+    // 这条断言会响亮地失败，不会假通过）。
+    fun holdGesture(id: Long, t0: Long): Triple<Int, Int, String> {
+        resetScrollToTop()
+        val start = scrollState.value
+        gestureTrace.setLength(0)
+        touchAt(id, t0, 400, 560, TouchPhase.Down)
+        driver.render(800, 600, density = d, frames = 1)
+        touchAt(id, t0 + 8, 400, 540, TouchPhase.Move)
+        touchAt(id, t0 + 16, 400, 520, TouchPhase.Move)
+        touchAt(id, t0 + 24, 400, 500, TouchPhase.Move)
+        driver.render(800, 600, density = d, frames = 1)
+        // 按住不动 ~190ms：每帧一条静止上报，和真机 100Hz 触摸同形
+        for (i in 1..12) {
+            driver.render(800, 600, density = d, frames = 1)
+            touchAt(id, t0 + 24 + i * 16L, 400, 500, TouchPhase.Move)
+        }
+        driver.render(800, 600, density = d, frames = 1)
+        touchAt(id, t0 + 24 + 13 * 16L, 400, 500, TouchPhase.Up)
+        driver.render(800, 600, density = d, frames = 1)
+        val afterUp = scrollState.value
+        driver.render(800, 600, density = d, frames = 30)
+        val end = scrollState.value
+        return Triple(afterUp - start, end - afterUp, gestureTrace.toString())
+    }
+    app.debugTouchTrace = true
+    val warmup = holdGesture(102L, 2000L)
+    val hold = holdGesture(103L, 2400L)
+    app.debugTouchTrace = false
+    report.check(
+        "interaction/touch-hold-has-no-fling",
+        hold.first >= 30 && kotlin.math.abs(hold.second) <= 2,
+        "拖动段=${hold.first}px（期望 ≥30） 松手后 30 帧位移=${hold.second}px（期望 0±2） " +
+            "trace=${hold.third} ｜ 预热遍: 拖动=${warmup.first}px 松手后位移=${warmup.second}px " +
+            "trace=${warmup.third}",
+    )
 
     // 2.7 焦点 / 光标 / 选区
     //

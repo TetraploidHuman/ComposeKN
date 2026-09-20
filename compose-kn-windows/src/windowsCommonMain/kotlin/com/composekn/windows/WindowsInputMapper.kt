@@ -111,6 +111,12 @@ internal fun ComposeScene.dispatchWindowsTouchEvent(
         pointers = pointers,
         buttons = PointerButtons(),
         keyboardModifiers = inputState.modifiers,
+        // 真实事件时间（毫秒）。**不要删**：Compose 的甩动速度估计器按时间轴拟合，
+        // 省略这个参数时会退回 sendPointerEvent 的默认值 `currentTimeMillis()` ——
+        // 那是「派发时刻」，而窗口循环是先把消息泵里的触摸事件一次全部派发再渲染，
+        // 于是同一帧里到达的几条更新共用一个毫秒。时间轴被压扁 → 算出假的甩动速度
+        // → 真机上「松手后列表自己跳一段」（HANDOVER §17.24）。
+        timeMillis = event.timeMillis,
         nativeEvent = event,
         button = null,
     )
@@ -120,8 +126,8 @@ internal fun ComposeScene.dispatchWindowsTouchEvent(
     // 实测：正常拖动 Move 的 result=7；触摸被当成鼠标时全是 1。
     if (inputState.debugTouchTrace) {
         println(
-            "TOUCHDBG phase=${event.phase} id=${event.pointerId} pos=${event.x},${event.y} " +
-                "pointers=${pointers.size} result=$result",
+            "TOUCHDBG phase=${event.phase} id=${event.pointerId} t=${event.timeMillis} " +
+                "pos=${event.x},${event.y} pointers=${pointers.size} result=$result",
         )
     }
 }

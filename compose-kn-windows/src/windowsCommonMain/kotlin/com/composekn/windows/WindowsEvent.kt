@@ -75,6 +75,17 @@ sealed class WindowsEvent {
         val x: Int,
         val y: Int,
         val phase: TouchPhase,
+        /**
+         * **真实事件时间**（C 侧由 `POINTER_INFO.dwTime` / `GetMessageTime()` 归一化出来的
+         * 进程内毫秒）。必须原样喂给 `sendPointerEvent`，不能省：Compose 的速度估计器
+         * 按时间轴做二次拟合，用「派发时刻」代替事件时间会把同一帧里到达的多条更新
+         * 压成同一个时间戳，从而算出凭空的甩动速度（真机表现：松手后内容自己跳一段，
+         * 见 HANDOVER §17.24）。
+         *
+         * 0 表示调用方没提供（合成事件 / 自检）：速度估计器拿到一串同时间戳的数据点，
+         * 结果是无甩动 —— 确定且可复现，正是自检需要的语义。
+         */
+        val timeMillis: Long = 0L,
     ) : WindowsEvent()
 
     /**

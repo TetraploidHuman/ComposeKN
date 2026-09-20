@@ -131,6 +131,29 @@ struct ComposeKNWin32Window {
     // 触摸（WM_POINTER）通道。COMPOSEKN_TOUCH=0 可整体关掉，退回「系统把触摸提升成鼠标」的老行为。
     bool touchEnabled = true;
     int touchLogCount = 0;
+    // 触摸事件时间的基准。POINTER_INFO.dwTime / GetMessageTime() 都是**系统 tick**
+    // （32 位毫秒），这里减去第一个触摸事件的 tick，归一化成「进程内单调毫秒」
+    // 再交给 Compose。
+    //
+    // 为什么必须带真实事件时间（§17.24）：宿主以前不给时间戳，`sendPointerEvent`
+    // 就用默认的 `currentTimeMillis()` —— 那是**派发时刻**。窗口循环是「先把消息泵里
+    // 的触摸事件一次全部派发，再渲染一帧」，于是同一帧里到达的几条 WM_POINTERUPDATE
+    // 拿到同一个毫秒。Compose 的速度估计器（Lsq2：按时间轴做二次拟合）时间轴被压扁，
+    // 算出凭空的甩动速度 —— 真机表现就是**松手后内容自己跳一段**。
+    uint32_t touchTimeBase = 0;
+    // 触摸诊断日志要用的「这根指针上一次事件」（算 dt 与位移）。4 槽环形缓冲，
+    // 多指交替推进时也找得到同一根手指。
+    struct TouchLogSample {
+        bool used = false;
+        uint32_t id = 0;
+        uint32_t time = 0;
+        float x = 0.f;
+        float y = 0.f;
+    };
+    TouchLogSample touchLogSamples[4] = {};
+    int touchLogNext = 0;
+    // 这台机器上见过多少次「同一毫秒内两条移动事件」（上面那个 bug 的现场特征）。
+    int touchSameTickMoveCount = 0;
     // false = 系统标题栏（Compose JVM 桌面 Window() 的默认形态：NC 全归 OS 管）；
     // true = 无边框自绘 CSD（对应 JVM 的 undecorated = true）。
     bool undecorated = false;
@@ -195,6 +218,37 @@ static uint32_t queryCurrentModifiers() {
 
 static void pushEvent(ComposeKNWin32Window* window, const ComposeKNWin32Event& event) {
     window->events.push_back(event);
+}
+
+/**
+ * 触摸事件的时间戳：把系统 tick 归一化成「进程内毫秒」（见 touchTimeBase 的说明）。
+ * `raw == 0`（驱动没填 dwTime）时用当前消息的时间。
+ */
+static uint32_t touchEventTime(ComposeKNWin32Window* window, uint32_t raw) {
+    const uint32_t value = (raw != 0) ? raw : static_cast<uint32_t>(GetMessageTime());
+    if (window->touchTimeBase == 0) window->touchTimeBase = value;
+    return value - window->touchTimeBase;
+}
+
+/** 找到某根指针上一次记录的触摸样本（诊断用，也用于 CAPTURECHANGED 的位置兜底）。 */
+static const ComposeKNWin32Window::TouchLogSample* findTouchSample(
+    const ComposeKNWin32Window* window, uint32_t id) {
+    for (int i = 0; i < 4; ++i) {
+        const auto& s = window->touchLogSamples[i];
+        if (s.used && s.id == id) return &s;
+    }
+    return nullptr;
+}
+
+static void storeTouchSample(ComposeKNWin32Window* window, uint32_t id, uint32_t time,
+                             float x, float y) {
+    auto& slot = window->touchLogSamples[window->touchLogNext];
+    slot.used = true;
+    slot.id = id;
+    slot.time = time;
+    slot.x = x;
+    slot.y = y;
+    window->touchLogNext = (window->touchLogNext + 1) % 4;
 }
 
 static int edgeMargin(ComposeKNWin32Window* window) {
@@ -1140,17 +1194,46 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             if (message == WM_POINTERCAPTURECHANGED) {
                 // 触点被系统收走（手势识别、其它窗口抢焦点…）：必须补一个抬起，
                 // 否则 Kotlin 侧的活动触点表会永远留着这根手指，后续滚动就"卡死"了。
+                //
+                // 位置/时间也不能省：Compose 的 Release 事件要带**该触点的最终位置**，
+                // 补成 (0,0) 会让「上一次位置 → 0,0」变成一次横跨半个窗口的位移。
+                // 文档保证此时 GetPointerInfo 仍返回收走前的数据；拿不到就退回最后一次
+                // 记录到的位置。
+                POINT pt{};
+                bool got = false;
+                uint32_t rawTime = 0;
+                if (g_getPointerInfo != nullptr) {
+                    POINTER_INFO info{};
+                    if (g_getPointerInfo(pointerId, &info)) {
+                        pt = info.ptPixelLocation;
+                        rawTime = info.dwTime;
+                        got = true;
+                    }
+                }
+                if (got) {
+                    ScreenToClient(hwnd, &pt);
+                } else if (const auto* last = findTouchSample(window, pointerId)) {
+                    pt.x = static_cast<LONG>(last->x);
+                    pt.y = static_cast<LONG>(last->y);
+                    rawTime = last->time + window->touchTimeBase;
+                }
                 e.type = COMPOSEKN_WIN32_EVENT_TOUCH_UP;
                 e.state = 0;
+                e.x = static_cast<float>(pt.x);
+                e.y = static_cast<float>(pt.y);
+                e.a = static_cast<int32_t>(touchEventTime(window, rawTime));
             } else {
                 // 坐标语义：lParam 到底是客户区还是屏幕坐标，各版本文档说法不一致，
                 // 这里直接用 GetPointerInfo 的**屏幕**坐标再转客户区，避免把触摸位置搞错。
                 POINT pt{};
                 bool got = false;
+                uint32_t rawTime = 0;
                 if (g_getPointerInfo != nullptr) {
                     POINTER_INFO info{};
                     if (g_getPointerInfo(pointerId, &info)) {
                         pt = info.ptPixelLocation;
+                        // dwTime = 「消息收到时的系统 tick」（毫秒）；0 时退回消息时间。
+                        rawTime = info.dwTime;
                         got = true;
                     }
                 }
@@ -1170,15 +1253,42 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 e.state = (message == WM_POINTERUP) ? 0u : 1u;
                 e.x = static_cast<float>(pt.x);
                 e.y = static_cast<float>(pt.y);
+                // 真实事件时间（进程内毫秒）—— Compose 用它做速度估计，见 touchTimeBase。
+                e.a = static_cast<int32_t>(touchEventTime(window, rawTime));
             }
             pushEvent(window, e);
-            if (window->touchLogCount < 12) {
-                ++window->touchLogCount;
-                composeknLog("touch: type=%d id=%u pos=%.0f,%.0f raw=%.0f",
-                             static_cast<int>(e.type), pointerId,
-                             static_cast<double>(e.x), static_cast<double>(e.y),
-                             static_cast<double>(e.state));
+            const uint32_t eventTime = static_cast<uint32_t>(e.a);
+            const char* phase = e.type == COMPOSEKN_WIN32_EVENT_TOUCH_DOWN ? "DOWN"
+                              : e.type == COMPOSEKN_WIN32_EVENT_TOUCH_UP   ? "UP"
+                                                                          : "MOVE";
+            if (message == WM_POINTERCAPTURECHANGED) phase = "CAPTURE-LOST";
+            const auto* prev = findTouchSample(window, pointerId);
+            if (prev != nullptr && e.type == COMPOSEKN_WIN32_EVENT_TOUCH_MOVE &&
+                eventTime == prev->time && (e.x != prev->x || e.y != prev->y)) {
+                // 诊断核心：同一毫秒里两条**移动**事件 —— 速度估计器的时间轴被压扁的现场。
+                ++window->touchSameTickMoveCount;
             }
+            // 日志上限 400 行：够覆盖一次完整的拖动，又不会把 composekn-startup.log 刷爆。
+            if (window->touchLogCount < 400) {
+                ++window->touchLogCount;
+                if (prev != nullptr) {
+                    composeknLog(
+                        "touch: %-12s id=%u t=%ums dt=%ums d=(%+.0f,%+.0f) pos=%.0f,%.0f",
+                        phase, pointerId, eventTime, eventTime - prev->time,
+                        static_cast<double>(e.x - prev->x), static_cast<double>(e.y - prev->y),
+                        static_cast<double>(e.x), static_cast<double>(e.y));
+                } else {
+                    composeknLog("touch: %-12s id=%u t=%ums pos=%.0f,%.0f",
+                                 phase, pointerId, eventTime,
+                                 static_cast<double>(e.x), static_cast<double>(e.y));
+                }
+            } else if (window->touchLogCount == 400) {
+                ++window->touchLogCount;
+                composeknLog("touch: （日志已达 400 行上限，后续触摸事件不再记录；"
+                             "同一毫秒内的移动事件累计 %d 次）",
+                             window->touchSameTickMoveCount);
+            }
+            storeTouchSample(window, pointerId, eventTime, e.x, e.y);
             // 明确"我处理了这条指针消息"（不交给 DefWindowProc）：
             // 否则系统会再合成一份鼠标消息，一次触摸变成两套输入。
             return 0;

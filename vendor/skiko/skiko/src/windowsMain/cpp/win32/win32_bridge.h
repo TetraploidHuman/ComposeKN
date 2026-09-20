@@ -61,8 +61,10 @@ typedef struct ComposeKNWin32Event {
     float y;          /* mouse: client coords; move: window y */
     uint32_t button;  /* mouse: button id; key: virtual key code */
     uint32_t state;   /* 0=released 1=pressed */
-    int32_t a;        /* key: flags; wheel: delta (120 = line) ; focus: 1=acquired */
-    int32_t b;        /* char: unicode codepoint; key: scan code */
+    int32_t a;        /* key: flags; wheel: delta (120 = line); focus: 1=acquired;
+                       * touch: 真实事件时间（归一化成进程内毫秒，见 win32_window.cc
+                       *       的 touchTimeBase —— Compose 的甩动速度估计器要用它） */
+    int32_t b;        /* char: unicode codepoint; key: scan code; mouse wheel: 1 = 横向 */
     uint32_t modifiers;
 } ComposeKNWin32Event;
 

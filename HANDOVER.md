@@ -2341,3 +2341,117 @@ interaction/no-leaked-touch-pointers # 两轮双指手势后 activeTouchCount �
 教训：**探针不要画东西** —— Compose 的命中测试按布局边界算，不画像素照样能接手势。
 
 自检：logic 97 / window 37 全绿；打包单文件 exe（无 icudtl.dat）干净目录复测同样全绿。
+### 17.24 嵌套滚动「跳变」的根因：触摸事件没带真实时间 → 假甩动（v0.5.6）
+
+#### 现象
+
+用户真机反馈：捏合/双指正常，但**「嵌套滚动的时候貌似会有跳变」**。随附的启动日志里
+触摸部分只有 12 行、且全是同一坐标（`pos=170,953` 连续 11 条 MOVE）—— 那是日志上限
+（`touchLogCount < 12`）先把日志截断了，移动过程根本没记下来。**先修诊断，再谈修复。**
+
+#### 排查（先排掉三个假设，避免瞎猜）
+
+| 假设 | 结论 |
+|---|---|
+| `WM_POINTERCAPTURECHANGED` 的 `wParam` 不是指针 id，补抬起时清错了触点 | **不成立**：MS 文档明确写 `wParam` 用 `GET_POINTERID_WPARAM` 取指针 id（只 `lParam` 是抢走捕获的窗口），原实现是对的 |
+| 触摸被系统「提升」成鼠标，一次手势两套事件 | 不成立：WM_POINTER* 一条都不交给 `DefWindowProc`（系统才不会再合成鼠标消息）；而且鼠标拖拽**按设计不能滚动**，就算真有第二套也不会造成滚动跳变 |
+| 事件队列丢/重/乱序 | 不成立：C 侧是 `std::vector` 顺序队列，Kotlin 一次全排空，没有环形覆盖、没有 peek 不消费 |
+
+#### 根因：宿主从来没给 `sendPointerEvent` 传时间戳，默认值拿到的是**派发时刻**
+
+`WindowsInputMapper.dispatchWindowsTouchEvent` 调 `sendPointerEvent(...)` 时**省略**了
+`timeMillis`，于是走默认值 `currentTimeMillis()`。而 `WindowsComposeWindow.run()` 的循环是：
+
+```
+win.pump() → translateAndDispatch()（把消息泵里所有事件一次全部派发） → 渲染一帧
+```
+
+→ **同一帧里到达的多条 `WM_POINTERUPDATE` 拿到同一个毫秒**。Compose 的甩动速度估计器
+（`Lsq2VelocityTracker` → `PointerVelocityTracker1D(Strategy.Lsq2)`，skikoMain 实现）
+是**按时间轴做二次多项式拟合**的，时间轴被压扁就会算出凭空的（或丢失真的）速度：
+
+用 Python 复刻 `PointerVelocityTracker1D.calculateVelocity()` + `polyFitLeastSquares()`
++ `adjustDataPointsIfNeeded()`，喂两个真实序列（同一段位移，只有时间不同）：
+
+```
+3 条快速移动挤在同一帧 + 之后按住不动 100ms 再抬手（真机上很常见）：
+    真实事件时间 ->      0 px/s   （正确：手指已经停了，不该有甩动）
+    派发时刻     ->  -1114 px/s   （凭空的甩动 -> 松手后内容自己滑一段 = "跳变"）
+
+一帧内完成的真甩动（抬手就松）：
+    真实事件时间 ->  15000 px/s   （有甩动）
+    派发时刻     ->      0 px/s   （真甩动反而丢了）
+```
+
+真机上「拖完停住再松手」是最常见的收尾动作，于是**每次收尾都可能多出一段假甩动**；
+嵌套滚动时这段假速度还会经 `nestedScroll` 交给父列表 —— 内层小列表已经到边，
+剩下的假速度推着**整页**滑一段，用户看到的就是「整页跳变」。
+
+**上游同款问题**：JetBrains `compose-multiplatform-core` 1c2b9f5
+「ui.touch.iOS fix scroll issues (#776)」，PR 里写得很直白 —— 修的就是
+*inadequate fling velocity during "quick-drag-and-stop" touch events sequence*、
+*duplicated data points in a single timestamp ... leading to inadequate velocity
+(unexpected scrolls to top)*。iOS 侧的做法正是：**用事件真实时间戳**，并把同一帧内的
+合并触摸样本放进 `ComposeScenePointer.historical`（不是当成多条独立事件发）。
+
+#### 修复
+
+* **C**：`POINTER_INFO.dwTime`（「消息收到时的系统 tick」，毫秒；为 0 时退回
+  `GetMessageTime()`）减去第一根手指的基准 → **进程内单调毫秒**，放进事件结构的 `a`
+  （触摸通道本来用不到这个字段）。
+* **Kotlin**：`WindowsEvent.TouchEvent.timeMillis` → `dispatchWindowsTouchEvent()` 原样
+  传给 `sendPointerEvent(timeMillis = …)`。合成事件（自检）默认 0 = 一串同时间戳的数据点
+  = 无甩动，确定可复现。
+* 顺带修 `WM_POINTERCAPTURECHANGED` 补的那条抬起：以前位置是 **(0,0)**，而 Compose 要求
+  Release 事件带该触点的**最终位置** —— 现在用 `GetPointerInfo`（文档保证此时仍返回收走
+  前的数据），拿不到就退回最后一次记录的位置。
+* **没做**（记进待办）：Windows 版 `historical`（`GetPointerInfoHistory` 的合并样本）。
+  这是对齐 iOS 形状的下一步，需要给桥接加一个变长样本队列，本轮不扩。
+
+#### 诊断升级（下次真机日志要能直接看出结论）
+
+触摸日志从「最多 12 行、只记 `type/id/pos`」改成「最多 400 行，记
+`t=`（进程内毫秒）/`dt=`/`d=(dx,dy)`/`pos`」，`WM_POINTERCAPTURECHANGED` 单独记成
+`CAPTURE-LOST`（以前混在 `type=13` 里，位置还是 0,0，很容易误读）；另外新增
+`touchSameTickMoveCount`：**同一毫秒内两条"移动"事件的累计次数**。
+
+```
+touch: MOVE         id=6440 t=1022ms dt=10ms d=(0,-20) pos=170,933
+touch: MOVE         id=6440 t=1022ms dt=0ms  d=(0,-20) pos=170,913   <- 修复前：时间轴压扁
+touch: CAPTURE-LOST id=6440 t=1180ms dt=36ms d=(0,-4)  pos=170,905
+```
+
+日志末尾会打出这个计数。**验收标准：修好后它恒为 0**（同一毫秒里不该再有两条移动）。
+
+#### 自检（logic 97 → 99）
+
+```
+interaction/touch-event-time-reaches-compose  # 端到端：宿主给的时间必须原样到达 Compose 指针层
+interaction/touch-hold-has-no-fling           # 拖 60px 后按住 190ms 再松手：松手后必须 ±2px 内不动
+```
+
+前一条是**回归网**。做法：测试屏里放一个**不画像素**的 `pointerInput` 探针（Box），
+把 `PointerInputChange.uptimeMillis` 记下来；用例带 `timeMillis = 4242/4258` 发一对
+Down/Up，断言探针看到的（最后一个事件 = Up）正好是 4258、且局部坐标是 `(20,20)`。
+一旦有人把 `sendPointerEvent(timeMillis = …)` 去掉/改回派发时刻，这里会拿到一个很大的
+系统毫秒数 —— 立刻红。
+
+后一条钉的是用户看到的语义（手指停了就不该再滚）。注意：**它在合成事件 harness 里
+修前修后都通过**（合成事件全部落在同一个墙钟毫秒 → 退化时间轴 → 速度算成 0 → 也不会
+有假甩动），所以抓 bug 靠的是前一条 + 下面那段仿真，真机验收靠用户日志里的
+`touchSameTickMoveCount` 和手感。这一点写在这里，免得以后误以为这条断言抓过这个 bug。
+
+#### 遗留：合成事件 harness 的一个怪现象（未定位，不影响真机）
+
+写上面第二条断言时，**同一套手势的第一遍会被整段吞掉**：TOUCHDBG 里每个事件都是
+`result=1`（只派发到了 pointerInput 节点，没有任何"移动/变化被消费"），于是拖动完全
+没生效；紧接着再跑同一套手势（只改 pointerId / timeMillis）就一切正常（`result=7`）。
+只在"鼠标拖拽用例刚跑完"之后出现，和本轮改的事件时间无关（改前改后一样）。因为
+**两遍都被吞掉时断言会响亮失败、不会假通过**，这里先按"跑两遍、断言第二遍、两遍数字
+都打进失败信息"处理，并把现象记进待办；真机路径（WM_POINTER）没有观察到这个现象。
+
+#### 本轮验证
+
+* logic 99 / window 37（合计 136）、`all` 模式 133 —— 全绿；
+* 打包单文件 exe（无 `icudtl.dat`）在**干净目录**里复测 99/37 全绿；
+* 截图阶段照旧通过（60.7 fps）。
