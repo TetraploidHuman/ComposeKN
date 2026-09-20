@@ -25,6 +25,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -148,6 +150,18 @@ private const val CHROME_ARGB = 0xFF2D2D30.toInt()
 /** CSD 标题栏高度（见 WindowsWindowChrome）。 */
 private const val CHROME_DP = 32f
 
+/**
+ * 多点触摸（捏合缩放）探针方块的位置/尺寸。
+ *
+ * 刻意挑在别的断言都不覆盖的空档里：既有的像素断言与手势测试覆盖顶部输入框
+ * （y 16~226）、按钮（0~210 × 96~144）、弹层/菜单锚点（400,200 / 520,300）、
+ * 性能文字（16,240）、底部滚动区（y 480~600）。x 560~760 / y 320~460 是空的。
+ */
+private const val PINCH_X_DP = 560
+private const val PINCH_Y_DP = 320
+private const val PINCH_W_DP = 200
+private const val PINCH_H_DP = 140
+
 class InteractionProbe {
     var clicked by mutableStateOf(false)
     var clickCount by mutableStateOf(0)
@@ -174,6 +188,16 @@ class InteractionProbe {
      * 宿主忘了喂尺寸时弹层会全部塌到窗口左上角（见 WindowsWindowInfo 的注释）。
      */
     var windowContainerSize by mutableStateOf(IntSize.Zero)
+
+    /**
+     * 多点触摸（捏合）探针：Compose 的 `transformable` 把每次 zoom 累乘进来。
+     * 两指张开应当 > 1、捏合应当 < 1 —— 这是「宿主把多指针事件正确送进 Compose」
+     * 的端到端证据（§8.4 一直缺这条）。
+     */
+    var pinchScale by mutableStateOf(1f)
+
+    /** 收到多少次 transformable 手势回调（0 说明事件根本没到控件）。 */
+    var pinchEvents by mutableStateOf(0)
 
     /** 性能自检：true 时界面进入「一直在动画」的状态（withFrameNanos 每帧 +1）。 */
     var animate by mutableStateOf(false)
@@ -315,6 +339,26 @@ private fun DeterministicTestScreen(
                     DropdownMenuItem(text = { Text("menu item B") }, onClick = {})
                 }
             }
+
+            // 多点触摸探针：两根手指的捏合/张开 -> Compose 官方的 transformable。
+            // 用官方手势而不是自己写 pointerInput，是为了测「宿主送进来的多指针事件」，
+            // 而不是同时把识别算法也一起自研了。
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = PINCH_X_DP.dp, y = PINCH_Y_DP.dp)
+                    .size(PINCH_W_DP.dp, PINCH_H_DP.dp)
+                    // ⚠ 刻意**不画背景**：它是纯手势探针，画出来会和别处的像素断言打架
+                    // （第一版就是这么被抓到的：menu/closed-region-is-background 报
+                    //  22200 个非背景像素 = 这个 200x110 的重叠区）。Compose 的命中测试
+                    // 按**布局边界**算、不看画出来的像素，所以照样能收到触摸。
+                    .transformable(
+                        state = rememberTransformableState { zoomChange, _, _ ->
+                            probe.pinchScale *= zoomChange
+                            probe.pinchEvents++
+                        },
+                    ),
+            )
 
             // 底部滚动区（滚轮测试）。
             // ScrollState 由调用方注入：断言时直接读 `scrollState.value`，
@@ -694,6 +738,39 @@ private fun renderChecks(report: SelfTestReport) {
     val beforeMouseDrag = scrollState.value
     mouseDrag(app, 400, 560, 300)
     driver.render(800, 600, density = d, frames = 4)
+    // 2.6c 多点触摸（捏合缩放）：宿主必须把**每根手指**的 WM_POINTER 事件聚合成
+    //      多指针 PointerEvent 交给 Compose（§8.4 里这块一直没测过）。
+    //      这里用官方 transformable 接手势：两指张开 -> 放大，捏合 -> 缩小。
+    val pinchBase = probe.pinchScale
+    twoFingerGesture(
+        app, driver, d,
+        start1 = Pair(620f, 390f), end1 = Pair(578f, 390f),
+        start2 = Pair(700f, 390f), end2 = Pair(742f, 390f),
+    )
+    report.check(
+        "interaction/pinch-zoom-in",
+        probe.pinchScale > pinchBase * 1.2f,
+        "两指张开 80px->164px：scale ${pinchBase} -> ${probe.pinchScale}，回调 ${probe.pinchEvents} 次",
+    )
+    val pinchAfterZoomIn = probe.pinchScale
+    twoFingerGesture(
+        app, driver, d,
+        start1 = Pair(586f, 390f), end1 = Pair(642f, 390f),
+        start2 = Pair(734f, 390f), end2 = Pair(678f, 390f),
+    )
+    report.check(
+        "interaction/pinch-zoom-out",
+        probe.pinchScale < pinchAfterZoomIn * 0.9f,
+        "两指捏合 148px->36px：scale $pinchAfterZoomIn -> ${probe.pinchScale}，回调 ${probe.pinchEvents} 次",
+    )
+    // 手指全部抬起之后，宿主的活动触点表必须归零 —— 否则残留的触点会让后续
+    // 单指手势"卡住"（WM_POINTERCAPTURECHANGED 那条补抬起的逻辑就是防这个）。
+    report.check(
+        "interaction/no-leaked-touch-pointers",
+        app.activeTouchCount == 0,
+        "两轮双指手势之后 activeTouchCount=${app.activeTouchCount}（期望 0）",
+    )
+
     report.check(
         "interaction/mouse-drag-does-not-scroll",
         scrollState.value == beforeMouseDrag,
@@ -1583,6 +1660,55 @@ private fun keyPress(app: WindowsComposeApplication, vk: Int) {
     app.dispatchEvent(WindowsEvent.KeyEvent(virtualKeyCode = vk, scanCode = 0, isKeyDown = true))
     app.dispatchEvent(WindowsEvent.KeyEvent(virtualKeyCode = vk, scanCode = 0, isKeyDown = false))
     app.pumpDispatchers()
+}
+
+/**
+ * 注入一次**双指**手势：两根手指各自 down -> N 步 move -> up。
+ *
+ * 为什么必须按"每根手指一条事件、交替推进"来发：宿主的触点表要求每次事件带上全部
+ * 活动触点（Kotlin 侧 `WindowsInputState.updateTouch` 就是这么组装的），而
+ * `detectTransformGestures` 需要看到两根手指的**位置都在变**才算 zoom。
+ */
+private fun twoFingerGesture(
+    app: WindowsComposeApplication,
+    driver: com.composekn.windows.test.OffscreenDriver,
+    density: Float,
+    start1: Pair<Float, Float>,
+    end1: Pair<Float, Float>,
+    start2: Pair<Float, Float>,
+    end2: Pair<Float, Float>,
+    steps: Int = 6,
+) {
+    fun touch(id: Long, p: Pair<Float, Float>, phase: TouchPhase) {
+        app.dispatchEvent(
+            WindowsEvent.TouchEvent(
+                pointerId = id,
+                x = (p.first * density).toInt(),
+                y = (p.second * density).toInt(),
+                phase = phase,
+            ),
+        )
+    }
+    touch(7L, start1, TouchPhase.Down)
+    touch(8L, start2, TouchPhase.Down)
+    driver.render(800, 600, density = density, frames = 2)
+    for (i in 1..steps) {
+        val t = i.toFloat() / steps
+        touch(
+            7L,
+            Pair(start1.first + (end1.first - start1.first) * t, start1.second + (end1.second - start1.second) * t),
+            TouchPhase.Move,
+        )
+        touch(
+            8L,
+            Pair(start2.first + (end2.first - start2.first) * t, start2.second + (end2.second - start2.second) * t),
+            TouchPhase.Move,
+        )
+        driver.render(800, 600, density = density, frames = 2)
+    }
+    touch(7L, end1, TouchPhase.Up)
+    touch(8L, end2, TouchPhase.Up)
+    driver.render(800, 600, density = density, frames = 4)
 }
 
 /** 统计两帧在 [y0, y1] 行范围内的不同像素数（用于「内容确实滚动了」这类断言）。 */

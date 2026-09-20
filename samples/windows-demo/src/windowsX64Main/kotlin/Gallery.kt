@@ -7,6 +7,8 @@ package main
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -97,6 +99,9 @@ class GalleryProbe {
     var scrollY by mutableStateOf(0)
     var lazyScrollY by mutableStateOf(0)
     var hoverCount by mutableStateOf(0)
+
+    /** 多点触摸：捏合缩放的累乘结果（两张手指张开 -> 变大，捏合 -> 变小）。 */
+    var pinchScale by mutableStateOf(1f)
     var frames by mutableStateOf(0)
     var clipboardText by mutableStateOf("")
 
@@ -409,6 +414,38 @@ private fun LazyListScope.gallerySections(probe: GalleryProbe, animate: Boolean)
                 dismissButton = {
                     TextButton(onClick = { probe.dialogOpen = false }) { Text("取消") }
                 },
+            )
+        }
+    }
+
+    section("多点触摸 / Pinch") {
+        // 宿主侧：C 的 WM_POINTER 为每根手指各发一条事件 -> Kotlin 聚合成「多指针
+        // PointerEvent」-> Compose 的手势识别。真机上用手指捏合/张开会改变 scale
+        // （触摸屏或精密触控板；鼠标拖拽不会触发，那条由自检单独断言）。
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(120.dp)
+                    .transformable(
+                        state = rememberTransformableState { zoomChange, _, _ ->
+                            probe.pinchScale = (probe.pinchScale * zoomChange).coerceIn(0.25f, 4f)
+                        },
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size((56 * probe.pinchScale).dp)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("两指\n捏合", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Spacer(Modifier.width(16.dp))
+            Text(
+                text = "scale=${(probe.pinchScale * 100).toInt()}%（两指张开/捏合试试；鼠标拖拽不动）",
+                style = MaterialTheme.typography.bodySmall,
             )
         }
     }

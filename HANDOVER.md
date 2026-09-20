@@ -325,7 +325,9 @@ cd /home/miaox99/ComposeKN
 ### 8.4 限制（待后续）
 
 - **完整交互验证需触摸屏**：本 GNOME Shell 会话无 touch 座标，事件路径未触发；代码按协议实现 + 编译/链接/运行干净，交互正确性待用户在触摸设备上实测（可拖 §7 的 Drag 方块 / 点按钮验证）。
-- 当前为**单点触摸**映射（每触摸点独立 Press/Move/Release）；**多点手势（捏合缩放/双指）**未做（需 Compose `sendPointerEvent` 的多 pointer 重载 + 手势识别），留作后续。
+- ~~当前为**单点触摸**映射；**多点手势（捏合缩放/双指）**未做（需 Compose `sendPointerEvent` 的多 pointer 重载 + 手势识别）~~
+  → **已做并验证，见 §17.23**（宿主侧原本就有：C 为每根手指各发一条 `WM_POINTER`、Kotlin 维护触点表
+  并走多指针 `sendPointerEvent`；缺的是**用起来 + 断言**）。
 
 ## 9. 自动化输入测试（2025-01-10 完成）
 
@@ -2290,3 +2292,52 @@ window 36→37。
   候选窗/组字窗请求；
 * 干净退出；这一次**全程最大化**（`窗口=1368x850`），`update 2.7~3.2 / draw 1.3~1.7 /
   present 3.6~5.5ms`（合计 ~8-10ms，仍在 59Hz 的 16.9ms 预算内），但与 1087x725 的数字不可比。
+
+
+### 17.23 多点触摸（捏合/双指）变成可验证的 + 性能基线 A/B（v0.5.5）
+
+#### (1) 性能基线：先回答"是不是 IME 那串改动把渲染拖慢了"
+
+用户真机日志里最近的 `profile` 数字比 v0.4.x 那几次高（`update 2.7~3.2 / draw 1.3~1.7` vs
+`1.5 / 0.8`），但**窗口尺寸不同**（1368x850 全程最大化 vs 1087x725），不可比。于是做了
+**本地 A/B**：同一台机器、同一个 X 会话、同一尺寸（1092x726）、都开动画、交替跑两个发布包：
+
+| 版本 | update | draw | present | total |
+|---|---|---|---|---|
+| v0.4.7（IMM32 之前） | 1.4~1.5ms | 1.5~1.6ms | 0.9~1.0ms | **3.9~4.0ms** |
+| v0.5.4（现在） | 1.2~1.4ms | 1.6~1.7ms | 0.9~1.1ms | **3.8~4.2ms** |
+
+**结论：没有代码级回归**（差异在噪声里）。真机上那个差异来自会话/机器状态（窗口尺寸、
+后台负载、驱动状态），不是这几版改动。想做机器级对照：把 v0.4.7 与当前版本的 zip 各解一个
+目录，**都不最大化**、各跑 ~30 秒，再比 `profile:` 行即可（两版都写各自的 `composekn-startup.log`）。
+
+#### (2) 多点触摸：管道早就在，缺的是"用起来 + 断言"
+
+宿主侧其实**已经完整**：
+
+* C：`WM_POINTERDOWN/UPDATE/UP/CAPTURECHANGED` 为**每根手指**各发一条事件（只认
+  `PT_TOUCH/PT_PEN`）；`WM_POINTERCAPTURECHANGED` 会补一条抬起，避免触点表留着"断了的手指"；
+* Kotlin：`WindowsInputState.updateTouch()` 维护 `pointerId -> position` 触点表，每次事件都
+  返回**全部**活动触点，`dispatchWindowsTouchEvent()` 用 `sendPointerEvent(pointers = …)`
+  的多指针重载派发；`activeTouchCount` 已经是公开的自检钩子。
+
+缺的是：**demo 里没有任何东西用它**，也**从来没测过**。这一版把它变成：
+
+* **自检探针**（deterministic 测试屏）：一个**只做命中测试、不画任何像素**的 Box +
+  `Modifier.transformable`，把 zoom 累乘进 `probe.pinchScale`；
+* 三条断言（logic 阶段，94→97）：
+
+```
+interaction/pinch-zoom-in            # 两指 80px -> 164px：scale 必须 > 1.2x
+interaction/pinch-zoom-out           # 两指 148px -> 36px：scale 必须 < 0.9x
+interaction/no-leaked-touch-pointers # 两轮双指手势后 activeTouchCount 必须为 0
+```
+
+* **画廊里加了可见的「多点触摸 / Pinch」区块**（真机用手指试：两指张开/捏合，方块跟着缩放，
+  旁边显示 `scale=…%`）。
+
+**踩到的坑（值得记）**：第一版给探针 Box 画了个背景色，结果它和 `menu/closed-region-is-background`
+的采样区重叠 200x110 像素，那条断言报 `actual=22200`（= 200x110，数字对得上，一眼能定位）。
+教训：**探针不要画东西** —— Compose 的命中测试按布局边界算，不画像素照样能接手势。
+
+自检：logic 97 / window 37 全绿；打包单文件 exe（无 icudtl.dat）干净目录复测同样全绿。
