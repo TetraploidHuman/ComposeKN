@@ -1289,6 +1289,50 @@ private fun renderChecks(report: SelfTestReport) {
             " 外层滚动=${pinchScrollState.value}px（期望 0）",
     )
 
+    // (c) 两指都在手势区里捏合，**松手之前先停住不动**（真机数字转换器会持续发静止上报）：
+    //     列表必须一动不动。
+    //
+    // 这条对着「缩放之后跳一下」：父 scrollable 被子的 transformable 消费后会进入
+    // 「手势接管」（gesture pickup）状态；当某一帧里**所有** change 都没被消费（=两指都
+    // 停住时就是），它会用「相对按下点的**总**位移」当 slop 检测的初始累计值，下一次事件
+    // 于是把 `总位移 - slop` 当成**第一次拖动增量**发出去 → 列表一次跳几百 px。
+    // 复现用两指对向张开（形心不动，纯缩放），第一根手指的总位移 161px → 跳变 ≈143px。
+    // 修复在 vendor/compose-core 的本地补丁里（§17.27）。
+    val jumpBefore = pinchScrollState.value
+    val jumpScaleBefore = pinchScrollProbe.pinchScale
+    fun pinchTouch(id: Long, x: Float, y: Float, phase: TouchPhase) {
+        pinchScrollApp.dispatchEvent(
+            WindowsEvent.TouchEvent(pointerId = id, x = x.toInt(), y = y.toInt(), phase = phase),
+        )
+    }
+    pinchTouch(201L, 240f, 140f, TouchPhase.Down)
+    pinchTouch(202L, 560f, 180f, TouchPhase.Down)
+    pinchDriver.render(800, 600, density = 1f, frames = 2)
+    for (i in 1..6) {
+        val t = i / 6f
+        pinchTouch(201L, 240f + (100f - 240f) * t, 140f + (60f - 140f) * t, TouchPhase.Move)
+        pinchTouch(202L, 560f + (700f - 560f) * t, 180f + (260f - 180f) * t, TouchPhase.Move)
+        pinchDriver.render(800, 600, density = 1f, frames = 2)
+    }
+    // ★ 关键：松手前停住不动若干帧（每帧两条静止上报，与真机 100Hz 触摸同形）
+    for (i in 1..8) {
+        pinchTouch(201L, 100f, 60f, TouchPhase.Move)
+        pinchTouch(202L, 700f, 260f, TouchPhase.Move)
+        pinchDriver.render(800, 600, density = 1f, frames = 2)
+    }
+    val jumpBeforeUp = pinchScrollState.value
+    pinchTouch(201L, 100f, 60f, TouchPhase.Up)
+    pinchTouch(202L, 700f, 260f, TouchPhase.Up)
+    pinchDriver.render(800, 600, density = 1f, frames = 6)
+    report.check(
+        "interaction/pinch-then-hold-does-not-jump",
+        pinchScrollState.value == jumpBefore,
+        "捏合后停住再松手：滚动 ${jumpBefore} ->（停住期间）${jumpBeforeUp} ->（松手后）" +
+            "${pinchScrollState.value}px（期望始终 ${jumpBefore}）" +
+            " 缩放 ${jumpScaleBefore} -> ${pinchScrollProbe.pinchScale}" +
+            "（若松手前跳了一截 = 手势接管把整段位移当成了第一次拖动增量）",
+    )
+
     // (b) 两指都落在下面的列表上（y>300），一起往上拖：列表必须滚，缩放必须不变
     val pinchScrollBefore = pinchScrollState.value
     val pinchScaleBefore = pinchScrollProbe.pinchScale

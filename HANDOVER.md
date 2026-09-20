@@ -2576,3 +2576,64 @@ Compose 会把剩余速度交给父容器（`nestedScroll` 的 postFling），�
 
 logic 101 / window 37（合计 138）、`all` 135 全绿；打包单文件 exe（无 `icudtl.dat`）
 干净目录复测 101/37 全绿。
+
+### 17.27 「缩放之后跳一下」「嵌套滚动有时候也跳」的**真正根因**：gesture pickup 重复计入位移（v0.5.9）
+
+#### 先纠正上一节的说法（用户当场质疑得对）
+
+v0.5.8 我把「缩放后跳」归因于"缩放方块改了布局"。用户反驳：**布局改动是跟手的** ——
+`pinchScale` 每个手势事件都会更新，`.size()` 是连续变化，不该在缩放结束后"一次性跳"。
+这个反驳是对的：那条改动（改 `graphicsLayer`）是有益的（缩放期间不再触发重排），
+**但不是跳变的根因**。真正的根因在下面。
+
+#### 复现（自检里最小化，先红后绿）
+
+`interaction/pinch-then-hold-does-not-jump`：两指在手势区里**对向张开**（形心不动、纯缩放），
+然后**停住不动若干帧**（真机数字转换器 ~100Hz 持续发静止上报），再松手 → 断言外层滚动始终 0。
+
+* 打补丁前：**FAIL —— 停住期间列表跳了 62px**（`滚动 0 ->（停住期间）62 ->（松手后）62px`）；
+* 打补丁后：PASS。
+
+62px 与代码推导精确吻合：第一根手指的 y 位移 −80px，slop 18px → 80−18 = **62**。
+
+#### 根因：`DragGestureNode` 的「手势接管」把**总位移**当成 slop 检测的初始累计值
+
+`foundation/.../Draggable.kt` `processAwaitGesturePickup()`（Final pass）里，父容器在
+「某一帧所有 change 都没被消费」时会重新武装 slop 检测：
+
+```kotlin
+val initialPositionChange = pointerEvent.changes.first().position - state.initialDown!!.position
+moveToAwaitTouchSlopState(initialDown, pointerId, initialPositionChange)   // ← 总位移
+```
+
+而 `TouchSlopDetector.reset(initialPositionAccumulator)` 把参数直接当成 `totalPositionChange`
+的**初始值**，`getPostSlopOffset()` 于是立刻判定"slop 已跨过"，返回
+`总位移 − slop` —— 这个值被 `sendDragEvent(dragEvent, postSlopOffset)` 当成**第一次拖动增量**
+发出去，父列表**一次跳几十~几百 px**。
+
+**真机触发条件非常常见**：
+
+* 子节点（`transformable`、内层 scrollable）消费了拖动 → 父容器进入 `AwaitGesturePickup`；
+* 只要有一帧**所有** change 都没被消费（两指**停住不动**时就是这样：`detectTransformGestures`
+  只消费 `positionChanged()` 的 change）→ 父容器"接管"；
+* 下一次事件（哪怕是静止上报！）→ 立刻把 `总位移 − slop` 当作第一次拖动增量 → **跳变**。
+
+这同时解释了用户的两条反馈：**「缩放之后跳一下」**（捏合完手指停住 → 列表跳 62px 起）和
+**「嵌套滚动有时候也跳」**（内层消费 → 外层接管后重复计入位移）。
+
+#### 修法：本地补丁 `vendor/compose-core.local/patches/0008-…patch`
+
+把 `initialPositionChange` 换成 `Offset.Zero`：接管之后的**新**位移重新累计 slop。
+被丢弃的那部分要么已经被子节点消费（再算一次就是重复计入），要么还在 slop 之内（本来就不该
+算）—— 所以正确行为就是"接管后要再动 ~18px 才开始滚"，而不是"把past位移一次性滚出来"。
+（本地改动走 `vendor/compose-core.local/patches`，`scripts/vendor-compose-core.sh` 重新同步时
+会幂等重放，不会丢；该脚本的 "N patches 已应用" 也从 7 改成 8。）
+
+#### 验证
+
+* 补丁前：`interaction/pinch-then-hold-does-not-jump` FAIL（跳 62px，见上）；
+* 补丁后：logic **102** / window 37（合计 139）、`all` 136 —— 全绿；
+* 打包单文件 exe（无 `icudtl.dat`）干净目录复测。
+
+**待办**：这个补丁值得回报上游（`processAwaitGesturePickup` 的语义问题：它无法区分
+"被消费掉的位移"与"未被消费的位移"，只能保守地从零开始）。等有 upstream 修法再对齐。

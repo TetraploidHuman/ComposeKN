@@ -197,7 +197,7 @@ fi
 grep -q "SkikoDispatchers.Main" "$DEST/ui/src/nonJvmMain/kotlin/androidx/compose/ui/Actuals.nonJvm.kt" \
   || { echo "!! patch 0001 未生效" >&2; exit 1; }
 
-echo "==> 完成：$N_ACTUALS 个 linuxX64Main actual，7 patches 已应用"
+echo "==> 完成：$N_ACTUALS 个 linuxX64Main actual，8 patches 已应用"
 
 # ---- 9. 可选：编译验证 ----------------------------------------------------
 if [[ "$CHECK" -eq 1 ]]; then

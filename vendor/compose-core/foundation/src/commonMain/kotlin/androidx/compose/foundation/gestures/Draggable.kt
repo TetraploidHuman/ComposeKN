@@ -1041,18 +1041,27 @@ internal abstract class DragGestureNode(
         } else if (hasUnconsumedDrag) {
             // has pointers down with unconsumed events, a chance to pick up this gesture,
             // move to the touch slop detection phase
-            val initialPositionChange =
-                pointerEvent.changes.first().position - state.initialDown!!.position
-
-            // await touch slop again, using the initial down as starting point.
-            // For most cases this should return immediately since we probably moved
-            // far enough from the initial down event.
+            //
+            // ComposeKN 本地补丁（HANDOVER §17.27）：这里原来传的是
+            //   `pointerEvent.changes.first().position - state.initialDown!!.position`
+            // —— 即「相对按下点的**总**位移」。它被 TouchSlopDetector.reset() 当成 slop 检测的
+            // 初始累计值之后，**下一次事件立刻**判定"slop 已跨过"，并把 `总位移 - slop` 作为
+            // **第一次拖动增量**发给父容器 → 父列表一次跳几十~几百 px。
+            //
+            // 触发条件在真机上非常常见：子节点（`transformable`、内层 scrollable）消费了
+            // 拖动之后，某一帧里**所有** change 都没被消费 —— 例如两指**停住不动**时
+            // （数字转换器仍以 ~100Hz 发静止上报），父容器就在这里"接管"并跳变。
+            // 自检 `interaction/pinch-then-hold-does-not-jump` 就是它的最小复现。
+            //
+            // 那些位移要么已经被子节点消费、要么还在 slop 之内，都不该在父容器上再算一次。
+            // 改成从零开始检测：接管之后的**新**位移重新累计 slop（用户再拖 ~18px 才开始滚），
+            // 一次跳变就没了。
             moveToAwaitTouchSlopState(
                 requireNotNull(state.initialDown) {
                     "AwaitGesturePickup.initialDown was not initialized."
                 },
                 state.pointerId,
-                initialPositionChange,
+                Offset.Zero,
             )
         }
     }
