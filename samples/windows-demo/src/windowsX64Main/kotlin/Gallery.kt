@@ -73,6 +73,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.composekn.windows.WindowsComposeWindow
 import kotlin.concurrent.Volatile
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.graphics.graphicsLayer
+import com.composekn.windows.internal.winlog
+import androidx.compose.runtime.withFrameNanos
 
 /**
  * 组件画廊的「观测点」。
@@ -102,6 +108,10 @@ class GalleryProbe {
 
     /** 多点触摸：捏合缩放的累乘结果（两张手指张开 -> 变大，捏合 -> 变小）。 */
     var pinchScale by mutableStateOf(1f)
+
+    /** 滚动/缩放诊断日志的上一次时间戳（ms），~20Hz 节流用（普通字段，不触发重组）。 */
+    @Volatile
+    var lastStateLogMs: Long = 0L
     var frames by mutableStateOf(0)
     var clipboardText by mutableStateOf("")
 
@@ -190,9 +200,44 @@ fun ComponentGallery(
             //    "Vertically scrollable component was measured with an infinity maximum
             //     height constraints"（内层只能用显式 .height(...) 的滚动容器）；
             // 2) 顺带验证 Lazy 虚拟化 + 滚轮滚动。
-            LazyColumn(modifier = Modifier.fillMaxSize()) {
+            val outerState = rememberLazyListState()
+            val innerState = rememberLazyListState()
+
+            // 诊断：把「外层/内层滚动位置 + 缩放值」写进 composekn-startup.log（~20Hz 节流）。
+            //
+            // 为什么需要：真机反馈「缩放之后还会跳 / 嵌套滚动有时候也跳」，但那种"跳"是
+            // 肉眼看到的现象，日志里只有触摸轨迹，无法判断**是哪个滚动容器在动、动了多少**。
+            // 这几行就是地面真值：跳变会表现为某个 tick 里 offset 突然变化一大截
+            // （或者 firstVisibleItemIndex 突变）。
+            //
+            // 只在真正变化时记（静止零开销），节流到 50ms → 连续滚动时最多 20 行/秒。
+            LaunchedEffect(Unit) {
+                var loggedAtLeastOnce = false
+                snapshotFlow {
+                    listOf(
+                        outerState.firstVisibleItemIndex,
+                        outerState.firstVisibleItemScrollOffset,
+                        innerState.firstVisibleItemIndex,
+                        innerState.firstVisibleItemScrollOffset,
+                        (probe.pinchScale * 100f).toInt(),
+                    )
+                }.collect { v ->
+                    val nowMs = withFrameNanos { it } / 1_000_000L
+                    // 第一条**无条件**记（基线：启动时在哪里），之后 50ms 节流。
+                    // 无条件记第一条还有一个好处：自检/脚本能靠它验证"这条日志真的在写"。
+                    if (!loggedAtLeastOnce || nowMs - probe.lastStateLogMs >= 50L) {
+                        loggedAtLeastOnce = true
+                        probe.lastStateLogMs = nowMs
+                        winlog(
+                            "gallery: outer=${v[0]}/${v[1]} inner=${v[2]}/${v[3]} scale=${v[4]}%",
+                        )
+                    }
+                }
+            }
+
+            LazyColumn(state = outerState, modifier = Modifier.fillMaxSize()) {
                 item { DiagnosticsHud(probe, window) }
-                gallerySections(probe, animate)
+                gallerySections(probe, animate, innerState)
                 item { Spacer(Modifier.height(24.dp)) }
             }
         }
@@ -229,7 +274,11 @@ private fun DiagnosticsHud(probe: GalleryProbe, window: WindowsComposeWindow) {
     }
 }
 
-private fun LazyListScope.gallerySections(probe: GalleryProbe, animate: Boolean) {
+private fun LazyListScope.gallerySections(
+    probe: GalleryProbe,
+    animate: Boolean,
+    innerState: LazyListState,
+) {
     section("按钮 / Buttons") {
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -437,14 +486,25 @@ private fun LazyListScope.gallerySections(probe: GalleryProbe, animate: Boolean)
                     .height(180.dp)
                     .transformable(
                         state = rememberTransformableState { zoomChange, _, _ ->
-                            probe.pinchScale = (probe.pinchScale * zoomChange).coerceIn(0.25f, 4f)
+                            // 上限 3 而不是 4：方块 56dp × 3 = 168dp < 手势区 180dp，
+                            // 放大到极限也不会溢出到下面的文字/其它区块上（真机反馈
+                            // 「缩放之后画面跳一下」有一部分就是这个溢出）。
+                            probe.pinchScale = (probe.pinchScale * zoomChange).coerceIn(0.25f, 3f)
                         },
                     ),
                 contentAlignment = Alignment.Center,
             ) {
+                // ⚠ 缩放的方块用 **graphicsLayer 缩放**，不能写成 `.size(56 * scale).dp`：
+                // 后者会让这个 item 的高度跟着变（56→224dp），把 LazyColumn 里下面的内容
+                // 顶来顶去 —— 真机上看到的就是「缩放之后画面跳一下」（§17.26）。
+                // graphicsLayer 只影响绘制，布局尺寸恒定 -> 缩放期间不会有任何内容位移。
                 Box(
                     modifier = Modifier
-                        .size((56 * probe.pinchScale).dp)
+                        .size(56.dp)
+                        .graphicsLayer {
+                            scaleX = probe.pinchScale
+                            scaleY = probe.pinchScale
+                        }
                         .background(MaterialTheme.colorScheme.primary),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -484,7 +544,7 @@ private fun LazyListScope.gallerySections(probe: GalleryProbe, animate: Boolean)
             Spacer(Modifier.height(12.dp))
             Text("LazyColumn（纵向虚拟化，固定 160dp 高）")
             Spacer(Modifier.height(6.dp))
-            LazyColumn(modifier = Modifier.fillMaxWidth().height(160.dp)) {
+            LazyColumn(state = innerState, modifier = Modifier.fillMaxWidth().height(160.dp)) {
                 items((0 until 60).toList()) { index ->
                     Row(
                         modifier = Modifier

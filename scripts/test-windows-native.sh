@@ -180,6 +180,20 @@ if [ -z "$ONLY" ] || [ "$ONLY" = "logic" ]; then
     fi
 fi
 
+# ------------------------------------------------- 2.6 画廊滚动/缩放状态日志
+#
+# 「缩放后跳 / 嵌套滚动跳」这类真机问题，光有触摸轨迹看不出**谁在动** —— 画廊必须把
+# 外层/内层 scrollable 的位置写进启动日志（~20Hz 节流、只在变化时记）。这条在 logic
+# 阶段就能验证：画廊离屏渲染时 LaunchedEffect 会写第一条基线。
+if [ -z "$ONLY" ] || [ "$ONLY" = "logic" ]; then
+    STARTUP_LOG="$RUN_DIR/composekn-startup.log"
+    if grep -q 'gallery: outer=' "$STARTUP_LOG" 2>/dev/null; then
+        pass "gallery: 滚动/缩放状态日志已写入（$(grep -c 'gallery: outer=' "$STARTUP_LOG") 行）"
+    else
+        fail "gallery: 启动日志里没有 'gallery: outer=…' 行（真机排查滚动跳变就靠它）"
+    fi
+fi
+
 # ----------------------------------------------------------- 3. 真实窗口
 if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
     run_phase window window 1

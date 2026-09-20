@@ -168,6 +168,13 @@ struct ComposeKNWin32Window {
         uint32_t lastTime = 0;
         float startX = 0.f;
         float startY = 0.f;
+        // 第一根手指的**最新位置**（摘要里的"终点/位移"用它）。
+        //
+        // ⚠ 不能在写摘要时再去 4 槽样本环里查第一根手指：多指长手势里那个槽早被别的
+        // 指针覆盖了，查不到就退回"当前事件"的坐标 —— v0.5.7 真机日志里就出现过
+        // 「id=6686 的终点写成了 6687 的坐标」。这里直接跟着事件更新，跟环的容量无关。
+        float lastX = 0.f;
+        float lastY = 0.f;
         int events = 0;
         int moves = 0;
         int maxSimultaneous = 0;
@@ -1322,6 +1329,8 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 window->touchGesture.startTime = eventTime;
                 window->touchGesture.startX = e.x;
                 window->touchGesture.startY = e.y;
+                window->touchGesture.lastX = e.x;
+                window->touchGesture.lastY = e.y;
                 window->touchGesture.events = 0;
                 window->touchGesture.moves = 0;
                 window->touchGesture.maxSimultaneous = 0;
@@ -1330,11 +1339,14 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             window->touchGesture.lastTime = eventTime;
             ++window->touchGesture.events;
             if (e.type == COMPOSEKN_WIN32_EVENT_TOUCH_MOVE) ++window->touchGesture.moves;
+            if (pointerId == window->touchGesture.firstId) {
+                // 摘要里的"终点/位移"永远跟第一根手指的最新位置走（和样本环容量无关）
+                window->touchGesture.lastX = e.x;
+                window->touchGesture.lastY = e.y;
+            }
             if (static_cast<int>(window->touchActiveIds.size()) > window->touchGesture.maxSimultaneous) {
                 window->touchGesture.maxSimultaneous = static_cast<int>(window->touchActiveIds.size());
             }
-            // 手势里的第一根手指现在还按着吗？（摘要里的"终点"用它的最新位置）
-            const auto* firstSample = findTouchSample(window, window->touchGesture.firstId);
             const bool multiTouch = window->touchActiveIds.size() >= 2;
             if (isUp || message == WM_POINTERCAPTURECHANGED) touchRemoveActive(window, pointerId);
             const bool gestureEnded = window->touchActiveIds.empty();
@@ -1373,12 +1385,10 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     window->touchGesture.events, window->touchGesture.moves,
                     static_cast<double>(window->touchGesture.startX),
                     static_cast<double>(window->touchGesture.startY),
-                    static_cast<double>(firstSample != nullptr ? firstSample->x : e.x),
-                    static_cast<double>(firstSample != nullptr ? firstSample->y : e.y),
-                    static_cast<double>((firstSample != nullptr ? firstSample->x : e.x) -
-                                        window->touchGesture.startX),
-                    static_cast<double>((firstSample != nullptr ? firstSample->y : e.y) -
-                                        window->touchGesture.startY),
+                    static_cast<double>(window->touchGesture.lastX),
+                    static_cast<double>(window->touchGesture.lastY),
+                    static_cast<double>(window->touchGesture.lastX - window->touchGesture.startX),
+                    static_cast<double>(window->touchGesture.lastY - window->touchGesture.startY),
                     window->touchGesture.maxSimultaneous);
                 window->touchGesture = ComposeKNWin32Window::TouchGestureSummary{};
                 if (window->touchSameTickMoveCount > 0) {
