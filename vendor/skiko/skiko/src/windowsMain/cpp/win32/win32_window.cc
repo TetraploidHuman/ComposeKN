@@ -154,6 +154,25 @@ struct ComposeKNWin32Window {
     int touchLogNext = 0;
     // 这台机器上见过多少次「同一毫秒内两条移动事件」（上面那个 bug 的现场特征）。
     int touchSameTickMoveCount = 0;
+    // 当前按下的指针集合 + 本次手势的摘要。
+    //
+    // 为什么需要「最大同时触点数」：真机反馈「双指缩放的时候列表也跟着滚」时必须能一眼
+    // 区分两种情形 ——(a) 宿主/系统只送来了一根手指（maxSim=1，那是触摸屏驱动/系统层面
+    // 的事），还是 (b) 两根手指都到了、但其中一根落在列表上把列表拖走了（maxSim=2，
+    // 那是 Compose 的语义：落在滚动区上的手指就该滚动它）。
+    std::vector<uint32_t> touchActiveIds;
+    struct TouchGestureSummary {
+        bool active = false;
+        uint32_t firstId = 0;
+        uint32_t startTime = 0;
+        uint32_t lastTime = 0;
+        float startX = 0.f;
+        float startY = 0.f;
+        int events = 0;
+        int moves = 0;
+        int maxSimultaneous = 0;
+    };
+    TouchGestureSummary touchGesture;
     // false = 系统标题栏（Compose JVM 桌面 Window() 的默认形态：NC 全归 OS 管）；
     // true = 无边框自绘 CSD（对应 JVM 的 undecorated = true）。
     bool undecorated = false;
@@ -230,14 +249,39 @@ static uint32_t touchEventTime(ComposeKNWin32Window* window, uint32_t raw) {
     return value - window->touchTimeBase;
 }
 
-/** 找到某根指针上一次记录的触摸样本（诊断用，也用于 CAPTURECHANGED 的位置兜底）。 */
+/** 找到某根指针**最近一次**记录的触摸样本（诊断用，也用于 CAPTURECHANGED 的位置兜底）。 */
 static const ComposeKNWin32Window::TouchLogSample* findTouchSample(
     const ComposeKNWin32Window* window, uint32_t id) {
-    for (int i = 0; i < 4; ++i) {
+    // 必须从**最后写入的那个槽**往回找：早先写成从 0 号槽开始找，单指连续拖动时会一直
+    // 命中同一根手指最老的那条样本 —— 日志里的 dt/d 于是变成了「相对按下那一刻」的累计值
+    // （真机日志里 dt=7,17,26,36… 一眼就能看出来），完全没有诊断价值。
+    for (int k = 0; k < 4; ++k) {
+        int i = window->touchLogNext - 1 - k;
+        i = ((i % 4) + 4) % 4;
         const auto& s = window->touchLogSamples[i];
         if (s.used && s.id == id) return &s;
     }
     return nullptr;
+}
+
+static bool touchIsActive(const ComposeKNWin32Window* window, uint32_t id) {
+    for (uint32_t value : window->touchActiveIds) {
+        if (value == id) return true;
+    }
+    return false;
+}
+
+static void touchAddActive(ComposeKNWin32Window* window, uint32_t id) {
+    if (!touchIsActive(window, id)) window->touchActiveIds.push_back(id);
+}
+
+static void touchRemoveActive(ComposeKNWin32Window* window, uint32_t id) {
+    for (size_t i = 0; i < window->touchActiveIds.size(); ++i) {
+        if (window->touchActiveIds[i] == id) {
+            window->touchActiveIds.erase(window->touchActiveIds.begin() + i);
+            return;
+        }
+    }
 }
 
 static void storeTouchSample(ComposeKNWin32Window* window, uint32_t id, uint32_t time,
@@ -1268,25 +1312,79 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 // 诊断核心：同一毫秒里两条**移动**事件 —— 速度估计器的时间轴被压扁的现场。
                 ++window->touchSameTickMoveCount;
             }
-            // 日志上限 400 行：够覆盖一次完整的拖动，又不会把 composekn-startup.log 刷爆。
-            if (window->touchLogCount < 400) {
+
+            // ---- 触点表 + 本次手势摘要 ----
+            const bool isDown = e.type == COMPOSEKN_WIN32_EVENT_TOUCH_DOWN;
+            const bool isUp = e.type == COMPOSEKN_WIN32_EVENT_TOUCH_UP;
+            if (!window->touchGesture.active) {
+                window->touchGesture.active = true;
+                window->touchGesture.firstId = pointerId;
+                window->touchGesture.startTime = eventTime;
+                window->touchGesture.startX = e.x;
+                window->touchGesture.startY = e.y;
+                window->touchGesture.events = 0;
+                window->touchGesture.moves = 0;
+                window->touchGesture.maxSimultaneous = 0;
+            }
+            if (isDown) touchAddActive(window, pointerId);
+            window->touchGesture.lastTime = eventTime;
+            ++window->touchGesture.events;
+            if (e.type == COMPOSEKN_WIN32_EVENT_TOUCH_MOVE) ++window->touchGesture.moves;
+            if (static_cast<int>(window->touchActiveIds.size()) > window->touchGesture.maxSimultaneous) {
+                window->touchGesture.maxSimultaneous = static_cast<int>(window->touchActiveIds.size());
+            }
+            // 手势里的第一根手指现在还按着吗？（摘要里的"终点"用它的最新位置）
+            const auto* firstSample = findTouchSample(window, window->touchGesture.firstId);
+            const bool multiTouch = window->touchActiveIds.size() >= 2;
+            if (isUp || message == WM_POINTERCAPTURECHANGED) touchRemoveActive(window, pointerId);
+            const bool gestureEnded = window->touchActiveIds.empty();
+
+            // 日志策略：DOWN/UP/CAPTURE-LOST/手势摘要**永远**记（行数少、信息密度高）；
+            // MOVE 只记「多指期间」和「每根手指的前 3 条」—— 单指长拖的几百条没有诊断
+            // 价值，反而会把日志上限吃光（v0.5.6 就是 400 行上限在 15 秒内被吃光，
+            // 真正要看的捏合根本没记上）。
+            const bool logDetail =
+                e.type != COMPOSEKN_WIN32_EVENT_TOUCH_MOVE || multiTouch ||
+                window->touchGesture.moves <= 3;
+            if (logDetail && window->touchLogCount < 4000) {
                 ++window->touchLogCount;
                 if (prev != nullptr) {
                     composeknLog(
-                        "touch: %-12s id=%u t=%ums dt=%ums d=(%+.0f,%+.0f) pos=%.0f,%.0f",
+                        "touch: %-12s id=%u t=%ums dt=%ums d=(%+.0f,%+.0f) pos=%.0f,%.0f active=%zu",
                         phase, pointerId, eventTime, eventTime - prev->time,
                         static_cast<double>(e.x - prev->x), static_cast<double>(e.y - prev->y),
-                        static_cast<double>(e.x), static_cast<double>(e.y));
+                        static_cast<double>(e.x), static_cast<double>(e.y),
+                        window->touchActiveIds.size());
                 } else {
-                    composeknLog("touch: %-12s id=%u t=%ums pos=%.0f,%.0f",
+                    composeknLog("touch: %-12s id=%u t=%ums pos=%.0f,%.0f active=%zu",
                                  phase, pointerId, eventTime,
-                                 static_cast<double>(e.x), static_cast<double>(e.y));
+                                 static_cast<double>(e.x), static_cast<double>(e.y),
+                                 window->touchActiveIds.size());
                 }
-            } else if (window->touchLogCount == 400) {
-                ++window->touchLogCount;
-                composeknLog("touch: （日志已达 400 行上限，后续触摸事件不再记录；"
-                             "同一毫秒内的移动事件累计 %d 次）",
-                             window->touchSameTickMoveCount);
+            }
+            if (gestureEnded) {
+                // 摘要行：一次手势的形状 + **最大同时触点数**（判断"双指到底有没有两根
+                // 手指同时到达"的关键；maxSim=1 说明只有一根手指被系统送进来）。
+                composeknLog(
+                    "touch: 手势结束 id=%u 时长=%ums 事件=%d 移动=%d 起点=%.0f,%.0f 终点=%.0f,%.0f "
+                    "位移=(%+.0f,%+.0f) 最大同时触点数=%d",
+                    window->touchGesture.firstId,
+                    window->touchGesture.lastTime - window->touchGesture.startTime,
+                    window->touchGesture.events, window->touchGesture.moves,
+                    static_cast<double>(window->touchGesture.startX),
+                    static_cast<double>(window->touchGesture.startY),
+                    static_cast<double>(firstSample != nullptr ? firstSample->x : e.x),
+                    static_cast<double>(firstSample != nullptr ? firstSample->y : e.y),
+                    static_cast<double>((firstSample != nullptr ? firstSample->x : e.x) -
+                                        window->touchGesture.startX),
+                    static_cast<double>((firstSample != nullptr ? firstSample->y : e.y) -
+                                        window->touchGesture.startY),
+                    window->touchGesture.maxSimultaneous);
+                window->touchGesture = ComposeKNWin32Window::TouchGestureSummary{};
+                if (window->touchSameTickMoveCount > 0) {
+                    composeknLog("touch: 本进程累计「同一毫秒内两条移动事件」%d 次（修复后应为 0）",
+                                 window->touchSameTickMoveCount);
+                }
             }
             storeTouchSample(window, pointerId, eventTime, e.x, e.y);
             // 明确"我处理了这条指针消息"（不交给 DefWindowProc）：

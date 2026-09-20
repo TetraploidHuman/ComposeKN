@@ -421,11 +421,20 @@ private fun LazyListScope.gallerySections(probe: GalleryProbe, animate: Boolean)
     section("多点触摸 / Pinch") {
         // 宿主侧：C 的 WM_POINTER 为每根手指各发一条事件 -> Kotlin 聚合成「多指针
         // PointerEvent」-> Compose 的手势识别。真机上用手指捏合/张开会改变 scale
-        // （触摸屏或精密触控板；鼠标拖拽不会触发，那条由自检单独断言）。
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // （触摸屏；鼠标拖拽不会触发，那条由自检单独断言）。
+        //
+        // ⚠ **手势区域必须做大**（占满一行 + 180dp 高）。真机反馈「捏合的时候列表跟着
+        // 滚、松手还往上甩」—— 根因就是原来只有 120dp 的方块：两指捏合时经常有一根手指
+        // 落在方块**外面**（落到 LazyColumn 上），那根手指就照常拖动列表了。这是 Compose
+        // 的语义（落在滚动区上的手指就该滚动它，Android 一样），不是宿主的问题；
+        // 让两根手指都落在 transformable 里，列表就不会跟着滚（自检里有专门断言）。
+        // 代价：在这块区域里**单指**拖动会被 transformable 当成 pan 消费（不会滚列表）——
+        // 演示用，可接受。
+        Column(Modifier.fillMaxWidth()) {
             Box(
                 modifier = Modifier
-                    .size(120.dp)
+                    .fillMaxWidth()
+                    .height(180.dp)
                     .transformable(
                         state = rememberTransformableState { zoomChange, _, _ ->
                             probe.pinchScale = (probe.pinchScale * zoomChange).coerceIn(0.25f, 4f)
@@ -442,9 +451,10 @@ private fun LazyListScope.gallerySections(probe: GalleryProbe, animate: Boolean)
                     Text("两指\n捏合", style = MaterialTheme.typography.labelSmall)
                 }
             }
-            Spacer(Modifier.width(16.dp))
+            Spacer(Modifier.height(6.dp))
             Text(
-                text = "scale=${(probe.pinchScale * 100).toInt()}%（两指张开/捏合试试；鼠标拖拽不动）",
+                text = "scale=${(probe.pinchScale * 100).toInt()}%" +
+                    "（在这块区域里两指张开/捏合；单指拖动不会滚列表）",
                 style = MaterialTheme.typography.bodySmall,
             )
         }

@@ -1233,6 +1233,80 @@ private fun renderChecks(report: SelfTestReport) {
     )
     earlyApp.close()
 
+    // 2.11b 真机反馈「双指捏合的时候列表也跟着滚，松手还往上甩」。
+    //
+    // 把两种情形钉死（都是 Compose 的既有语义，不是宿主行为差异）：
+    //   (a) 两根手指都落在 transformable 区域内 -> 缩放生效，外层滚动区**一点不动**
+    //   (b) 两根手指都落在列表上（没落在手势区里）-> 列表照常滚（并且缩放值不变）
+    // 真机上看到的「捏合还滚 + 松手往上甩」就是 (b)：画廊原来的捏合区只有 120dp，
+    // 两指捏合时经常有手指落到外面；而 HUD 上的 scale 百分比是**上一次成功捏合**留下的，
+    // 于是看起来像「缩放的同时在滚」。画廊现在把那块手势区做大了（Gallery.kt 有注释）。
+    val pinchScrollState = ScrollState(0)
+    val pinchScrollProbe = InteractionProbe()
+    val pinchScrollApp = WindowsComposeApplication(
+        title = "pinch-scroll",
+        width = 800,
+        height = 600,
+        undecorated = true,
+    )
+    pinchScrollApp.setContent(withChrome = false) {
+        Column(Modifier.fillMaxSize().verticalScroll(pinchScrollState)) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(300.dp)
+                    .transformable(
+                        state = rememberTransformableState { zoomChange, _, _ ->
+                            pinchScrollProbe.pinchScale =
+                                (pinchScrollProbe.pinchScale * zoomChange).coerceIn(0.25f, 4f)
+                        },
+                    ),
+            )
+            repeat(8) { index ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(80.dp)
+                        .background(if (index % 2 == 0) Color(0xFF203040) else Color(0xFF304050)),
+                )
+            }
+        }
+    }
+    val pinchDriver = OffscreenDriver(pinchScrollApp)
+    pinchDriver.render(800, 600, density = 1f, frames = 3)
+
+    // (a) 两指都在手势区（y<300）里，对向张开：缩放必须变，列表必须不动
+    twoFingerGesture(
+        pinchScrollApp, pinchDriver, 1f,
+        start1 = Pair(240f, 120f), end1 = Pair(180f, 80f),
+        start2 = Pair(560f, 200f), end2 = Pair(620f, 240f),
+    )
+    pinchDriver.render(800, 600, density = 1f, frames = 4)
+    report.check(
+        "interaction/pinch-inside-scrollable-does-not-scroll",
+        pinchScrollProbe.pinchScale > 1.05f && pinchScrollState.value == 0,
+        "两指都在手势区：scale=${pinchScrollProbe.pinchScale}（期望 >1.05）" +
+            " 外层滚动=${pinchScrollState.value}px（期望 0）",
+    )
+
+    // (b) 两指都落在下面的列表上（y>300），一起往上拖：列表必须滚，缩放必须不变
+    val pinchScrollBefore = pinchScrollState.value
+    val pinchScaleBefore = pinchScrollProbe.pinchScale
+    twoFingerGesture(
+        pinchScrollApp, pinchDriver, 1f,
+        start1 = Pair(400f, 420f), end1 = Pair(400f, 320f),
+        start2 = Pair(500f, 520f), end2 = Pair(500f, 420f),
+    )
+    pinchDriver.render(800, 600, density = 1f, frames = 4)
+    report.check(
+        "interaction/pinch-outside-target-scrolls-list",
+        pinchScrollState.value > pinchScrollBefore && pinchScrollProbe.pinchScale == pinchScaleBefore,
+        "两指都在列表上：滚动 ${pinchScrollBefore}->${pinchScrollState.value}px（期望变大）" +
+            " scale=${pinchScrollProbe.pinchScale}（期望不变=${pinchScaleBefore}）" +
+            " max=${pinchScrollState.maxValue}",
+    )
+    pinchScrollApp.close()
+
     // 2.12 对话框：遮罩 + 独立内容层（比 Popup 更重的一层）
     //
     // 放在最后：对话框一旦打开会吃掉后续指针事件（点遮罩 = 关闭），
