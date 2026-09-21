@@ -113,6 +113,7 @@ import org.jetbrains.skia.ColorAlphaType
 import org.jetbrains.skia.ColorType
 import org.jetbrains.skia.Image
 import org.jetbrains.skia.ImageInfo
+import org.jetbrains.skiko.ClipboardImage
 import org.jetbrains.skiko.Win32Message
 
 // =====================================================================
@@ -260,18 +261,72 @@ private const val CLIP_PLAIN = "ComposeKN 富文本回退文本"
  * （CF_DIB 默认自下而上），以及 stride/通道顺序错位 —— 纯色块全都看不出来，
  * 四色一眼就能看出是翻转了还是串通道了。
  */
+private val CLIP_IMAGE_BGRA = byteArrayOf(
+    // 第 0 行：红(0,0) 绿(1,0)
+    0x00, 0x00, 0xFF.toByte(), 0xFF.toByte(),
+    0x00, 0xFF.toByte(), 0x00, 0xFF.toByte(),
+    // 第 1 行：蓝(0,1) 白(1,1)
+    0xFF.toByte(), 0x00, 0x00, 0xFF.toByte(),
+    0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(),
+)
+
 private fun clipboardTestImage(): ImageBitmap {
     // BGRA、自上而下、stride = 2*4
-    val bgra = byteArrayOf(
-        // 第 0 行：红(0,0) 绿(1,0)
-        0x00, 0x00, 0xFF.toByte(), 0xFF.toByte(),
-        0x00, 0xFF.toByte(), 0x00, 0xFF.toByte(),
-        // 第 1 行：蓝(0,1) 白(1,1)
-        0xFF.toByte(), 0x00, 0x00, 0xFF.toByte(),
-        0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(),
-    )
     val info = ImageInfo(2, 2, ColorType.BGRA_8888, ColorAlphaType.UNPREMUL)
-    return Image.makeRaster(info, bgra, 8).toComposeImageBitmap()
+    return Image.makeRaster(info, CLIP_IMAGE_BGRA.copyOf(), 8).toComposeImageBitmap()
+}
+
+/** 同一份 2×2 四色数据，但用剪贴板层的中间表示（BGRA，自上而下）。 */
+private fun clipboardTestClipboardImage(): ClipboardImage = ClipboardImage(2, 2, CLIP_IMAGE_BGRA.copyOf())
+
+/**
+ * 手工拼一张 **8bpp 调色板 DIB**（BITMAPINFOHEADER + 4 色调色板 + 自下而上的索引行）。
+ *
+ * `clrUsed = 0` 是个真实的坑：规范上 0 表示"全 256 项"，但缓冲区里可能只有几项
+ * （Wine 转换格式后就是这样；某些老程序也会）—— 解码器要按"实际装得下的项数"裁剪，
+ * 所以这里专门造一份这种数据来测。
+ */
+private fun dib8WithPalette(width: Int, height: Int, indices: ByteArray, clrUsed: Int): ByteArray {
+    val header = 40
+    val paletteBytes = 16
+    val stride = ((width + 3) / 4) * 4
+    val out = ByteArray(header + paletteBytes + stride * height)
+    fun putInt(off: Int, value: Int) {
+        out[off] = value.toByte()
+        out[off + 1] = (value ushr 8).toByte()
+        out[off + 2] = (value ushr 16).toByte()
+        out[off + 3] = (value ushr 24).toByte()
+    }
+    fun putShort(off: Int, value: Int) {
+        out[off] = value.toByte()
+        out[off + 1] = (value ushr 8).toByte()
+    }
+    putInt(0, header)
+    putInt(4, width)
+    putInt(8, height)                 // 正数 = 自下而上
+    putShort(12, 1)
+    putShort(14, 8)
+    putInt(16, 0)                     // BI_RGB
+    putInt(20, stride * height)
+    putInt(32, clrUsed)
+    // 调色板条目是 RGBQUAD（内存顺序 B, G, R, 保留）。colors 是 0xRRGGBB：
+    //   红 0xFF0000 -> B=0x00 G=0x00 R=0xFF
+    //   绿 0x00FF00 -> B=0x00 G=0xFF R=0x00
+    //   蓝 0x0000FF -> B=0xFF G=0x00 R=0x00
+    //   白 0xFFFFFF -> B=0xFF G=0xFF R=0xFF
+    val colors = intArrayOf(0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF)
+    for (i in 0 until 4) {
+        val color = colors[i]
+        out[header + i * 4 + 0] = (color and 0xFF).toByte()            // B
+        out[header + i * 4 + 1] = ((color shr 8) and 0xFF).toByte()    // G
+        out[header + i * 4 + 2] = ((color shr 16) and 0xFF).toByte()   // R
+    }
+    for (y in 0 until height) {
+        for (x in 0 until width) {
+            out[header + paletteBytes + stride * (height - 1 - y) + x] = indices[y * width + x]
+        }
+    }
+    return out
 }
 
 /** 期望的 2×2 ARGB 像素（自上而下）。 */
@@ -2825,7 +2880,110 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                     "compression=$v5Compression；CF_DIB 头=$dibHeader ${dibBits}bpp",
             )
         }
+        // ---- 剪贴板：文件列表（CF_HDROP）与图片的其它来源（CF_BITMAP / 8bpp 调色板）----
         if (frame == 136) {
+            // 资源管理器里 Ctrl+C 一个文件，剪贴板上是 CF_HDROP（路径列表），没有位图。
+            app.window.clipboardTestSetFiles(DROP_TEST_FILES)
+        }
+        if (frame == 138) {
+            val entry = probe.clipboardManager?.getClip()
+            report.check(
+                "window/clipboard-files-from-cf-hdrop",
+                entry?.getFiles() == DROP_TEST_FILES,
+                "CF_HDROP -> files=${entry?.getFiles()}（期望 $DROP_TEST_FILES）",
+            )
+            // 只有 CF_HDROP 时读图必须失败 —— 顺便触发 C 侧的「当前可用格式」诊断日志
+            // （脚本会断言那一行出现），真机上"截图了但粘不进"就靠它定位。
+            report.check(
+                "window/clipboard-image-missing-on-file-drop",
+                entry?.getImage() == null,
+                "只有 CF_HDROP 时 getImage()=${entry?.getImage()}（期望 null）",
+            )
+            // 有的截图工具只放裸 HBITMAP：走 CF_BITMAP 回退（GDI 转一遍）。
+            app.window.clipboardTestSetBitmap(clipboardTestClipboardImage())
+        }
+        if (frame == 140) {
+            val image = probe.clipboardManager?.getClip()?.getImage()
+            val pixels = image?.let { img -> IntArray(img.width * img.height).also { img.readPixels(it) } }
+            report.check(
+                "window/clipboard-image-from-cf-bitmap",
+                image != null && image.width == 2 && image.height == 2 &&
+                    pixels != null && pixels.contentEquals(CLIP_IMAGE_EXPECTED_ARGB),
+                "CF_BITMAP 读回 ${image?.width}x${image?.height} 像素=" +
+                    pixels?.joinToString { "0x${it.toUInt().toString(16)}" },
+            )
+            // 老程序/256 色画图会给 8bpp 调色板 DIB（固定 4 色：红/绿/蓝/白）。
+            app.window.clipboardTestSetDib8(2, 2, byteArrayOf(0, 1, 2, 3))
+        }
+        if (frame == 142) {
+            val image = probe.clipboardManager?.getClip()?.getImage()
+            val pixels = image?.let { img -> IntArray(img.width * img.height).also { img.readPixels(it) } }
+            report.check(
+                "window/clipboard-image-from-dib8-palette",
+                image != null && image.width == 2 && image.height == 2 &&
+                    pixels != null && pixels.contentEquals(CLIP_IMAGE_EXPECTED_ARGB),
+                "8bpp 调色板 DIB 读回 ${image?.width}x${image?.height} 像素=" +
+                    pixels?.joinToString { "0x${it.toUInt().toString(16)}" },
+            )
+        }
+        if (frame == 144) {
+            // 直接喂原始 DIB 字节给解码器（绕开剪贴板 —— Wine 对 8bpp 的 CF_DIB 会做有损
+            // 转换，合成出来的 V5 少了调色板，所以"调色板解码"这条真机上会走到的路径
+            // 必须这样测）。三种真实世界形态：
+            //   1) 8bpp + 4 色调色板（标准自下而上）；
+            //   2) 8bpp 但 biClrUsed=0、缓冲区里只有 4 项（头撒谎，按实际裁剪）；
+            //   3) 24bpp + 自上而下（biHeight<0）。
+            val indices = byteArrayOf(0, 1, 2, 3)
+            val standard = app.window.testDecodeDib(dib8WithPalette(2, 2, indices, clrUsed = 4))
+            val lying = app.window.testDecodeDib(dib8WithPalette(2, 2, indices, clrUsed = 0))
+            // ClipboardImage 里就是 BGRA、自上而下 —— 直接和期望字节比，
+            // 不用再绕一圈 ImageBitmap。
+            val standardPixels = standard?.pixels
+            val lyingPixels = lying?.pixels
+            report.check(
+                "window/clipboard-dib8-decoder-standard-palette",
+                standard != null && standard.width == 2 && standard.height == 2 &&
+                    standardPixels != null && standardPixels.contentEquals(CLIP_IMAGE_BGRA),
+                "8bpp+4 色调色板 -> ${standard?.width}x${standard?.height} 像素=" +
+                    standardPixels?.joinToString { "0x${it.toUInt().toString(16)}" },
+            )
+            report.check(
+                "window/clipboard-dib8-decoder-clrused-lies",
+                lying != null && lyingPixels != null &&
+                    lyingPixels.contentEquals(CLIP_IMAGE_BGRA),
+                "biClrUsed=0（声称 256 项）但只给了 4 项 -> 像素=" +
+                    lyingPixels?.joinToString { "0x${it.toUInt().toString(16)}" },
+            )
+            // 24bpp 自上而下：自己拼字节（每行按 4 字节对齐）
+            val stride24 = 8   // (2*3+3)/4*4 = 8
+            val dib24 = ByteArray(40 + stride24 * 2)
+            fun putInt24(off: Int, value: Int) {
+                dib24[off] = value.toByte()
+                dib24[off + 1] = (value ushr 8).toByte()
+                dib24[off + 2] = (value ushr 16).toByte()
+                dib24[off + 3] = (value ushr 24).toByte()
+            }
+            putInt24(0, 40); putInt24(4, 2); putInt24(8, -2)   // 负数 = 自上而下
+            dib24[12] = 1; dib24[14] = 24; putInt24(16, 0); putInt24(20, stride24 * 2)
+            // 自上而下：第 0 行 = 红、绿；第 1 行 = 蓝、白（BGR 顺序）。
+            // ⚠ 24bpp 每行要按 4 字节对齐：2 像素 = 6 字节 + 2 字节填充，所以这里写的是
+            // **带填充的整行**（少写这两个 0 会把第二行整体错 2 字节，读出来就串色了）。
+            val bgr24 = byteArrayOf(
+                0x00, 0x00, 0xFF.toByte(), 0x00, 0xFF.toByte(), 0x00, 0x00, 0x00,
+                0xFF.toByte(), 0x00, 0x00, 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0x00, 0x00,
+            )
+            bgr24.copyInto(dib24, 40)
+            val topDown = app.window.testDecodeDib(dib24)
+            val topDownPixels = topDown?.pixels
+            report.check(
+                "window/clipboard-dib24-decoder-topdown",
+                topDown != null && topDownPixels != null &&
+                    topDownPixels.contentEquals(CLIP_IMAGE_BGRA),
+                "24bpp 自上而下 -> 像素=" +
+                    topDownPixels?.joinToString { "0x${it.toUInt().toString(16)}" },
+            )
+        }
+        if (frame == 146) {
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。
             driveFrames = false

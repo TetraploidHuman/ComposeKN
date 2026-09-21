@@ -246,6 +246,9 @@ if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
     # 分两次写会把前一次擦掉）以及位图（CF_DIBV5 + 传统 CF_DIB 两份）。
     check_log_line "剪贴板多格式写入（文本+HTML）" "个格式（文本=1 HTML="
     check_log_line "剪贴板位图写入" "位图=1"
+    # 「截图了但粘不进」的诊断：读图失败时必须把当前剪贴板上的格式全打出来，
+    # 真机日志一次就能定清楚该补哪种格式（BITMAP/DIB/DIBV5/PNG/…）。
+    check_log_line "读图失败时的格式诊断" "clipboard: 读图片失败，当前可用格式 = ["
     # 反证：真实鼠标消息**不该**顺带产生触摸事件（v0.5.11 的「笔悬停变手指」
     # 就是触摸通道串了）。window 阶段全程没有真触摸，所以一条都不该有。
     TOUCH_LINES="$(grep -c '^.*touch: ' "$STARTUP_LOG" 2>/dev/null || true)"

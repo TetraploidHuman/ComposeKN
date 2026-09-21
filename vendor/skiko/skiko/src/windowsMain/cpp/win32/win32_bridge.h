@@ -424,6 +424,43 @@ void composekn_win32_clipboard_set_image(
     ComposeKNWin32Window* window, int32_t width, int32_t height, const uint8_t* bgra);
 
 /**
+ * CF_HDROP：剪贴板上的**文件路径列表**（在资源管理器里 Ctrl+C 一个文件就是这个格式）。
+ *
+ * UTF-8、多条用 '\n' 分隔；没有该格式返回 -1（两段式：缓冲区不够回需要的字节数）。
+ */
+int32_t composekn_win32_clipboard_get_files(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size);
+
+// ---- 自检用：往剪贴板放特定形态的内容（真机上不好复现的格式）----
+
+/**
+ * 自检用：直接把一段 DIB 字节喂给解码器（不经过剪贴板）。
+ *
+ * Wine 会对 8bpp 的 CF_DIB 做有损转换，所以"8bpp 调色板解码"这条路必须绕开剪贴板才
+ * 能在自动化里跑到（真机上从画图/老程序复制的 256 色图走的正是它）。
+ * 两段式：`out_size == 0` 时只回需要的字节数；尺寸写到 `out_dims[0..1]`。
+ */
+int32_t composekn_win32_test_decode_dib(
+    const uint8_t* dib, int32_t dib_size,
+    uint8_t* out_bgra, int32_t out_size, int32_t* out_dims);
+
+/** 放一个 CF_HDROP（`utf8_paths` 是 '\n' 分隔的 UTF-8 路径）。 */
+bool composekn_win32_clipboard_test_set_files(ComposeKNWin32Window* window, const char* utf8_paths);
+
+/** 放一张**只有** CF_BITMAP（裸 HBITMAP）的图 —— 有的截图工具就只给这个。 */
+bool composekn_win32_clipboard_test_set_bitmap(
+    ComposeKNWin32Window* window, int32_t width, int32_t height, const uint8_t* bgra);
+
+/**
+ * 放一张 8bpp **调色板** CF_DIB（老程序/256 色画图）。
+ *
+ * `indices` 每像素 1 字节（取低 2 位，映射到固定 4 色调色板：红/绿/蓝/白）。
+ */
+bool composekn_win32_clipboard_test_set_dib8(
+    ComposeKNWin32Window* window, int32_t width, int32_t height,
+    const uint8_t* indices, int32_t index_count);
+
+/**
  * 自检用：把剪贴板里某个格式的**原始字节**（hex）读出来，供测试独立校验
  * 「我们写进去的 CF_HTML 头/位图头到底长什么样」。
  *

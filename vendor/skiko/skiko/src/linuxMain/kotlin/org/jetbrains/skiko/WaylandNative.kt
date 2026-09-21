@@ -203,6 +203,8 @@ object WaylandClipboard {
     //   * 读：回 null（= 没有这个格式）；
     //   * 写：只写文本，HTML/RTF/位图**忽略**。
     // 补齐要动 C 侧协议（多 MIME + send 回调），单独一轮做 —— 见 HANDOVER §17.34。
+    /** 文件列表（Wayland 侧是 `text/uri-list` 那条，还没接）。 */
+    fun getFiles(): List<String> = emptyList()
     fun getHtml(): String? = null
     fun getRtf(): String? = null
     fun getImage(): ClipboardImage? = null

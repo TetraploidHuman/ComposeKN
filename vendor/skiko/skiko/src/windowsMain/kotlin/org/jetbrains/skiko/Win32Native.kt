@@ -262,6 +262,32 @@ internal external fun composekn_win32_clipboard_get_image(
     window: COpaquePointer?, buffer: CPointer<UByteVar>?, bufferSize: Int, outSize: CPointer<IntVar>,
 ): Int
 
+@SymbolName("composekn_win32_clipboard_get_files")
+internal external fun composekn_win32_clipboard_get_files(
+    window: COpaquePointer?, buffer: CPointer<ByteVar>, bufferSize: Int,
+): Int
+
+@SymbolName("composekn_win32_test_decode_dib")
+internal external fun composekn_win32_test_decode_dib(
+    dib: CPointer<UByteVar>, dibSize: Int,
+    outBgra: CPointer<UByteVar>?, outSize: Int, outDims: CPointer<IntVar>,
+): Int
+
+@SymbolName("composekn_win32_clipboard_test_set_files")
+internal external fun composekn_win32_clipboard_test_set_files(
+    window: COpaquePointer?, utf8Paths: CPointer<ByteVar>,
+): Boolean
+
+@SymbolName("composekn_win32_clipboard_test_set_bitmap")
+internal external fun composekn_win32_clipboard_test_set_bitmap(
+    window: COpaquePointer?, width: Int, height: Int, bgra: CPointer<UByteVar>,
+): Boolean
+
+@SymbolName("composekn_win32_clipboard_test_set_dib8")
+internal external fun composekn_win32_clipboard_test_set_dib8(
+    window: COpaquePointer?, width: Int, height: Int, indices: CPointer<UByteVar>, indexCount: Int,
+): Boolean
+
 @SymbolName("composekn_win32_clipboard_get_raw_hex")
 internal external fun composekn_win32_clipboard_get_raw_hex(
     window: COpaquePointer?, formatName: CPointer<ByteVar>, buffer: CPointer<ByteVar>, bufferSize: Int,
@@ -601,6 +627,69 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      */
     fun testSimulateDrag(phase: Int, x: Int, y: Int, kind: Int): Boolean =
         composekn_win32_test_simulate_drag(native, phase, x, y, kind)
+
+    // ---- 剪贴板：文件列表（CF_HDROP）----
+
+    /**
+     * 剪贴板上的**文件路径列表**（资源管理器里复制文件就是这个格式）。
+     *
+     * 空列表 = 剪贴板里没有文件（比如复制的是文本/图片）。
+     */
+    fun clipboardGetFiles(): List<String> {
+        val joined = clipboardPopString { buffer, size ->
+            composekn_win32_clipboard_get_files(native, buffer, size)
+        } ?: return emptyList()
+        return joined.split('\n').filter { it.isNotEmpty() }
+    }
+
+    /**
+     * 自检用：直接把一段 DIB 字节喂给解码器（不经过剪贴板，绕开 Wine 的有损转换）。
+     *
+     * null = 解不出来（格式不支持/数据不够）。走的是剪贴板读图同一条解码路径。
+     */
+    fun testDecodeDib(dib: ByteArray): ClipboardImage? = memScoped {
+        val dims = allocArray<IntVar>(2)
+        val needed = dib.usePinned { pinned ->
+            composekn_win32_test_decode_dib(
+                pinned.addressOf(0).reinterpret<UByteVar>(), dib.size, null, 0, dims,
+            )
+        }
+        if (needed <= 0) return@memScoped null
+        val width = dims[0]
+        val height = dims[1]
+        if (width <= 0 || height <= 0) return@memScoped null
+        val pixels = ByteArray(needed)
+        val written = dib.usePinned { pinned ->
+            pixels.usePinned { outPinned ->
+                composekn_win32_test_decode_dib(
+                    pinned.addressOf(0).reinterpret<UByteVar>(), dib.size,
+                    outPinned.addressOf(0).reinterpret<UByteVar>(), needed, dims,
+                )
+            }
+        }
+        if (written != needed) return@memScoped null
+        ClipboardImage(width, height, pixels)
+    }
+
+    /** 自检用：放一个 CF_HDROP（`\n` 分隔的 UTF-8 路径）。 */
+    fun clipboardTestSetFiles(paths: List<String>): Boolean =
+        paths.joinToString("\n").useCString { composekn_win32_clipboard_test_set_files(native, it) }
+
+    /** 自检用：放一张**只有** CF_BITMAP（裸 HBITMAP）的图。 */
+    fun clipboardTestSetBitmap(image: ClipboardImage): Boolean =
+        image.pixels.usePinned { pinned ->
+            composekn_win32_clipboard_test_set_bitmap(
+                native, image.width, image.height, pinned.addressOf(0).reinterpret<UByteVar>(),
+            )
+        }
+
+    /** 自检用：放一张 8bpp 调色板 CF_DIB（每像素 1 字节索引，映射固定 4 色）。 */
+    fun clipboardTestSetDib8(width: Int, height: Int, indices: ByteArray): Boolean =
+        indices.usePinned { pinned ->
+            composekn_win32_clipboard_test_set_dib8(
+                native, width, height, pinned.addressOf(0).reinterpret<UByteVar>(), indices.size,
+            )
+        }
 
     // ---- 剪贴板：富文本格式（CF_HTML / RTF / CF_DIBV5）----
 

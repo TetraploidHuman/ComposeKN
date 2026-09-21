@@ -4,6 +4,7 @@ import org.jetbrains.skia.Canvas
 import org.jetbrains.skiko.SkiaLayer
 import org.jetbrains.skiko.SkikoRenderDelegate
 import org.jetbrains.skiko.Win32Event
+import org.jetbrains.skiko.ClipboardImage
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.win32Log
@@ -471,6 +472,24 @@ class WindowsComposeWindow(
      * 所以是「ENTER 先乐观接受，Kotlin 判定完纠正后面的 OVER/DROP」。
      */
     fun setDropAccept(accept: Boolean): Boolean = win32Window?.setDropAccept(accept) ?: false
+
+    /** 自检用：直接把一段 DIB 字节喂给解码器（绕开剪贴板）。 */
+    fun testDecodeDib(dib: ByteArray): ClipboardImage? = win32Window?.testDecodeDib(dib)
+
+    /**
+     * 自检用：往剪贴板放一个 `CF_HDROP`（`paths` 是文件路径列表）——
+     * 模拟"在资源管理器里 Ctrl+C 了文件"。
+     */
+    fun clipboardTestSetFiles(paths: List<String>): Boolean =
+        win32Window?.clipboardTestSetFiles(paths) ?: false
+
+    /** 自检用：往剪贴板放一张**只有** `CF_BITMAP`（裸 HBITMAP）的图。 */
+    fun clipboardTestSetBitmap(image: ClipboardImage): Boolean =
+        win32Window?.clipboardTestSetBitmap(image) ?: false
+
+    /** 自检用：往剪贴板放一张 8bpp 调色板 `CF_DIB`。 */
+    fun clipboardTestSetDib8(width: Int, height: Int, indices: ByteArray): Boolean =
+        win32Window?.clipboardTestSetDib8(width, height, indices) ?: false
 
     /**
      * 自检用：把剪贴板里某个格式的**原始字节**按 hex 读出来。

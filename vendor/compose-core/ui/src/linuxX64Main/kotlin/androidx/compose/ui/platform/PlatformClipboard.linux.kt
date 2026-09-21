@@ -74,12 +74,14 @@ internal actual fun createPlatformClipboard(): Clipboard = LinuxPlatformClipboar
  */
 private fun platformClipEntry(): ClipEntry? {
     val text = WaylandClipboard.getText()
+    val files = WaylandClipboard.getFiles()
     val html = WaylandClipboard.getHtml()
     val rtf = WaylandClipboard.getRtf()
     val image = WaylandClipboard.getImage()
-    if (text == null && html == null && rtf == null && image == null) return null
+    if (text == null && files.isEmpty() && html == null && rtf == null && image == null) return null
     return ClipEntry().apply {
         plainText = text
+        this.files = files
         this.html = html
         this.rtf = rtf
         this.image = image?.toImageBitmap()
@@ -133,6 +135,9 @@ actual class ClipEntry internal constructor() {
         get() = ClipMetadata.PlainText
 
     internal var plainText: String? = null
+
+    /** 剪贴板上的**文件路径列表**（Windows 的 CF_HDROP；资源管理器里复制文件就是这个）。 */
+    internal var files: List<String> = emptyList()
     internal var html: String? = null
     internal var rtf: String? = null
     internal var image: ImageBitmap? = null
@@ -140,6 +145,20 @@ actual class ClipEntry internal constructor() {
     /** 纯文本（CF_UNICODETEXT）；没有则 null。 */
     @ExperimentalComposeUiApi
     fun getPlainText(): String? = plainText
+
+    /**
+     * 剪贴板上的**文件路径列表**（Windows 上是 `CF_HDROP`）。
+     *
+     * 典型场景：在资源管理器里 Ctrl+C 选中的文件，再到应用里粘贴 —— 拿到的就是这个
+     * 列表（剪贴板上**没有**图片数据，只有路径）。
+     *
+     * 空列表 = 这次剪贴板里没有文件。
+     *
+     * ⚠ 目前只支持**读**：把文件列表**写**进剪贴板（`CF_HDROP` + 首选拖放效果那套
+     * shell 语义）还没做，所以没有对应的 `withFiles` 工厂。
+     */
+    @ExperimentalComposeUiApi
+    fun getFiles(): List<String> = files
 
     /** HTML（Windows 上写/读的是 CF_HTML 里的**片段**，不含格式头）。 */
     @ExperimentalComposeUiApi

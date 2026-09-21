@@ -3365,3 +3365,105 @@ Version/StartHTML=105/EndHTML=216/StartFragment=137/EndFragment=184 共 216 字�
 * logic **118** / window **72**（+9）（合计 **190**）、`all` **187** —— 全绿；
 * 外部阶段：`win32msg` **13** 条（+2）+ `input` 5 条 + `screenshot` 4 条全绿；
 * 打包单文件 exe（无 `icudtl.dat`）干净目录复测。
+
+### 17.35 剪贴板图片的三级回退 + 文件列表（CF_HDROP）+ 「截图了但粘不进」诊断（v0.5.17）
+
+起因是个很具体的问题（用户问）：**「我用 Win10 自带截图工具截图到剪贴板，能直接粘进输入框吗？」**
+答案是两半：
+
+* **粘不进输入框** —— 文本框是纯文本控件，它的粘贴只会去要 `CF_UNICODETEXT`；截图时剪贴板上
+  没有文本格式，所以什么也不会发生。上游 Compose Desktop 一样（AWT 的 `stringFlavor` 也拿不到）。
+  这不是宿主 bug，是**应用要有地方接收图片**。
+* **图片本身读得到** —— 但"截图工具到底放了哪种格式"因版本而异，所以这一版把读取路径做全了。
+
+#### 1. 读图：三级回退，而且**解析失败也要继续试下一个**
+
+```
+CF_DIBV5（语义最全）-> CF_DIB（传统 40 字节头）-> CF_BITMAP（裸 HBITMAP，走 GDI 转）
+```
+
+为什么强调"失败也继续"：真机上 V5 可能是别的程序**合成歪的**（Wine 就会把 8bpp 的 `CF_DIB`
+合成出一个丢了调色板、长度也不对的 V5），而旁边那份 `CF_DIB`/`CF_BITMAP` 往往是好的。
+实测日志就是活教材：
+
+```
+clipboard: 位图数据不够（需要 140 字节，只有 132）
+clipboard: 8bpp 位图没有调色板（2x2，块 132 字节）
+clipboard: CF_DIBV5/CF_DIB/CF_BITMAP 三个都拿不到句柄
+```
+
+顺带修掉的两处真实健壮性问题（都不是 Wine 特有，老程序的 DIB 也会这样）：
+
+* **调色板大小不可信**：`biClrUsed = 0` 规范上表示"全 256 项"，但缓冲区里可能只有几项 ——
+  现在**把像素数据锚定到缓冲区末尾**（`pixelOffset = size - 像素字节数`），再按
+  "头之后、像素之前"算调色板项数并裁剪；索引超出调色板时当不透明黑。
+  8bpp 且**一项调色板都没有**时判定为解析失败（不给"全黑图"这种假成功），继续试下一个格式。
+* 位深/头型支持面：`BITMAPV5HEADER(124)` / `BITMAPINFOHEADER(40)` / `BITMAPCOREHEADER(12)`，
+  `32/24/8bpp`，`BI_RGB`/`BI_BITFIELDS`，`biHeight` 正负（自下而上/上而下）都处理；
+  调色板与 RLE 压缩仍不支持（RLE 现在会明确回 -1 并记一行原因）。
+
+#### 2. 文件列表：`CF_HDROP`（复制文件 → 粘贴路径）
+
+在资源管理器里 Ctrl+C 一个 `.jpg`，剪贴板上是 **`CF_HDROP` 文件路径列表**，不是位图 ——
+这条以前完全没接（拖放那条早就有了，但那是两个入口）。现在：
+
+* C 侧把 `HDROP` 解码抽成 `readHDropFiles()`（拖放 / 剪贴板共用）；
+* 新增 `composekn_win32_clipboard_get_files()` + `Win32Window.clipboardGetFiles()`；
+* 共享层 `ClipEntry` 多了 **`files` / `getFiles()`**（Windows 上是 CF_HDROP）。
+* ⚠ 目前**只支持读**：把文件列表**写**进剪贴板（`CF_HDROP` + 首选拖放效果那套 shell 语义）
+  还没做，所以**故意没有** `withFiles` 工厂 —— 免得给一个语义不完整的 API。
+
+#### 3. 「截图了但粘不进」诊断
+
+读图失败时，如果剪贴板上**确实有**跟图片/文件相关的格式（`BITMAP`/`DIB`/`DIBV5`/`HDROP`/
+`PNG`/`JFIF`），就打一行**当前全部格式**：
+
+```
+clipboard: 读图片失败，当前可用格式 = [DIB, BITMAP, DIBV5]
+```
+
+只在有相关格式时打 —— 否则每次粘贴文本（`getClip()` 会顺带问一次图片）都会刷一行，日志没法看。
+用户下次只要"截个图 → 点一下画廊里的粘贴框 → 把日志发来"，就能定清楚该补哪种格式。
+
+#### 4. 画廊里可以直接用眼睛验
+
+`Gallery.kt` 新增「剪贴板 / Clipboard」一节 + **粘贴框**（点击读剪贴板）：
+
+* 图片 → 直接画在框里，并显示 `${width}x${height}`；
+* 只有文件 → 显示"文件 N 个：第一条路径"；
+* 只有文本 → 显示前 40 个字符；
+* 都没有 → 明确说"剪贴板里没有图片/文件/文本"。
+
+每次点击还会写一行 `paste: 读剪贴板 -> 图片=WxH 文件=N 文本=M`，真机排查时对着看就行。
+（为什么用"点击"而不是 Ctrl+V：画廊里的元素没做焦点管理，点击是"一定能用"的入口；真做应用时
+用 `Modifier.onPreviewKeyEvent` 处理 Ctrl+V，读的还是同一个 `ClipboardManager.getClip()`。）
+
+#### 5. 几个要说清楚的边界
+
+* **JPEG 没有"剪贴板格式"**：Windows 没有标准 `CF_JPEG`。所有程序复制图片时都是先解码成像素，
+  以 `CF_DIB`/`CF_DIBV5` 放上去 —— 所以源文件是 jpg/png/gif 无所谓，拿到的都是像素。
+* **`"PNG"` 这个注册格式我们没读也没写**：Windows 10 之后有些程序（Chrome 等）会**额外**放一份
+  `"PNG"`（无损 + alpha）。我们读 V5 就够了；要不要额外写一份留给"下游要无损"的场景再定。
+* **元文件（EMF/WMF）不支持**：Word/Visio 复制矢量图形时主要给这个，现在读不到。
+* Wine 会把 8bpp 的 `CF_DIB` 转歪，所以"8bpp 调色板解码"这条**真机上会走到的**路径，
+  在自动化里是绕开剪贴板直接喂字节测的（`composekn_win32_test_decode_dib`）。
+
+#### 自检（新增 7 条）
+
+| 断言 | 内容 |
+| --- | --- |
+| `clipboard-files-from-cf-hdrop` | CF_HDROP → `ClipEntry.getFiles()` |
+| `clipboard-image-missing-on-file-drop` | 只有文件列表时 `getImage()` 必须是 null（顺便触发诊断日志） |
+| `clipboard-image-from-cf-bitmap` | 只有裸 HBITMAP 时也能读出 2×2 四色（走 GDI） |
+| `clipboard-image-from-dib8-palette` | 8bpp 调色板图（Wine 下经 CF_BITMAP 回退） |
+| `clipboard-dib8-decoder-standard-palette` | 直接喂 8bpp+4 色调色板字节 → 逐像素正确 |
+| `clipboard-dib8-decoder-clrused-lies` | `biClrUsed=0`（声称 256 项）但只给 4 项 → 仍能正确解码 |
+| `clipboard-dib24-decoder-topdown` | 24bpp + `biHeight<0`（自上而下）+ 行填充 → 逐像素正确 |
+
+脚本侧外部证据加了 1 条：`clipboard: 读图片失败，当前可用格式 = [` 必须出现在宿主日志里。
+
+#### 验证
+
+* logic **118** / window **79**（+7）（合计 **197**）、`all` **194** —— 全绿；
+* 外部阶段：`win32msg` **14** 条（+1）+ `input` 5 条 + `screenshot` 4 条全绿；
+* 打包单文件 exe（无 `icudtl.dat`）干净目录复测。

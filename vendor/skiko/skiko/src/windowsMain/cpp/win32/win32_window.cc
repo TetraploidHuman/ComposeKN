@@ -2689,6 +2689,27 @@ static std::string wideToUtf8(const wchar_t* wide) {
 }
 
 /** 从 IDataObject 里取出 CF_HDROP（文件列表）与 CF_UNICODETEXT（文本）。 */
+/**
+ * 把一个 `HDROP` 解成 `'\n'` 分隔的 UTF-8 路径列表（拖放和剪贴板两个入口共用）。
+ *
+ * 返回值 = 解析出几条路径。
+ */
+static int readHDropFiles(HDROP drop, std::string& out) {
+    if (drop == nullptr) return 0;
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    int found = 0;
+    for (UINT i = 0; i < count; ++i) {
+        const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+        std::vector<wchar_t> buf(static_cast<size_t>(len) + 1, L'\0');
+        if (DragQueryFileW(drop, i, buf.data(), len + 1) > 0) {
+            if (!out.empty()) out.push_back('\n');
+            out += wideToUtf8(buf.data());
+            ++found;
+        }
+    }
+    return found;
+}
+
 static bool extractDropPayload(IDataObject* data, std::string& files, std::string& text) {
     if (data == nullptr) return false;
     bool any = false;
@@ -2697,16 +2718,7 @@ static bool extractDropPayload(IDataObject* data, std::string& files, std::strin
     if (data->GetData(&fmt, &medium) == S_OK) {
         HDROP drop = static_cast<HDROP>(GlobalLock(medium.hGlobal));
         if (drop != nullptr) {
-            const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-            for (UINT i = 0; i < count; ++i) {
-                const UINT len = DragQueryFileW(drop, i, nullptr, 0);
-                std::vector<wchar_t> buf(static_cast<size_t>(len) + 1, L'\0');
-                if (DragQueryFileW(drop, i, buf.data(), len + 1) > 0) {
-                    if (!files.empty()) files.push_back('\n');
-                    files += wideToUtf8(buf.data());
-                    any = true;
-                }
-            }
+            any = readHDropFiles(drop, files) > 0 || any;
             GlobalUnlock(medium.hGlobal);
         }
         ReleaseStgMedium(&medium);
@@ -3251,19 +3263,65 @@ static bool parseDib(const void* data, size_t size, std::vector<uint8_t>& out, i
         composeknLog("clipboard: 位图头大小 %u 不认识", headerSize);
         return false;
     }
-    if (w <= 0 || h <= 0 || w > 20000 || h > 20000) return false;
-    if (bitCount != 32 && bitCount != 24) {
-        composeknLog("clipboard: %u bpp 位图暂不支持（只做 32/24bpp）", bitCount);
+    if (w <= 0 || h <= 0 || w > 20000 || h > 20000) {
+        composeknLog("clipboard: 位图尺寸异常 %dx%d（头 %u）", w, h, headerSize);
+        return false;
+    }
+    if (bitCount != 32 && bitCount != 24 && bitCount != 8) {
+        composeknLog("clipboard: %u bpp 位图暂不支持（只做 32/24/8bpp，头 %u）", bitCount, headerSize);
         return false;
     }
     if (compression != 0 /*BI_RGB*/ && compression != 3 /*BI_BITFIELDS*/) {
-        composeknLog("clipboard: 压缩位图暂不支持（biCompression=%u）", compression);
+        composeknLog(
+            "clipboard: 压缩位图暂不支持（biCompression=%u，%u bpp，%dx%d）",
+            compression, bitCount, w, h
+        );
         return false;
     }
     const size_t srcStride = ((static_cast<size_t>(w) * bitCount / 8) + 3) & ~static_cast<size_t>(3);
-    if (pixelOffset + srcStride * static_cast<size_t>(h) > size) {
-        composeknLog("clipboard: 位图数据不够（需要 %zu 字节，只有 %zu）", pixelOffset + srcStride * h, size);
+    const size_t pixelBytes = srcStride * static_cast<size_t>(h);
+    if (pixelBytes > size) {
+        composeknLog(
+            "clipboard: 位图数据不够（像素需要 %zu 字节，整块只有 %zu；%dx%d %ubpp）",
+            pixelBytes, size, w, h, bitCount
+        );
         return false;
+    }
+    // **像素数据锚定到缓冲区末尾**：调色板大小不可信时（biClrUsed=0 声称 256 项、
+    // 缓冲区里其实只有几项 —— Wine 转换格式后就是这样，某些老程序也会），"头后面剩
+    // 多少字节"根本推不出来，但"最后 pixelBytes 字节一定是像素"是稳的。
+    pixelOffset = size - pixelBytes;
+
+    // 8bpp 还有一张调色板（跟在头后面，每项 4 字节 RGBQUAD）。
+    uint32_t palette[256] = {};
+    int paletteEntries = 0;
+    if (bitCount == 8) {
+        const auto* bmi = reinterpret_cast<const BITMAPINFOHEADER*>(bytes);
+        UINT used = 0;
+        if (headerSize >= 40) used = bmi->biClrUsed;
+        if (used == 0 || used > 256) used = 256;   // 0 = 规范上"全 256 项"
+        int declaredEntries = static_cast<int>(used);
+        // 调色板能有多少项 = 头部之后、像素之前的字节数（按像素锚定位置算）。
+        const size_t paletteSpace = pixelOffset > headerSize ? pixelOffset - headerSize : 0;
+        int availableEntries = static_cast<int>(paletteSpace / 4);
+        if (availableEntries > 256) availableEntries = 256;
+        paletteEntries = declaredEntries < availableEntries ? declaredEntries : availableEntries;
+        if (paletteEntries <= 0) {
+            // 8bpp 却一张调色板都没有（头之后紧接着就是像素）—— 索引没法映射成颜色。
+            // 这种通常是"别的程序合成歪的"（Wine 把 8bpp CF_DIB 转成 V5 时就会丢掉
+            // 调色板）：当成解析**失败**，让调用方继续试下一个格式（CF_DIB/CF_BITMAP），
+            // 而不是给出一张全黑的图。
+            composeknLog("clipboard: 8bpp 位图没有调色板（%dx%d，块 %zu 字节）", w, h, size);
+            return false;
+        }
+        for (int i = 0; i < paletteEntries; ++i) {
+            const auto* entry = bytes + headerSize + static_cast<size_t>(i) * 4;
+            // RGBQUAD: B, G, R, reserved
+            palette[i] = (static_cast<uint32_t>(entry[3]) << 24) |
+                         (static_cast<uint32_t>(entry[2]) << 16) |
+                         (static_cast<uint32_t>(entry[1]) << 8) |
+                         static_cast<uint32_t>(entry[0]);
+        }
     }
     out.assign(static_cast<size_t>(w) * h * 4, 0);
     for (int32_t y = 0; y < h; ++y) {
@@ -3276,11 +3334,18 @@ static bool parseDib(const void* data, size_t size, std::vector<uint8_t>& out, i
                 dst[x * 4 + 1] = row[x * 4 + 1];
                 dst[x * 4 + 2] = row[x * 4 + 2];
                 dst[x * 4 + 3] = row[x * 4 + 3];
-            } else {
+            } else if (bitCount == 24) {
                 dst[x * 4 + 0] = row[x * 3 + 0];
                 dst[x * 4 + 1] = row[x * 3 + 1];
                 dst[x * 4 + 2] = row[x * 3 + 2];
                 dst[x * 4 + 3] = 0xFF;
+            } else {
+                const uint8_t index = row[x];
+                const uint32_t entry = index < paletteEntries ? palette[index] : 0xFF000000u;
+                dst[x * 4 + 0] = static_cast<uint8_t>(entry & 0xFF);
+                dst[x * 4 + 1] = static_cast<uint8_t>((entry >> 8) & 0xFF);
+                dst[x * 4 + 2] = static_cast<uint8_t>((entry >> 16) & 0xFF);
+                dst[x * 4 + 3] = 0xFF;   // 调色板 DIB 没有 alpha
             }
         }
     }
@@ -3342,6 +3407,114 @@ static std::vector<uint8_t> buildDibLegacy(int32_t width, int32_t height, const 
         std::memcpy(dst, src, stride);
     }
     return out;
+}
+
+/** 标准剪贴板格式号 -> 名字（日志/自检要看懂）。 */
+static const char* standardClipboardFormatName(UINT format) {
+    switch (format) {
+        case CF_TEXT: return "TEXT";
+        case CF_BITMAP: return "BITMAP";
+        case CF_METAFILEPICT: return "METAFILEPICT";
+        case CF_SYLK: return "SYLK";
+        case CF_DIF: return "DIF";
+        case CF_TIFF: return "TIFF";
+        case CF_OEMTEXT: return "OEMTEXT";
+        case CF_DIB: return "DIB";
+        case CF_PALETTE: return "PALETTE";
+        case CF_PENDATA: return "PENDATA";
+        case CF_RIFF: return "RIFF";
+        case CF_WAVE: return "WAVE";
+        case CF_UNICODETEXT: return "UNICODETEXT";
+        case CF_ENHMETAFILE: return "ENHMETAFILE";
+        case CF_HDROP: return "HDROP";
+        case CF_LOCALE: return "LOCALE";
+        case CF_DIBV5: return "DIBV5";
+        default: return nullptr;
+    }
+}
+
+/** 当前打开着的剪贴板里所有格式的名字，拼成 "[A, B, C]"。 */
+static std::string enumerateClipboardFormats() {
+    std::string out;
+    UINT format = 0;
+    int count = 0;
+    while ((format = EnumClipboardFormats(format)) != 0) {
+        if (count > 0) out += ", ";
+        const char* standard = standardClipboardFormatName(format);
+        if (standard != nullptr) {
+            out += standard;
+        } else {
+            char name[128] = {0};
+            if (GetClipboardFormatNameA(format, name, sizeof(name)) > 0) {
+                out += name;
+            } else {
+                out += "?";
+            }
+        }
+        ++count;
+        if (count >= 24) {   // 防呆：有的程序会放一堆私有格式
+            out += ", …";
+            break;
+        }
+    }
+    if (count == 0) out = "（空）";
+    return out;
+}
+
+/** 剪贴板上有没有"跟图片/文件有关"的格式（决定读图失败要不要写诊断日志）。 */
+static bool hasImageLikeClipboardFormat() {
+    static const UINT kInteresting[] = {
+        CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP,
+        RegisterClipboardFormatA("PNG"), RegisterClipboardFormatA("JFIF"),
+    };
+    for (UINT format : kInteresting) {
+        if (format != 0 && IsClipboardFormatAvailable(format)) return true;
+    }
+    return false;
+}
+
+/** CF_BITMAP（裸 HBITMAP，没有 DIB 头）-> 自上而下 BGRA。 */
+static bool parseBitmapHandle(HBITMAP handle, std::vector<uint8_t>& out, int32_t& width, int32_t& height) {
+    if (handle == nullptr) return false;
+    BITMAP bm = {};
+    if (GetObjectA(handle, sizeof(bm), &bm) == 0) {
+        composeknLog("clipboard: CF_BITMAP 的 GetObject 失败 err=%lu", (unsigned long)GetLastError());
+        return false;
+    }
+    if (bm.bmWidth <= 0 || bm.bmHeight <= 0 || bm.bmWidth > 20000 || bm.bmHeight > 20000) {
+        composeknLog("clipboard: CF_BITMAP 尺寸异常 %ldx%ld", (long)bm.bmWidth, (long)bm.bmHeight);
+        return false;
+    }
+
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = bm.bmWidth;
+    // 负数 = 要自上而下的行（省得我们再翻一次）
+    info.bmiHeader.biHeight = -bm.bmHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    info.bmiHeader.biSizeImage = static_cast<DWORD>(bm.bmWidth) * 4 * static_cast<DWORD>(bm.bmHeight);
+
+    HDC dc = GetDC(nullptr);
+    if (dc == nullptr) return false;
+    out.assign(static_cast<size_t>(bm.bmWidth) * bm.bmHeight * 4, 0);
+    const int lines = GetDIBits(
+        dc, handle, 0, static_cast<UINT>(bm.bmHeight), out.data(), &info, DIB_RGB_COLORS
+    );
+    ReleaseDC(nullptr, dc);
+    if (lines == 0) {
+        composeknLog("clipboard: CF_BITMAP 的 GetDIBits 失败 err=%lu（%ldx%ld %ubpp）",
+                     (unsigned long)GetLastError(), (long)bm.bmWidth, (long)bm.bmHeight,
+                     (unsigned)bm.bmBitsPixel);
+        return false;
+    }
+    // HBITMAP（DDB）里通常没有 alpha 信息，GetDIBits 会把第 4 字节填 0/垃圾 ——
+    // 一律当不透明处理（不然整张图会"全透明"看不见）。
+    for (size_t i = 3; i < out.size(); i += 4) out[i] = 0xFF;
+    width = bm.bmWidth;
+    height = bm.bmHeight;
+    return true;
 }
 
 /** 把一块字节放进剪贴板（HGLOBAL 所有权的约定见调用点）。 */
@@ -3425,30 +3598,55 @@ extern "C" int32_t composekn_win32_clipboard_get_image(
     ComposeKNWin32Window* window, uint8_t* buffer, int32_t buffer_size, int32_t* out_size) {
     (void)window;
     if (!OpenClipboard(nullptr)) return -1;
-    // 优先 V5（语义明确），退回老 CF_DIB。
-    HANDLE handle = GetClipboardData(CF_DIBV5);
-    if (handle == nullptr) handle = GetClipboardData(CF_DIB);
-    int32_t result = -1;
-    if (handle != nullptr) {
+
+    // 按顺序试三种格式，**解析失败也继续试下一个**：
+    //   CF_DIBV5（语义最全）-> CF_DIB（传统）-> CF_BITMAP（裸 HBITMAP）。
+    // 为什么"失败也要继续"：真机上 V5 可能是别的程序合成歪的/被截断的（Wine 就会把
+    // 8bpp 的 CF_DIB 合成出一个少了调色板的 V5），而旁边那份 CF_DIB 往往是好的。
+    HANDLE candidates[2] = { GetClipboardData(CF_DIBV5), GetClipboardData(CF_DIB) };
+    bool got = false;
+    std::vector<uint8_t> pixels;
+    int32_t width = 0;
+    int32_t height = 0;
+    for (HANDLE handle : candidates) {
+        if (handle == nullptr) continue;
         void* data = GlobalLock(handle);
-        if (data != nullptr) {
-            std::vector<uint8_t> pixels;
-            int32_t w = 0, h = 0;
-            if (parseDib(data, GlobalSize(handle), pixels, w, h)) {
-                const int32_t needed = static_cast<int32_t>(pixels.size());
-                if (buffer == nullptr || buffer_size < needed) {
-                    result = needed;
-                } else {
-                    std::memcpy(buffer, pixels.data(), static_cast<size_t>(needed));
-                    result = needed;
-                }
-                if (out_size != nullptr) {
-                    out_size[0] = w;
-                    out_size[1] = h;
-                }
-            }
-            GlobalUnlock(handle);
+        if (data == nullptr) continue;
+        got = parseDib(data, GlobalSize(handle), pixels, width, height);
+        GlobalUnlock(handle);
+        if (got) break;
+    }
+    if (!got) {
+        HBITMAP bitmap = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+        if (bitmap != nullptr) {
+            got = parseBitmapHandle(bitmap, pixels, width, height);
+        } else if (candidates[0] == nullptr && candidates[1] == nullptr) {
+            composeknLog("clipboard: CF_DIBV5/CF_DIB/CF_BITMAP 三个都拿不到句柄");
         }
+    }
+
+    int32_t result = -1;
+    if (got && !pixels.empty()) {
+        const int32_t needed = static_cast<int32_t>(pixels.size());
+        if (buffer == nullptr || buffer_size < needed) {
+            result = needed;   // 两段式：先告诉调用方要多大
+        } else {
+            std::memcpy(buffer, pixels.data(), static_cast<size_t>(needed));
+            result = needed;
+        }
+        if (out_size != nullptr) {
+            out_size[0] = width;
+            out_size[1] = height;
+        }
+    }
+
+    if (result < 0 && hasImageLikeClipboardFormat()) {
+        // 剪贴板上**确实有**图片/文件类格式，但没读出来 —— 把当前全部格式打出来。
+        // 真机排查"截图了但粘不进"就靠这行。
+        //
+        // 只在有相关格式时打：否则每次粘贴文本（`getClip()` 会顺带问一次图片）都会刷
+        // 一行"读图片失败"，日志就没法看了。
+        composeknLog("clipboard: 读图片失败，当前可用格式 = [%s]", enumerateClipboardFormats().c_str());
     }
     CloseClipboard();
     return result;
@@ -3556,4 +3754,207 @@ extern "C" void composekn_win32_clipboard_set_rich(
 
 extern "C" void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window, const char* text) {
     composekn_win32_clipboard_set_rich(window, text, nullptr, nullptr, 0, 0, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 剪贴板：文件列表（CF_HDROP）、CF_BITMAP 回退、格式诊断
+//
+// 背景（真机问题）：Win10 的截图工具往剪贴板放什么格式，不同版本不一样 —— 有的放
+// CF_DIB/CF_DIBV5，有的只放 CF_BITMAP（裸 HBITMAP）。所以：
+//   * 读图：CF_DIBV5 -> CF_DIB -> **CF_BITMAP**（GDI 转一遍）三级回退；
+//   * 全都读不到时，把**当前剪贴板上所有格式**打进日志 —— 用户截一张图粘一次，
+//     日志就能告诉我们该怎么补。
+// 另外：在资源管理器里复制文件，剪贴板上是 CF_HDROP（文件路径列表）而不是位图，
+// 所以"复制文件 -> 粘贴"要有单独一条读路径（拖放那条已经实现了，这里复用解码）。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+
+}  // namespace
+
+extern "C" int32_t composekn_win32_clipboard_get_files(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size) {
+    (void)window;
+    if (!OpenClipboard(nullptr)) return -1;
+    HANDLE handle = GetClipboardData(CF_HDROP);
+    int32_t result = -1;
+    if (handle != nullptr) {
+        HDROP drop = static_cast<HDROP>(GlobalLock(handle));
+        if (drop != nullptr) {
+            std::string files;
+            readHDropFiles(drop, files);
+            GlobalUnlock(handle);
+            if (!files.empty()) {
+                const int32_t needed = static_cast<int32_t>(files.size());
+                if (buffer == nullptr || buffer_size < needed) {
+                    result = needed;
+                } else {
+                    std::memcpy(buffer, files.data(), static_cast<size_t>(needed));
+                    result = needed;
+                }
+            }
+        }
+    }
+    CloseClipboard();
+    return result;
+}
+
+/**
+ * 自检用：**直接**把一段 DIB 字节喂给解码器（不经过剪贴板）。
+ *
+ * 为什么要这条：Wine 的剪贴板会对 8bpp 的 CF_DIB 做一次有损转换（合成出来的 V5 少了
+ * 调色板、长度也不对），于是"8bpp 调色板解码"这条代码路径在自动化里跑不到。真机上
+ * 从画图/老程序复制的 256 色图走的正是这条路径，所以这里绕开剪贴板直接测解码器。
+ *
+ * 两段式：out_size==0 时只回需要的字节数；否则写像素并回写入字节数。
+ */
+extern "C" int32_t composekn_win32_test_decode_dib(
+    const uint8_t* dib, int32_t dib_size,
+    uint8_t* out_bgra, int32_t out_size, int32_t* out_dims) {
+    if (dib == nullptr || dib_size <= 0) return -1;
+    std::vector<uint8_t> pixels;
+    int32_t width = 0;
+    int32_t height = 0;
+    if (!parseDib(dib, static_cast<size_t>(dib_size), pixels, width, height)) return -1;
+    const int32_t needed = static_cast<int32_t>(pixels.size());
+    if (out_dims != nullptr) {
+        out_dims[0] = width;
+        out_dims[1] = height;
+    }
+    if (out_bgra == nullptr || out_size < needed) return needed;
+    std::memcpy(out_bgra, pixels.data(), static_cast<size_t>(needed));
+    return needed;
+}
+
+extern "C" bool composekn_win32_clipboard_test_set_files(
+    ComposeKNWin32Window* window, const char* utf8_paths) {
+    (void)window;
+    if (utf8_paths == nullptr) return false;
+    // '\n' 分隔的 UTF-8 路径 -> DROPFILES + 宽字符双 NUL 结尾列表
+    std::vector<std::wstring> widePaths;
+    {
+        std::string current;
+        for (const char* p = utf8_paths; ; ++p) {
+            if (*p == '\n' || *p == '\0') {
+                if (!current.empty()) {
+                    const int wlen = MultiByteToWideChar(CP_UTF8, 0, current.c_str(), -1, nullptr, 0);
+                    if (wlen > 1) {
+                        std::vector<wchar_t> wide(static_cast<size_t>(wlen), L'\0');
+                        MultiByteToWideChar(CP_UTF8, 0, current.c_str(), -1, wide.data(), wlen);
+                        widePaths.emplace_back(wide.data());
+                    }
+                    current.clear();
+                }
+                if (*p == '\0') break;
+            } else {
+                current.push_back(*p);
+            }
+        }
+    }
+    if (widePaths.empty()) return false;
+    size_t chars = 1;   // 结尾的双 NUL 里第一个
+    for (const auto& path : widePaths) chars += path.size() + 1;
+    const SIZE_T bytes = sizeof(DROPFILES) + chars * sizeof(wchar_t);
+    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+    if (global == nullptr) return false;
+    DROPFILES* df = static_cast<DROPFILES*>(GlobalLock(global));
+    if (df == nullptr) {
+        GlobalFree(global);
+        return false;
+    }
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    wchar_t* cursor = reinterpret_cast<wchar_t*>(reinterpret_cast<char*>(df) + sizeof(DROPFILES));
+    for (const auto& path : widePaths) {
+        std::memcpy(cursor, path.c_str(), (path.size() + 1) * sizeof(wchar_t));
+        cursor += path.size() + 1;
+    }
+    GlobalUnlock(global);
+    if (!OpenClipboard(nullptr)) {
+        GlobalFree(global);
+        return false;
+    }
+    EmptyClipboard();
+    const bool ok = SetClipboardData(CF_HDROP, global) != nullptr;
+    if (!ok) GlobalFree(global);
+    CloseClipboard();
+    composeknLog("clipboard(test): 放入 CF_HDROP（%zu 条路径）", widePaths.size());
+    return ok;
+}
+
+/** 自检用：放一张只有 CF_BITMAP 的图（模拟"截图工具只给裸 HBITMAP"）。 */
+extern "C" bool composekn_win32_clipboard_test_set_bitmap(
+    ComposeKNWin32Window* window, int32_t width, int32_t height, const uint8_t* bgra) {
+    (void)window;
+    if (width <= 0 || height <= 0 || bgra == nullptr) return false;
+    // 用传统 40 字节 BITMAPINFOHEADER 那份去建 HBITMAP：CreateDIBitmap 的文档
+    // 只保证认 BITMAPINFOHEADER，喂 V5 头（biSize=124）有的 GDI 实现会直接失败。
+    const std::vector<uint8_t> dib = buildDibLegacy(width, height, bgra);
+    const auto* header = reinterpret_cast<const BITMAPINFOHEADER*>(dib.data());
+    const void* bits = dib.data() + sizeof(BITMAPINFOHEADER);
+    HDC dc = GetDC(nullptr);
+    if (dc == nullptr) return false;
+    HBITMAP bitmap = CreateDIBitmap(dc, header, CBM_INIT, bits, reinterpret_cast<const BITMAPINFO*>(header), DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    if (bitmap == nullptr) return false;
+    if (!OpenClipboard(nullptr)) {
+        DeleteObject(bitmap);
+        return false;
+    }
+    EmptyClipboard();
+    const bool ok = SetClipboardData(CF_BITMAP, bitmap) != nullptr;
+    if (!ok) DeleteObject(bitmap);
+    CloseClipboard();
+    composeknLog("clipboard(test): 放入 CF_BITMAP %dx%d", width, height);
+    return ok;
+}
+
+/** 自检用：放一张 8bpp 调色板 CF_DIB（模拟老程序/256 色画图）。 */
+extern "C" bool composekn_win32_clipboard_test_set_dib8(
+    ComposeKNWin32Window* window, int32_t width, int32_t height, const uint8_t* indices, int32_t index_count) {
+    (void)window;
+    if (width <= 0 || height <= 0 || indices == nullptr) return false;
+    // 固定 4 色调色板：红/绿/蓝/白（索引 0..3）
+    static const uint32_t kPalette[4] = { 0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu };
+    const size_t stride = ((static_cast<size_t>(width) + 3) / 4) * 4;   // 8bpp 行 4 字节对齐
+    std::vector<uint8_t> dib(sizeof(BITMAPINFOHEADER) + 4 * 4 + stride * static_cast<size_t>(height), 0);
+    auto* bmi = reinterpret_cast<BITMAPINFOHEADER*>(dib.data());
+    bmi->biSize = sizeof(BITMAPINFOHEADER);
+    bmi->biWidth = width;
+    bmi->biHeight = height;
+    bmi->biPlanes = 1;
+    bmi->biBitCount = 8;
+    bmi->biCompression = BI_RGB;
+    bmi->biClrUsed = 4;
+    bmi->biSizeImage = static_cast<DWORD>(stride * static_cast<size_t>(height));
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t color = kPalette[i];
+        uint8_t* entry = dib.data() + sizeof(BITMAPINFOHEADER) + static_cast<size_t>(i) * 4;
+        entry[0] = static_cast<uint8_t>(color & 0xFF);           // B
+        entry[1] = static_cast<uint8_t>((color >> 8) & 0xFF);    // G
+        entry[2] = static_cast<uint8_t>((color >> 16) & 0xFF);   // R
+        entry[3] = 0;
+    }
+    for (int32_t y = 0; y < height; ++y) {
+        for (int32_t x = 0; x < width; ++x) {
+            const int32_t src = y * width + x;
+            uint8_t value = 0;
+            if (src < index_count) value = static_cast<uint8_t>(indices[src] & 0x03);
+            // 自下而上
+            dib[sizeof(BITMAPINFOHEADER) + 16 + stride * static_cast<size_t>(height - 1 - y) + static_cast<size_t>(x)] = value;
+        }
+    }
+    HGLOBAL global = bytesToGlobal(dib);
+    if (global == nullptr) return false;
+    if (!OpenClipboard(nullptr)) {
+        GlobalFree(global);
+        return false;
+    }
+    EmptyClipboard();
+    const bool ok = SetClipboardData(CF_DIB, global) != nullptr;
+    if (!ok) GlobalFree(global);
+    CloseClipboard();
+    composeknLog("clipboard(test): 放入 8bpp CF_DIB %dx%d", width, height);
+    return ok;
 }

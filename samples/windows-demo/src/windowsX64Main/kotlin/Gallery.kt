@@ -1,11 +1,13 @@
 @file:OptIn(
     androidx.compose.foundation.ExperimentalFoundationApi::class,
     androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
 )
 
 package main
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.rememberTransformableState
@@ -63,12 +65,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.style.TextOverflow
@@ -443,6 +447,10 @@ private fun LazyListScope.gallerySections(
         }
     }
 
+    section("剪贴板 / Clipboard") {
+        ClipboardPasteBox()
+    }
+
     section("弹层 / Popup") {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Box {
@@ -684,6 +692,94 @@ private fun LazyListScope.gallerySections(
  * 所以「悬停/点击试试」这个盒子**必须**也把点击做成可见反馈，否则真机触摸用户
  * 得到的就是「点了没反应」（用户实测反馈，HANDOVER §17.28）。鼠标悬停照旧变色。
  */
+/**
+ * 「从剪贴板粘贴」盒子：**点一下**就把剪贴板内容读出来显示。
+ *
+ * 为什么用点击而不是 Ctrl+V：这个画廊里的元素没有做焦点管理，点击是"一定能用"的入口
+ *（真做应用时用 `Modifier.onPreviewKeyEvent` 处理 Ctrl+V 即可，读的还是同一个
+ * `ClipboardManager.getClip()`）。另外这也回答了那个常见疑问：**文本框里粘不进图片** ——
+ * 文本控件的粘贴只会去要 `CF_UNICODETEXT`，图片要靠应用自己收（就是这里）。
+ *
+ * 走的是 v0.5.16/v0.5.17 接上的通道：
+ *   * 图片：CF_DIBV5 -> CF_DIB -> CF_BITMAP 三级回退（截图工具给哪种都能读）；
+ *   * 文件：CF_HDROP（资源管理器里 Ctrl+C 的文件路径列表）。
+ */
+@Composable
+private fun ClipboardPasteBox() {
+    val clipboard = LocalClipboardManager.current
+    var image by remember { mutableStateOf<ImageBitmap?>(null) }
+    var status by remember { mutableStateOf("点这里 = 从剪贴板粘贴（先 Win+Shift+S 截个图）") }
+
+    Card(modifier = Modifier.width(360.dp)) {
+        Column(Modifier.padding(12.dp)) {
+            Text("剪贴板粘贴", style = MaterialTheme.typography.titleSmall)
+            Box(
+                modifier = Modifier
+                    .padding(top = 8.dp)
+                    .size(220.dp)
+                    .background(Color(0xFFE8E8E8))
+                    .clickable {
+                        val entry = clipboard.getClip()
+                        val pastedImage = entry?.getImage()
+                        val pastedFiles = entry?.getFiles().orEmpty()
+                        val pastedText = entry?.getPlainText()
+                        when {
+                            pastedImage != null -> {
+                                image = pastedImage
+                                status = "图片 ${pastedImage.width}x${pastedImage.height}"
+                            }
+                            pastedFiles.isNotEmpty() -> {
+                                image = null
+                                status = "文件 ${pastedFiles.size} 个：${pastedFiles.first()}"
+                            }
+                            !pastedText.isNullOrEmpty() -> {
+                                image = null
+                                status = "文本：${pastedText.take(40)}"
+                            }
+                            else -> {
+                                image = null
+                                status = "剪贴板里没有图片/文件/文本"
+                            }
+                        }
+                        winlog(
+                            "paste: 读剪贴板 -> 图片=" +
+                                (pastedImage?.let { "${it.width}x${it.height}" } ?: "无") +
+                                " 文件=${pastedFiles.size} 文本=${pastedText?.length ?: 0}",
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                val shown = image
+                if (shown != null) {
+                    Image(
+                        bitmap = shown,
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(10.dp),
+                    )
+                }
+            }
+            Text(
+                status,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            Text(
+                "支持截图工具/浏览器复制的图片（CF_DIBV5/CF_DIB/CF_BITMAP）与资源管理器" +
+                    "复制的文件（CF_HDROP）。注意：**文本框里粘不进图片** —— 文本控件只会" +
+                    "去要纯文本，图片必须由应用自己接收（这里就是）。",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
 @Composable
 private fun HoverBox(probe: GalleryProbe) {
     val interactionSource = remember { MutableInteractionSource() }

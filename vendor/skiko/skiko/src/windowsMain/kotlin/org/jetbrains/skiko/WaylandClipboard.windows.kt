@@ -20,6 +20,9 @@ object WaylandClipboard {
     // 名字仍叫 WaylandClipboard 是历史原因（这套平台代码最初是给 Wayland 写的，
     // 见文件头）；Windows 侧就是直接转发到 Win32 剪贴板桥。
 
+    /** CF_HDROP：剪贴板上的文件路径列表（资源管理器里复制文件就是这个）。 */
+    fun getFiles(): List<String> = findWindow()?.clipboardGetFiles() ?: emptyList()
+
     /** CF_HTML 的**片段**（头部的偏移解析在 C 侧）。 */
     fun getHtml(): String? = findWindow()?.clipboardGetHtml()
 
