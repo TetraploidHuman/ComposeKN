@@ -855,12 +855,14 @@ CI：`.github/workflows/tests.yml`（ubuntu-latest，apt 装 wayland/EGL/xkbcomm
 
 ```bash
 # 在仓库根目录（会自己起 Xvfb —— NixOS 的 xvfb 包没有 xvfb-run）
-nix-shell -p wine64 xvfb xauth imagemagick xwininfo --run ./scripts/test-windows-native.sh
+nix-shell -p wine64 xvfb xauth imagemagick xwininfo xdotool --run ./scripts/test-windows-native.sh
 ```
 
-阶段：`logic` → `window` → `screenshot`（外部验证：抓窗口 PNG，检查标题栏 `#2D2D30`
-与颜色数 ≥ 200，即「不是白窗口」）。可选 `--skip-build`（用现有 exe）、
-`--no-screenshot`、`--only=<phase>`；产物与日志在 `/tmp/composekn-wintest/`。
+阶段：`logic` → `window`（含「真实 Win32 消息」子阶段，见 §17.31）→ `input`（外部
+`xdotool` 注入，验证 X11 -> wine -> wndproc 投递链路）→ `screenshot`（外部验证：抓窗口
+PNG，检查标题栏颜色与颜色数 ≥ 200，即「不是白窗口」）。可选 `--skip-build`（用现有
+exe）、`--no-screenshot`、`--no-input`、`--only=<phase>`
+（`logic|window|input|screenshot`）；产物与日志在 `/tmp/composekn-wintest/`。
 
 在真机（Windows 10/11）上等价操作：
 
@@ -2935,3 +2937,87 @@ SELFTEST FAIL : interaction/horizontal-wheel-scrolls-horizontal-list — …
 
 logic **116**（+4）/ window 37（合计 **153**）、`all` **150** —— 全绿；打包单文件 exe
 （无 `icudtl.dat`）干净目录复测。
+
+### 17.31 宿主层（C++ wndproc）纳入自动化 + 外部 X11 注入（v0.5.13）
+
+#### 问题：窗口阶段的自检从来没跑过 C++ 宿主层
+
+窗口阶段以前只调 `app.dispatchEvent(...)` —— 从 Kotlin 侧把 `WindowsEvent` 直接喂给
+Compose，**完全跳过 C++ 宿主层**。于是下面这些代码在自动化里从来没有被执行过：
+
+* wndproc 的参数解码（`GET_X_LPARAM` / `GET_WHEEL_DELTA_WPARAM` / 键码 lParam 位域）；
+* 坐标换算（`WM_*WHEEL` 的 lParam 是**屏幕**坐标，wndproc 里要 `ScreenToClient`）；
+* 消息过滤（§17.29 的笔悬停守卫）；
+* 以及 `GetMessage -> TranslateMessage -> DispatchMessage` 这条投递链本身。
+
+历史 bug 全部落在这个盲区里：§17.29（笔悬停变成一根按下的手指，`WM_POINTERUPDATE`
+分支）和 §17.30（Shift+滚轮没实现，`WM_MOUSEWHEEL` 分支）**都是用户真机手动操作时，
+那段代码才第一次被执行**。
+
+#### 做法 1：程序内 `PostMessage`（覆盖「消息到了之后宿主怎么处理」）
+
+新增 `composekn_win32_post_test_mouse` / `composekn_win32_post_test_key`，把**真实格式**的
+Win32 消息投到窗口自己的消息队列：
+
+```
+PostMessage -> 主循环 GetMessage -> TranslateMessage -> DispatchMessage
+            -> 真实 wndproc 分支 -> C 侧事件队列 -> Kotlin 派发 -> Compose
+```
+
+* 鼠标：`x/y` 是**客户区**坐标；滚轮消息由 C 侧按真机格式把坐标换成**屏幕坐标**进
+  lParam、delta 装进 wParam 高 16 位（`MAKEWPARAM(0, delta)`），wndproc 里再
+  `ScreenToClient` + `GET_WHEEL_DELTA_WPARAM` 换回来。这条链错一位，滚轮就会滚到
+  别的控件上。
+* 键盘：lParam 按真机格式拼（bit16-23 扫描码、bit30 = 之前是否已按下）。
+
+window 阶段 frame 79..106 新增 14 条断言（`window/winmsg-*`）：移动必须产生 hover 且
+**不能**凭空按下、按下/抬起要有 Press/Release、点击计数 +1、移开要 Exit、竖向滚轮要
+推动竖向列表、横向滚轮要推动横向列表、真实点击能把焦点还给输入框、真实按键要能输入字符。
+
+#### 做法 2：外部 `xdotool` 注入（覆盖「系统会不会送来这条消息」）
+
+`PostMessage` 绕过了系统输入栈，所以它证明不了「系统真的会把消息送到我们窗口」。测试
+脚本新增 `input` 阶段（`--only=input`，`--no-input` 可跳过）：`xdotool` 往 X 服务器打
+真实的鼠标/键盘事件，走 `X11 -> wine 的 X 驱动 -> Win32 消息队列 -> wndproc`。
+
+断言方式是**坐标差**而不是绝对坐标：两次相隔 `(dx,dy)` 的点击，在客户区坐标里也必须
+相隔 `(dx,dy)`。这样就不需要知道 wine 在无窗口管理器时自己画的装饰偏移（不可移植）。
+另外断言竖向滚轮/键盘消息到达，以及**鼠标输入不能串进触摸通道**（`touch:` 行数 = 0）。
+
+#### 踩到的三个坑（写下来，因为都会再遇到）
+
+1. **真实点击按钮会把焦点从输入框抢走**（Compose 语义：`clickable` 是 focusable 的）
+   → 后面一整串 IME/文本断言全红（`imeCaretRectForChar` 返回 null、文档馈送长度 0、
+   `WM_CHAR` 不插入），现象看起来像「宿主把事件丢了」。第一版就是这么红的。
+   修法不是去改那些断言，而是用真实点击把焦点还回输入框，并新增 `probe.mainFocused`
+   探针把「有没有焦点」变成可断言的 —— 下次再看到这组失败，一眼就能先排除焦点问题。
+2. **不要手工再投 `WM_CHAR`**：真实键盘的字符是消息循环里的 `TranslateMessage` 从
+   `WM_KEYDOWN` 翻译出来的（`composekn_win32_pump`）。手工再补一条 `WM_CHAR` 会插入
+   两个字符（第一版：`expected=CKz actual=CKzz`）。现在只投 KEYDOWN/KEYUP，字符由循环
+   自己翻译 —— 顺手把「循环里有没有接 TranslateMessage」也变成了断言（删掉就变 `CK`）。
+3. **横向滚轮在 `value=0` 时往反方向滚会被夹住**（值不变），断言写成 `!=` 其实只是在
+   测「夹取」。LTR 两个轴的 `reverseDirection` 都是 true，所以**负** delta 才是
+   「向前滚 = 值增大」；两边必须对称地选方向。
+
+#### 先红后绿（可复现的 fail-before）
+
+在宿主层临时插入一个「吞掉鼠标按键事件」的开关（`COMPOSEKN_TEST_SWALLOW_CLICKS=1`，
+只用于取证据，随后从源码里删掉），跑 `--only=window`：
+
+```
+SELFTEST ok   : window/click-reaches-compose        ← 旧断言（Kotlin 侧合成事件）什么都看不见
+SELFTEST FAIL : window/winmsg-lbuttondown-presses — pressed=false Press 增量=0
+SELFTEST FAIL : window/winmsg-click-lands — clickCount 1->1 Release 增量=0
+SELFTEST: RESULT FAIL (51 checks, 2 failures)       ← 其余 49 条全绿
+```
+
+宿主层丢事件时，**只有**走真实消息的那组会红 —— 这就是新自检的牙齿长在哪里的直接证据。
+
+#### 另外记下：测试脚本侧的「外部证据」
+
+除了 Kotlin 侧的断言，脚本还会直接检查 exe 同目录的 `composekn-startup.log` 里必须出现
+`mouse: 左键 DOWN pos=`、`wheel: 竖直 delta=-120`、`wheel: 横向 delta=-120`、
+`key: DOWN vk=0x5A` 等行（新增 `win32msg:` 组，7 条）。这些行**只有 C++ 分支会打印**，
+所以它们是「真的走过 wndproc」的、不依赖程序自述的外部证据。同时新增滚轮诊断日志
+`wheel: 竖直|横向 delta=<原始 delta> pos=x,y`（原始 delta，不折算成「格」——触控板/精确
+滚轮送来的是任意小数倍 `WHEEL_DELTA`，折算会掩盖问题）。

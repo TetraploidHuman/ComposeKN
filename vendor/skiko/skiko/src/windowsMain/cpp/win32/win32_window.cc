@@ -158,9 +158,10 @@ struct ComposeKNWin32Window {
     int touchHoverCount = 0;
     int touchHoverLogCount = 0;
     uint32_t touchHoverLastId = 0;
-    // 输入诊断（点不动/点击来源定位用）：鼠标按键与按键事件的日志条数上限。
+    // 输入诊断（点不动/点击来源定位用）：鼠标按键、按键、滚轮事件的日志条数上限。
     int mouseLogCount = 0;
     int keyLogCount = 0;
+    int wheelLogCount = 0;
     // 当前按下的指针集合 + 本次手势的摘要。
     //
     // 为什么需要「最大同时触点数」：真机反馈「双指缩放的时候列表也跟着滚」时必须能一眼
@@ -251,6 +252,27 @@ static uint32_t queryCurrentModifiers() {
 
 static void pushEvent(ComposeKNWin32Window* window, const ComposeKNWin32Event& event) {
     window->events.push_back(event);
+}
+
+/**
+ * 滚轮诊断日志。
+ *
+ * 为什么必须记原始 delta（而不是「滚了几格」）：触控板/精确滚轮送来的是**任意小数
+ * 倍**的 WHEEL_DELTA（WM_MOUSEWHEEL 的 delta 字段可以是 1..120 之间任意值，甚至
+ * 小于 120 的负数），而 Kotlin 侧以前做的是 `raw.a / 120` 整数除法 —— 小于一格的
+ * 增量会被截断成 0（触控板「一顿一顿、慢速完全不动」）。日志里有原始 delta 才能
+ * 区分「系统没送」「送来了但被截断」「送来了方向反了」。
+ */
+static void logWheelEvent(ComposeKNWin32Window* window, const ComposeKNWin32Event& e) {
+    if (window == nullptr || window->wheelLogCount >= 600) return;
+    ++window->wheelLogCount;
+    composeknLog(
+        "wheel: %s delta=%d pos=%ld,%ld",
+        e.b == 1 ? "横向" : "竖直",
+        e.a,
+        static_cast<long>(e.x),
+        static_cast<long>(e.y)
+    );
 }
 
 /**
@@ -1217,6 +1239,7 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             e.b = 0;  // 0 = 纵向（WM_MOUSEWHEEL）
             e.modifiers = queryCurrentModifiers();
             pushEvent(window, e);
+            logWheelEvent(window, e);
             break;
         }
         case WM_MOUSEHWHEEL: {
@@ -1232,6 +1255,7 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             e.b = 1;  // 1 = 横向（WM_MOUSEHWHEEL）
             e.modifiers = queryCurrentModifiers();
             pushEvent(window, e);
+            logWheelEvent(window, e);
             break;
         }
         case WM_SETCURSOR: {
@@ -2491,4 +2515,85 @@ extern "C" void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window,
     EmptyClipboard();
     SetClipboardData(CF_UNICODETEXT, global); // clipboard owns `global` on success
     CloseClipboard();
+}
+
+// ---------------------------------------------------------------------------
+// 自检用：真实 Win32 消息注入
+//
+// 为什么需要它（HANDOVER §17.31）：自检里的窗口阶段以前只调 `app.dispatchEvent`
+// **从 Kotlin 侧**喂 WindowsEvent，于是 C++ 宿主这一层（wndproc 的参数解码、
+// 坐标换算、消息过滤、GetMessage/DispatchMessage 投递）在自动化里**从来没有被跑过**
+// —— 只有当用户真机上手动操作时才第一次执行。历史 bug 就是这么漏出去的：
+// 笔悬停被当成一根按下的手指（WM_POINTERUPDATE 分支）、Shift+滚轮没实现
+// （WM_MOUSEWHEEL 分支）都属于「宿主层问题，真机才发现」。
+//
+// 下面两条把**真实的 Win32 消息** PostMessage 到窗口自己的消息队列：主循环的
+// GetMessage -> DispatchMessage -> 真实 wndproc 分支会处理它，事件再从 C 侧队列
+// 弹回 Kotlin。所以断言的是宿主本身，而不是别处合成的等价物。
+//
+// 注意：PostMessage 不经过系统输入栈，所以它测的是「消息到了之后宿主怎么处理」，
+// 不是「系统会不会送来这条消息」。后者由测试脚本里的外部注入阶段（xdotool 打真实
+// X11 输入 -> wine -> wndproc）覆盖。
+// ---------------------------------------------------------------------------
+
+extern "C" bool composekn_win32_post_test_mouse(
+    ComposeKNWin32Window* window,
+    uint32_t message,
+    int32_t x,
+    int32_t y,
+    int32_t wheel_delta
+) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    WPARAM wparam = 0;
+    LPARAM lparam = 0;
+    switch (message) {
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL: {
+            // 真实消息里 WM_*WHEEL 的 lParam 是**屏幕**坐标（我们 wndproc 里再
+            // ScreenToClient 换回来），delta 装在 wParam 的高 16 位
+            // （GET_WHEEL_DELTA_WPARAM 取的就是它，且当作**有符号** short）。
+            POINT pt = {x, y};
+            ClientToScreen(window->hwnd, &pt);
+            lparam = MAKELPARAM(pt.x, pt.y);
+            wparam = MAKEWPARAM(0, static_cast<WORD>(wheel_delta));
+            break;
+        }
+        default:
+            // 移动/按键：lParam 低 16 位 = x，高 16 位 = y。
+            lparam = MAKELPARAM(x, y);
+            break;
+    }
+    return PostMessageW(window->hwnd, message, wparam, lparam) != FALSE;
+}
+
+extern "C" bool composekn_win32_post_test_key(
+    ComposeKNWin32Window* window,
+    uint32_t message,
+    int32_t vk_or_char,
+    int32_t scan_code,
+    int32_t is_repeat
+) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    const WPARAM wparam = static_cast<WPARAM>(static_cast<uint32_t>(vk_or_char));
+    LPARAM lparam = 1;  // bit0-15 = 重复次数
+    switch (message) {
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+        case WM_KEYUP:
+        case WM_SYSKEYUP: {
+            // bit16-23 = 扫描码；bit30 = 「这条消息之前那个键是否已经按下」
+            // （1 = 系统的自动重复）；bit31 = 抬起。
+            lparam |= (static_cast<LPARAM>(scan_code & 0xFF) << 16);
+            if (is_repeat != 0) lparam |= (1LL << 30);
+            if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+                // 注意用 1LL：mingw 上 long 是 32 位，`1L << 31` 是未定义行为。
+                lparam |= (1LL << 30) | (1LL << 31);
+            }
+            break;
+        }
+        default:
+            // WM_CHAR / WM_UNICHAR：wParam = 字符码点，lParam 只有重复次数有意义。
+            break;
+    }
+    return PostMessageW(window->hwnd, message, wparam, lparam) != FALSE;
 }

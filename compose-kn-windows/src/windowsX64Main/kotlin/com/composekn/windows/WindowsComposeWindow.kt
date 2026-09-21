@@ -430,6 +430,28 @@ class WindowsComposeWindow(
         win32Window?.imeTestConfirmReconvert(text, targetOffset, targetLen) ?: false
 
     /**
+     * 自检用：把一条**真实的 Win32 鼠标消息** PostMessage 到窗口自己的消息队列。
+     *
+     * 与 [WindowsComposeApplication.dispatchEvent] 的区别是根本性的：后者把
+     * `WindowsEvent` 直接喂给 Compose，**跳过整个 C++ 宿主层**；这条会走
+     * 主循环 `GetMessage -> DispatchMessage -> 真实 wndproc 分支 -> C 侧事件队列`，
+     * 于是 wndproc 里的参数解码、坐标换算、消息过滤都在自动化覆盖之内
+     * （HANDOVER §17.31）。
+     *
+     * [x]/[y] 是客户区坐标（物理像素，与真机消息一致）。
+     */
+    fun postTestMouseMessage(message: Int, x: Int, y: Int, wheelDelta: Int = 0): Boolean =
+        win32Window?.postTestMouseMessage(message, x, y, wheelDelta) ?: false
+
+    /** 自检用：把一条**真实的 Win32 键盘/字符消息** PostMessage 到窗口的消息队列。 */
+    fun postTestKeyMessage(
+        message: Int,
+        vkOrChar: Int,
+        scanCode: Int = 0,
+        isRepeat: Boolean = false,
+    ): Boolean = win32Window?.postTestKeyMessage(message, vkOrChar, scanCode, isRepeat) ?: false
+
+    /**
      * Begin window move (for title bar drag).
      */
     fun beginMove() {

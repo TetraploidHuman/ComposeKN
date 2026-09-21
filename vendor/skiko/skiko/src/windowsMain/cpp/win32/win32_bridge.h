@@ -246,6 +246,50 @@ bool composekn_win32_ime_composing(ComposeKNWin32Window* window);
 /** 自检用：注入一条「IME 提交」事件（Wine 里没有真 IME，驱动不了这条路）。 */
 void composekn_win32_ime_test_commit(ComposeKNWin32Window* window, const char* utf8);
 
+// ---------------------------------------------------------------------------
+// 自检用：真实 Win32 消息注入（PostMessage -> 主循环 -> 真实 wndproc 分支）
+//
+// 存在的理由：窗口阶段的自检以前只从 Kotlin 侧合成 WindowsEvent，C++ 宿主这一层
+// （wndproc 的参数解码 / 坐标换算 / 消息过滤）在自动化里从未被执行 —— 历史 bug
+// （笔悬停变手指、Shift+滚轮没实现）全是「宿主层问题、真机才发现」。
+// ---------------------------------------------------------------------------
+
+/**
+ * 投递一条**真实的鼠标消息**到窗口自己的消息队列。
+ *
+ *   message                    x / y           wheel_delta
+ *   WM_MOUSEMOVE               客户区坐标      忽略
+ *   WM_LBUTTONDOWN/UP 等按键消息  客户区坐标      忽略
+ *   WM_MOUSEWHEEL / WM_MOUSEHWHEEL  客户区坐标   滚轮增量（缩进 wParam 高 16 位；
+ *                                                负值 = 向用户方向滚）
+ *
+ * 滚轮消息的坐标会被换成**屏幕坐标**再进 lParam —— 与真机消息一致（宿主 wndproc
+ * 里用 ScreenToClient 换回客户区）。返回 false = 窗口还没建好 / PostMessage 失败。
+ */
+bool composekn_win32_post_test_mouse(
+    ComposeKNWin32Window* window,
+    uint32_t message,
+    int32_t x,
+    int32_t y,
+    int32_t wheel_delta
+);
+
+/**
+ * 投递一条**真实的键盘/字符消息**到窗口自己的消息队列。
+ *
+ *   message                                    vk_or_char        scan_code / is_repeat
+ *   WM_KEYDOWN/UP, WM_SYSKEYDOWN/UP            虚拟键码           用来拼 lParam
+ *                                              （bit16-23 扫描码、bit30 之前是否已按下）
+ *   WM_CHAR / WM_UNICHAR                       字符码点           忽略
+ */
+bool composekn_win32_post_test_key(
+    ComposeKNWin32Window* window,
+    uint32_t message,
+    int32_t vk_or_char,
+    int32_t scan_code,
+    int32_t is_repeat
+);
+
 /** ShowWindow wrapper: cmd 3=SW_MAXIMIZE 6=SW_MINIMIZE 9=SW_RESTORE 5=SW_SHOW */
 void composekn_win32_show(ComposeKNWin32Window* window, int cmd);
 bool composekn_win32_is_maximized(ComposeKNWin32Window* window);

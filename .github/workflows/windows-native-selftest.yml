@@ -153,8 +153,10 @@ jobs:
           # 里是**单独的包**，而 `--no-install-recommends` 不会把它带上 ——
           # 于是 Wine 里一个字体都没有，Skia 的 Windows 字体管理器直接
           # `IllegalStateException: Could not load font`（CI 上连栽两次就是它）。
+          # `xdotool` 是 input 阶段用的：往 X 服务器打真实鼠标/键盘事件，
+          # 验证 X11 -> wine -> wndproc 这条投递链路（PostMessage 证明不了它）。
           sudo apt-get install -y --no-install-recommends \
-            xvfb xauth x11-utils imagemagick zstd fontconfig \
+            xvfb xauth x11-utils xdotool imagemagick zstd fontconfig \
             fonts-wine fonts-liberation fonts-dejavu-core
           fc-cache -f >/dev/null 2>&1 || true
           echo "--- 字体自检 ---"
@@ -185,7 +187,7 @@ jobs:
           ls "$WINEPREFIX/drive_c/windows/Fonts" | head -8
           ls "$WINEPREFIX" | head -5
 
-      - name: Run native selftest (logic + window + screenshot)
+      - name: Run native selftest (logic + window + input + screenshot)
         id: selftest
         env:
           SKIA_MINGW_PREBUILT: ${{ steps.prebuilt.outputs.dir }}

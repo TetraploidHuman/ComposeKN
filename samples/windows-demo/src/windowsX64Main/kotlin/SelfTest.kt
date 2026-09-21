@@ -102,6 +102,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.jetbrains.skiko.Win32Message
 
 // =====================================================================
 // 自动化自检（`COMPOSEKN_SELFTEST=1` / `--selftest`）
@@ -189,6 +190,21 @@ private const val HSCROLL_Y_DP = 256
 private const val HSCROLL_W_DP = 120
 private const val HSCROLL_H_DP = 32
 
+/**
+ * 「真实 Win32 消息」子阶段（§17.31）用的命中点，单位是**窗口**逻辑坐标（dp），
+ * 已经含 CSD 标题栏偏移 —— 和窗口阶段那些合成事件的坐标同一套约定。
+ *
+ *   * 按钮：内容 (40..200, 96..144) + 32dp 标题栏 -> 中心 (120, 152)
+ *   * 输入框：内容 (16, 16) 起、占满宽度 -> 用 (400, 76)
+ */
+private const val BTN_X_DP = 120f
+private const val BTN_Y_DP = 152f
+private const val TEXT_X_DP = 400f
+private const val TEXT_Y_DP = 76f
+
+/** VK_Z（真实 WM_KEYDOWN/WM_KEYUP 用；字符本身走 WM_CHAR）。 */
+private const val VK_Z = 0x5A
+
 class InteractionProbe {
     var clicked by mutableStateOf(false)
     var clickCount by mutableStateOf(0)
@@ -218,6 +234,17 @@ class InteractionProbe {
 
     /** 主输入框的内容 + 选区（选区用来断言「点击定位光标」「Ctrl+A 全选」）。 */
     var value by mutableStateOf(TextFieldValue(""))
+
+    /**
+     * 主输入框的聚焦状态（`onFocusChanged` 回填）。
+     *
+     * 为什么要单独探它：文本输入（`WM_CHAR`）、IME 组字、`imeCaretRectForChar`
+     * 全都要求「有焦点 + 文本会话活跃」。真实鼠标消息子阶段会点按钮（那一步会把
+     * 焦点从输入框抢走，这是 Compose 的正常语义），所以后面必须能断言
+     * 「用真实点击把焦点还回来了」—— 否则后面一串 IME 断言失败时，根本分不清是
+     * 宿主丢了事件还是输入框本来就没焦点。
+     */
+    var mainFocused by mutableStateOf(false)
 
     /** 左/右对照输入框的焦点状态（由 onFocusChanged 回填）。 */
     var leftFocused by mutableStateOf(false)
@@ -335,7 +362,8 @@ private fun DeterministicTestScreen(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(16.dp)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .onFocusChanged { probe.mainFocused = it.isFocused },
                 singleLine = true,
                 label = { Text("type here") },
             )
@@ -1869,6 +1897,20 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
     var clipboardValue: String? = null
     var clickedAt = Pair(0, 0)
 
+    // 「真实 Win32 消息」子阶段（§17.31）的基线快照。
+    //
+    // 为什么记基线而不是断言绝对值：前面已经有一大堆**合成**事件（frame 10 的点击、
+    // frame 16 的滚轮…）改过同一批探针，绝对值断言会和它们纠缠；这一段要证明的是
+    // 「真实消息确实走通了」，所以断言的是**增量**。
+    var msgClicks0 = 0
+    var msgPresses0 = 0
+    var msgReleases0 = 0
+    var msgHoverEnters0 = 0
+    var msgHoverExits0 = 0
+    var msgScroll0 = 0
+    var msgHScroll0 = 0
+    var msgText0 = ""
+
     // 交互阶段由 frameHook **显式**请求下一帧。
     //
     // 窗口循环现在是「按需渲染 + 帧节流」：没有渲染请求时它真的睡着（CPU ≈ 0），
@@ -2043,6 +2085,139 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
             )
             report.check("window/frame-count", app.window.frameCount >= 78, "frames=${app.window.frameCount}")
         }
+
+        // =================================================================
+        // 真实 Win32 消息路径（HANDOVER §17.31）
+        //
+        // 上面所有断言走的都是 `app.dispatchEvent(...)`：把 WindowsEvent 直接喂给
+        // Compose，**完全跳过 C++ 宿主层**。于是 wndproc 里的参数解码、坐标换算、
+        // 消息过滤在自动化里从来没有被执行过 —— 历史上的宿主层 bug（笔悬停变成
+        // 一根按下的手指、Shift+滚轮没实现）全都是「只有真机手动操作才第一次跑到」。
+        //
+        // 这一段用 PostMessage 把**真实的 Win32 消息**投到窗口自己的消息队列：
+        //   主循环 GetMessage -> DispatchMessage -> 真实 wndproc 分支 -> C 侧事件
+        //   队列 -> Kotlin 派发 -> Compose
+        // 断言的是宿主本身。坐标按**当前**窗口尺寸算（这一段在 frame 74 最大化
+        // 之后跑，窗口已经不是 900x600）。
+        //
+        // 注意边界：PostMessage 不经过系统输入栈，所以它证明的是「消息到了之后宿主
+        // 怎么处理」，不证明「系统会不会送来这条消息」。后者由测试脚本里的外部注入
+        // 阶段覆盖（xdotool 打真实 X11 输入 -> wine -> wndproc）。
+        // =================================================================
+        if (frame == 79) {
+            msgClicks0 = probe.clickCount
+            msgPresses0 = probe.probeButtonPresses
+            msgReleases0 = probe.probeButtonReleases
+            msgHoverEnters0 = probe.probeButtonHoverEnters
+            msgHoverExits0 = probe.probeButtonHoverExits
+            msgScroll0 = scrollState.value
+            msgHScroll0 = probe.horizontalScrollValue
+            msgText0 = probe.text
+            report.section("window 真实 Win32 消息（PostMessage -> wndproc -> Compose）")
+            val ok = postRealMouse(app, Win32Message.MOUSEMOVE, BTN_X_DP, BTN_Y_DP)
+            report.check("window/winmsg-post-mousemove", ok, "PostMessage(WM_MOUSEMOVE) -> $ok")
+        }
+        if (frame == 81) {
+            // 真实 WM_MOUSEMOVE -> 真实 wndproc -> Compose hover。
+            // 同时断言**没有**凭空按下：单纯的移动绝不能产生 PressInteraction
+            // （v0.5.11 那个「笔悬停变成一根按下的手指」就是这条的反面）。
+            report.check(
+                "window/winmsg-mousemove-hovers",
+                probe.probeButtonHovered && probe.probeButtonHoverEnters - msgHoverEnters0 >= 1,
+                "hovered=${probe.probeButtonHovered} " +
+                    "Enter 增量=${probe.probeButtonHoverEnters - msgHoverEnters0}",
+            )
+            report.check(
+                "window/winmsg-mousemove-does-not-press",
+                probe.probeButtonPresses == msgPresses0 && !probe.probeButtonPressed,
+                "Press 增量=${probe.probeButtonPresses - msgPresses0} pressed=${probe.probeButtonPressed}",
+            )
+            val ok = postRealMouse(app, Win32Message.LBUTTONDOWN, BTN_X_DP, BTN_Y_DP)
+            report.check("window/winmsg-post-lbuttondown", ok, "PostMessage(WM_LBUTTONDOWN) -> $ok")
+        }
+        if (frame == 83) {
+            report.check(
+                "window/winmsg-lbuttondown-presses",
+                probe.probeButtonPressed && probe.probeButtonPresses == msgPresses0 + 1,
+                "pressed=${probe.probeButtonPressed} Press 增量=${probe.probeButtonPresses - msgPresses0}",
+            )
+            postRealMouse(app, Win32Message.LBUTTONUP, BTN_X_DP, BTN_Y_DP)
+        }
+        if (frame == 85) {
+            report.check(
+                "window/winmsg-click-lands",
+                probe.clickCount == msgClicks0 + 1 &&
+                    probe.probeButtonReleases == msgReleases0 + 1 &&
+                    !probe.probeButtonPressed,
+                "clickCount ${msgClicks0}->${probe.clickCount} " +
+                    "Release 增量=${probe.probeButtonReleases - msgReleases0}",
+            )
+            // 真实 WM_MOUSEMOVE 离开按钮 -> hover 必须退出（正向 + 反向都走真路径）
+            postRealMouse(app, Win32Message.MOUSEMOVE, TEXT_X_DP, TEXT_Y_DP)
+        }
+        if (frame == 87) {
+            report.check(
+                "window/winmsg-mousemove-exits-hover",
+                !probe.probeButtonHovered &&
+                    probe.probeButtonHoverExits - msgHoverExits0 >= 1,
+                "hovered=${probe.probeButtonHovered} Exit 增量=${probe.probeButtonHoverExits - msgHoverExits0}",
+            )
+            // 真实 WM_MOUSEWHEEL：客户端坐标是**窗口**逻辑坐标，C 侧会把它换算成
+            // 屏幕坐标进 lParam（与真机消息一致），wndproc 里再 ScreenToClient 换回来
+            // —— 这条链路错一位，滚轮就会滚到别的控件上。
+            // 纵向滚动区贴在窗口底部（fillMaxWidth + height(120) + align(BottomStart)），
+            // 所以 y 按**当前**窗口高度算；-120 = 一格、向用户方向（滚轮向下）。
+            val ok = postRealMouse(
+                app, Win32Message.MOUSEWHEEL, 450f,
+                app.window.logicalHeight - CHROME_DP - 60f,
+                wheelDelta = -Win32Message.WHEEL_DELTA,
+            )
+            report.check("window/winmsg-post-mousewheel", ok, "PostMessage(WM_MOUSEWHEEL) -> $ok")
+        }
+        if (frame == 89) {
+            report.check(
+                "window/winmsg-wheel-scrolls",
+                scrollState.value > msgScroll0,
+                "滚动值 ${msgScroll0} -> ${scrollState.value}（-120 = 滚轮向下，值应当增大）",
+            )
+            // 真实 WM_MOUSEHWHEEL（横向滚轮 / 触控板横滑）。
+            // 方向说明：和竖向同一套约定 —— Compose 的 scrollable 对 LTR 两个轴都是
+            // `reverseDirection = true`，所以 **负** delta 才是「向前滚 = 值增大」。
+            // 0 处往反方向滚会被夹住（值不变），所以这里必须用会真正推动它的方向，
+            // 否则断言写成 `!=` 也只是在测「夹取」。上游 AWT 没有横向分量可对照
+            // （HANDOVER §17.30），方向本身没有上游依据 —— 这里钉的是「事件确实
+            // 推到了横向滚动条」，纯竖直 delta 是推不动它的（阈值 PI/4）。
+            val ok = postRealMouse(
+                app, Win32Message.MOUSEHWHEEL, HSCROLL_X_DP + HSCROLL_W_DP / 2f,
+                HSCROLL_Y_DP + HSCROLL_H_DP / 2f + CHROME_DP,
+                wheelDelta = -Win32Message.WHEEL_DELTA,
+            )
+            report.check("window/winmsg-post-mousehwheel", ok, "PostMessage(WM_MOUSEHWHEEL) -> $ok")
+        }
+        if (frame == 91) {
+            report.check(
+                "window/winmsg-horizontal-wheel-scrolls",
+                probe.horizontalScrollValue > msgHScroll0,
+                "横向滚动值 ${msgHScroll0} -> ${probe.horizontalScrollValue}",
+            )
+            // 用**真实点击**把焦点还给输入框。
+            //
+            // 上面点按钮那一步会把焦点从输入框抢走（Compose 的正常语义：clickable
+            // 是 focusable 的）。后面 WM_CHAR / IME 组字全都要求输入框有焦点，所以
+            // 必须还回来 —— 而且是走**真实消息**还，顺手把「真实点击能聚焦文本框」
+            // 这条也覆盖了。焦点状态由 `probe.mainFocused` 断言（frame 93）。
+            postRealMouse(app, Win32Message.MOUSEMOVE, TEXT_X_DP, TEXT_Y_DP)
+            postRealMouse(app, Win32Message.LBUTTONDOWN, TEXT_X_DP, TEXT_Y_DP)
+            postRealMouse(app, Win32Message.LBUTTONUP, TEXT_X_DP, TEXT_Y_DP)
+        }
+        if (frame == 93) {
+            report.check(
+                "window/winmsg-real-click-refocuses-textfield",
+                probe.mainFocused,
+                "真实点击输入框后 mainFocused=${probe.mainFocused}",
+            )
+        }
+
         // ---- IME 候选窗锚点：走**真实**的 WM_IME_REQUEST(IMR_QUERYCHARPOSITION) 路径 ----
         //
         // 背景（真机两轮反馈）：微软拼音在组字期间显然是用「光标那条查询」的结果摆候选窗，
@@ -2052,12 +2227,12 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
         // 这里断言的是 C 侧真答案（组字起点 = 组字中任何 dwCharPos 的答案），
         // 而 imeCaretRectForChar 那条路（如实映射）继续由逻辑阶段断言 —— 两条路
         // 是分开的，不能互相替代。
-        if (frame == 80) {
+        if (frame == 94) {
             app.window.imeTestSendCompositionMessage(start = true)   // 真 WM_IME_STARTCOMPOSITION
             app.dispatchEvent(WindowsEvent.ImeStartEvent)
             app.dispatchEvent(WindowsEvent.ImeCompositionEvent("ni hao"))
         }
-        if (frame == 82) {
+        if (frame == 96) {
             val composed = "ni hao"
             val anchor = app.imeCaretRectForChar(0)
             val caret = app.imeCaretRectForChar(composed.length)
@@ -2073,7 +2248,7 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                     "组字起点=$anchor 真实光标=$caret composing=${app.window.imeComposing}",
             )
         }
-        if (frame == 83) {
+        if (frame == 97) {
             // ---- IMM32 文档馈送 / 组字字体（输入法通过这些请求拿"文档 + 组字范围"）----
             // 此时文本框内容是 "CKni hao"，其中 "ni hao" 是组字区（偏移 2..8）。
             // 注意：这些请求真机上是输入法**同步**问的（Wine 里没有输入法，只能我们自己发），
@@ -2126,7 +2301,7 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                 "IMR_COMPOSITIONFONT -> handled=${font?.get(0)} lfHeight=${font?.get(9)}（期望 1 / 负数）",
             )
         }
-        if (frame == 84) {
+        if (frame == 98) {
             // 组字结束：立刻恢复如实回答（= 真实光标），不能还钉在组字起点。
             // 先结掉 Compose 侧的组字（composition 变 null），C 侧的 composing 由
             // 真 WM_IME_ENDCOMPOSITION 同步关掉，然后问一个**非 0** 的 dwCharPos：
@@ -2144,7 +2319,7 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
             // 把刚插进去的 "ni hao" 删掉，保持后面的断言还是看到 "CK"
             repeat(6) { keyPress(app, 0x08) }
         }
-        if (frame == 86) {
+        if (frame == 100) {
             // ---- 「重新转换」选区握手（走**真实** WM_IME_REQUEST(IMR_CONFIRMRECONVERTSTRING)）----
             // 此时文本框是 "CK"、光标在末尾。输入法把 "CK" + 目标 [0,2) 发回来：
             // 我们能对上 -> 接受，并先把 [0,2) 变成选区（随后那段组字会替换它）。
@@ -2163,16 +2338,32 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
             // 注意：上面的选选区事件是**排队**的（C 侧 FIFO），要到下一轮消息循环才落地 ——
             // 这正是真实 IME 的顺序（确认 -> 选区 -> 组字），所以组字放在 frame==87 发。
         }
-        if (frame == 87) {
+        if (frame == 101) {
             app.dispatchEvent(WindowsEvent.ImeStartEvent)
             app.dispatchEvent(WindowsEvent.ImeCompositionEvent("CK"))
         }
-        if (frame == 88) {
+        if (frame == 102) {
             report.checkEquals("window/ime-reconvert-composition-no-duplicate", "CK", probe.text)
             app.dispatchEvent(WindowsEvent.ImeCommitEvent("CK"))
             app.dispatchEvent(WindowsEvent.ImeEndEvent)
             report.checkEquals("window/ime-reconvert-commit-no-duplicate", "CK", probe.text)
             report.checkEquals("window/ime-charpos-test-restores-text", "CK", probe.text)
+            // 真实键盘消息（PostMessage）：只投 WM_KEYDOWN / WM_KEYUP，**不**手工投
+            // WM_CHAR —— 真实键盘上那个字符是消息循环里的 `TranslateMessage` 从
+            // KEYDOWN 翻译出来的（见 `composekn_win32_pump`），所以
+            //   KEYDOWN -> TranslateMessage -> WM_CHAR -> wndproc 的字符分支
+            // 这条链才是真实路径。手工再投一条 WM_CHAR 会插入两个字符
+            // （第一版就是这么红的：expected=CKz actual=CKzz），顺便也就把
+            // 「循环里有没有接 TranslateMessage」这件事变成了断言的一部分：
+            // 谁把它删掉，这里就会变成 actual=CK。
+            val zDown = postRealKey(app, Win32Message.KEYDOWN, VK_Z, scanCode = 0x2C)
+            report.check("window/winmsg-post-keydown", zDown, "PostMessage(WM_KEYDOWN VK_Z) -> $zDown")
+        }
+        if (frame == 104) {
+            postRealKey(app, Win32Message.KEYUP, VK_Z, scanCode = 0x2C)
+        }
+        if (frame == 106) {
+            report.checkEquals("window/winmsg-key-char-inserts-text", "${msgText0}z", probe.text)
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。
             driveFrames = false
@@ -2402,6 +2593,40 @@ private fun keyPress(app: WindowsComposeApplication, vk: Int) {
     app.dispatchEvent(WindowsEvent.KeyEvent(virtualKeyCode = vk, scanCode = 0, isKeyDown = false))
     app.pumpDispatchers()
 }
+
+/**
+ * 投递一条**真实**的 Win32 鼠标消息（`PostMessage` -> 主循环 -> 真实 wndproc 分支）。
+ *
+ * 与 [click] / [wheel] 这些合成工具的根本区别：合成工具把 `WindowsEvent` 直接喂给
+ * Compose，**跳过了 C++ 宿主层**（wndproc 的参数解码 / 坐标换算 / 消息过滤）。
+ * 这一条会走完整链路，所以能覆盖宿主本身（HANDOVER §17.31）。
+ *
+ * 坐标是**窗口**逻辑坐标（dp，含 CSD 标题栏偏移），这里按当前 dpiScale 换成物理像素。
+ */
+private fun postRealMouse(
+    app: WindowsComposeApplication,
+    message: Int,
+    xDp: Float,
+    yDp: Float,
+    wheelDelta: Int = 0,
+): Boolean {
+    val scale = app.window.dpiScale
+    return app.window.postTestMouseMessage(
+        message = message,
+        x = (xDp * scale).toInt(),
+        y = (yDp * scale).toInt(),
+        wheelDelta = wheelDelta,
+    )
+}
+
+/** 投递一条**真实**的 Win32 键盘/字符消息（同 [postRealMouse] 的说明）。 */
+private fun postRealKey(
+    app: WindowsComposeApplication,
+    message: Int,
+    vkOrChar: Int,
+    scanCode: Int = 0,
+): Boolean =
+    app.window.postTestKeyMessage(message = message, vkOrChar = vkOrChar, scanCode = scanCode)
 
 /**
  * 注入一次**双指**手势：两根手指各自 down -> N 步 move -> up。

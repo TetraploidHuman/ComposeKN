@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
 # ComposeKN Windows 原生 exe 的自动化测试驱动。
 #
-# 三层验证（对应 exe 内置的 `--selftest` 三阶段）：
+# 四层验证（对应 exe 内置的 `--selftest` + 两个外部阶段）：
 #   1. logic  —— 纯逻辑断言（键位映射/消息解码/输入状态），不需要窗口
 #   2. render —— 离屏光栅化真实 Compose 场景 + 像素断言（布局/density/CSD 标题栏/
 #                点击与键盘输入、滚轮滚动），同样不需要窗口
-#   3. window —— 真实 Win32 窗口：剪贴板桥接、逐帧渲染循环、合成点击、干净退出
+#   3. window —— 真实 Win32 窗口：剪贴板桥接、逐帧渲染循环、合成点击、干净退出，
+#                外加「真实 Win32 消息」子阶段（PostMessage -> 真实 wndproc 分支）
+#   3.5 input —— 外部注入：xdotool 打真实 X11 鼠标/键盘 -> wine -> wndproc
+#                （证明「系统真的会把这些消息送到窗口」，window 阶段的 PostMessage
+#                 证明不了这一点）
 #   4. 截图   —— 独立于程序自述的外部验证：抓窗口 PNG，检查标题栏颜色/色彩数量
 #
 # 用法（在仓库根目录）：
-#   nix-shell -p wine64 xvfb xauth imagemagick xwininfo \
+#   nix-shell -p wine64 xvfb xauth imagemagick xwininfo xdotool \
 #       --run ./scripts/test-windows-native.sh
 #
 #   --skip-build    不重新链接，直接用现有的 exe
 #   --exe=PATH      用指定的 exe（隐含 --skip-build；CI 从构建产物里取）
 #   --no-screenshot 跳过截图阶段（没有 X 时）
-#   --only=<phase>  只跑某个阶段: logic|window|screenshot
+#   --no-input      跳过外部注入阶段（没有 xdotool 时）
+#   --only=<phase>  只跑某个阶段: logic|window|input|screenshot
 #
 # 环境变量：
 #   SKIA_MINGW_PREBUILT=<dir>  预编译 mingw-Skia 包（跳过 Skia 构建；icudtl.dat 在链接期被
 #                              直接编进 exe，测试运行时**不需要**同目录数据文件）
 #   SKIA_MINGW_WORK=<dir>      从源码构建时的 Skia 工作目录
+#   COMPOSEKN_WINTEST_XDOTOOL_DX/DY  外部注入阶段两次点击的像素间隔（默认 40x25）
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,14 +46,16 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 SKIP_BUILD=0
 DO_SCREENSHOT=1
 ONLY=""
+DO_INPUT=1
 
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         --no-screenshot) DO_SCREENSHOT=0 ;;
+        --no-input) DO_INPUT=0 ;;
         --only=*) ONLY="${arg#--only=}" ;;
         --exe=*) EXE_OVERRIDE="${arg#--exe=}"; SKIP_BUILD=1 ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "未知参数: $arg" >&2; exit 2 ;;
     esac
 done
@@ -197,6 +205,169 @@ fi
 # ----------------------------------------------------------- 3. 真实窗口
 if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
     run_phase window window 1
+fi
+
+# -------------------------------------- 3.2 宿主层（C++ wndproc）真的被跑过
+#
+# 窗口阶段新增了一组「真实 Win32 消息」断言：自检用 PostMessage 把真的
+# WM_MOUSEMOVE / WM_LBUTTONDOWN/UP / WM_MOUSEWHEEL / WM_MOUSEHWHEEL /
+# WM_KEYDOWN / WM_CHAR / WM_KEYUP 投到窗口自己的消息队列，走
+# 主循环 GetMessage -> DispatchMessage -> 真实 wndproc 分支。
+#
+# 这里从**外部**再确认一次：C 侧那几条诊断日志必须真的出现。为什么不能只信
+# Kotlin 侧的 PASS —— 那组断言最终看的是 Compose 里的探针，万一哪天有人把宿主
+# 改回「从 Kotlin 侧合成事件」也能全绿；日志行是只有真的走过 wndproc 才会有的
+# 证据（`mouse:`/`key:`/`wheel:` 三条都只在 C++ 分支里打印）。
+if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
+    STARTUP_LOG="$RUN_DIR/composekn-startup.log"
+    check_log_line() {   # $1 = 名字, $2 = 必须出现的字面量
+        if grep -qF -- "$2" "$STARTUP_LOG" 2>/dev/null; then
+            pass "win32msg: 宿主日志出现『$1』"
+        else
+            fail "win32msg: 宿主日志里没有『$1』（grep -F '$2' $STARTUP_LOG）"
+        fi
+    }
+    check_log_line "真实鼠标按下" "mouse: 左键 DOWN pos="
+    check_log_line "真实鼠标抬起" "mouse: 左键 UP pos="
+    check_log_line "真实竖向滚轮" "wheel: 竖直 delta=-120"
+    check_log_line "真实横向滚轮" "wheel: 横向 delta=-120"
+    check_log_line "真实按键按下" "key: DOWN vk=0x5A"
+    check_log_line "真实按键抬起" "key: UP vk=0x5A"
+    # 反证：真实鼠标消息**不该**顺带产生触摸事件（v0.5.11 的「笔悬停变手指」
+    # 就是触摸通道串了）。window 阶段全程没有真触摸，所以一条都不该有。
+    TOUCH_LINES="$(grep -c '^.*touch: ' "$STARTUP_LOG" 2>/dev/null || true)"
+    POINTER_HOVER="$(grep -c '^.*pointer: 悬停' "$STARTUP_LOG" 2>/dev/null || true)"
+    if [ "${TOUCH_LINES:-0}" = "0" ] && [ "${POINTER_HOVER:-0}" = "0" ]; then
+        pass "win32msg: 真实鼠标消息没有污染触摸通道（touch=0 悬停丢弃=0）"
+    else
+        fail "win32msg: 鼠标消息串进了触摸通道（touch=$TOUCH_LINES 悬停丢弃=$POINTER_HOVER）"
+        grep -n 'touch: \|pointer: 悬停' "$STARTUP_LOG" | head -5 || true
+    fi
+fi
+
+# ------------------------------------------------- 3.5 外部注入（xdotool）
+#
+# 与 3.2 的区别（两者互补，缺一不可）：
+#   * 3.2 是程序 PostMessage 给自己 —— 证明「消息到了之后宿主怎么处理」，
+#     但 PostMessage 绕过了系统输入栈。
+#   * 这一段用 xdotool 往 X 服务器打**真实**的鼠标/键盘事件，走
+#     X11 -> wine 的 X 驱动 -> Win32 消息队列 -> wndproc 整条链路，
+#     证明「系统真的会把这些消息送到我们的窗口」。
+#
+# 断言方式是**坐标差**而不是绝对坐标：不管窗口摆在哪、有没有装饰/缩放，
+# 两次相隔 (dx,dy) 的点击在客户区坐标里也必须相隔 (dx,dy)。这样就不需要知道
+# wine 的窗口框架偏移（无窗口管理器时它自己画装饰，偏移不可移植）。
+if { [ -z "$ONLY" ] && [ "$DO_INPUT" = "1" ]; } || [ "$ONLY" = "input" ]; then
+    if ! command -v xdotool >/dev/null 2>&1; then
+        if [ "$ONLY" = "input" ]; then
+            fail "input: 找不到 xdotool（nix-shell -p … xdotool）"
+        else
+            pass "input: 跳过（没装 xdotool；显式 --only=input 时会失败）"
+        fi
+    else
+        info "阶段 input（xdotool 真实注入：X11 -> wine -> WndProc）"
+        IN_LOG="$RUN_DIR/input.log"
+        rm -f "$IN_LOG" "$RUN_DIR/composekn-startup.log"
+        IN_DX="${COMPOSEKN_WINTEST_XDOTOOL_DX:-40}"
+        IN_DY="${COMPOSEKN_WINTEST_XDOTOOL_DY:-25}"
+        cat > "$RUN_DIR/input.sh" <<'EOIN'
+set -e
+export WINEDEBUG="${WINEDEBUG:--all}"
+"$WINECMD" "$EXE_RUN" >"$IN_LOG" 2>&1 &
+APP_PID=$!
+WID=""
+for _ in $(seq 1 60); do
+    sleep 0.5
+    WID="$(xwininfo -root -tree 2>/dev/null | grep -m1 'ComposeKN Windows Demo' | awk '{print $1}')" || true
+    [ -n "${WID:-}" ] && break
+done
+if [ -z "${WID:-}" ]; then
+    echo "INPUT-NO-WINDOW"
+    kill $APP_PID 2>/dev/null || true
+    exit 1
+fi
+# 等布局/首帧就位：坐标命中依赖布局已经完成
+sleep 4
+eval "$(xdotool getwindowgeometry --shell "$WID" 2>/dev/null || true)"
+echo "INPUT-GEOM x=${X:-?} y=${Y:-?} w=${WIDTH:-?} h=${HEIGHT:-?}"
+BX=$(( ${X:-0} + ${WIDTH:-200} / 2 ))
+BY=$(( ${Y:-0} + ${HEIGHT:-200} / 2 ))
+echo "INPUT-CLICK1 $BX,$BY"
+xdotool mousemove "$BX" "$BY" click 1
+sleep 1
+echo "INPUT-CLICK2 $((BX+$IN_DX)),$((BY+$IN_DY))"
+xdotool mousemove "$((BX+$IN_DX))" "$((BY+$IN_DY))" click 1
+sleep 1
+# 滚轮：X11 的 4/5 号键 = 滚轮上/下，wine 会翻成 WM_MOUSEWHEEL（±120）
+xdotool mousemove "$BX" "$BY"
+xdotool click 4
+sleep 0.3
+xdotool click 5
+sleep 1
+# 键盘：无窗口管理器时 X 的输入焦点是 PointerRoot，鼠标刚移进窗口，
+# 所以这里不需要 windowactivate（没有 WM 也激活不了）。
+xdotool key Return
+sleep 2
+kill $APP_PID 2>/dev/null || true
+for _ in $(seq 1 20); do
+    kill -0 $APP_PID 2>/dev/null || break
+    sleep 0.25
+done
+kill -9 $APP_PID 2>/dev/null || true
+echo "INPUT-OK"
+EOIN
+        start_xvfb
+        set +e
+        timeout 300 env WINECMD="$WINECMD" EXE_RUN="$EXE_RUN" IN_LOG="$IN_LOG" \
+            IN_DX="$IN_DX" IN_DY="$IN_DY" bash "$RUN_DIR/input.sh" \
+            > "$RUN_DIR/input.out" 2>&1
+        set -e
+        STARTUP_LOG="$RUN_DIR/composekn-startup.log"
+        if ! grep -q INPUT-OK "$RUN_DIR/input.out"; then
+            fail "input: 注入脚本没跑完（见 $RUN_DIR/input.out）"
+            tail -20 "$RUN_DIR/input.out" || true
+        else
+            # 两次点击的客户区坐标差必须等于我们注入的像素间隔。
+            XN="$(grep -o 'mouse: 左键 DOWN pos=[-0-9]*,[-0-9]*' "$STARTUP_LOG" 2>/dev/null | head -2 || true)"
+            N="$(printf '%s\n' "$XN" | grep -c 'pos=' || true)"
+            if [ "${N:-0}" -lt 2 ]; then
+                fail "input: 只看到 $N 条『mouse: 左键 DOWN』（期望 ≥2，见 $STARTUP_LOG）"
+                tail -5 "$IN_LOG" || true
+            else
+                P1="$(printf '%s\n' "$XN" | sed -n 1p)"
+                P2="$(printf '%s\n' "$XN" | sed -n 2p)"
+                X1="$(printf '%s' "$P1" | sed 's/.*pos=//; s/,.*//')"
+                Y1="$(printf '%s' "$P1" | sed 's/.*,//')"
+                X2="$(printf '%s' "$P2" | sed 's/.*pos=//; s/,.*//')"
+                Y2="$(printf '%s' "$P2" | sed 's/.*,//')"
+                DX=$((X2 - X1))
+                DY=$((Y2 - Y1))
+                if [ "$DX" = "$IN_DX" ] && [ "$DY" = "$IN_DY" ]; then
+                    pass "input: 真实 X11 鼠标点击到达 wndproc，客户区坐标差 = ($DX,$DY)"
+                else
+                    fail "input: 坐标差 ($DX,$DY) ≠ 注入的 ($IN_DX,$IN_DY)（$P1 / $P2）"
+                fi
+            fi
+            # 滚轮 / 键盘：证明这两条消息也被系统送到了窗口
+            for spec in "真实竖向滚轮|wheel: 竖直 delta=" "真实按键按下|key: DOWN vk=0x0D" "真实按键抬起|key: UP vk=0x0D"; do
+                want_name="${spec%%|*}"
+                want_text="${spec#*|}"
+                if grep -qF -- "$want_text" "$STARTUP_LOG" 2>/dev/null; then
+                    pass "input: $want_name（$(grep -F -- "$want_text" "$STARTUP_LOG" | head -1 | sed 's/^\[[^]]*\] //' | tr -d '\r\n')）"
+                else
+                    fail "input: 没看到『$want_name』（grep -F '$want_text' $STARTUP_LOG）"
+                fi
+            done
+            # 反证：X11 鼠标输入**不该**在触摸通道里冒出来（鼠标必须只走 WM_MOUSE*）。
+            TOUCH_LINES="$(grep -c '^.*touch: ' "$STARTUP_LOG" 2>/dev/null || true)"
+            if [ "${TOUCH_LINES:-0}" = "0" ]; then
+                pass "input: 真实鼠标输入没有串进触摸通道"
+            else
+                fail "input: 真实鼠标输入串进了触摸通道（touch=$TOUCH_LINES）"
+                grep -n 'touch: ' "$STARTUP_LOG" | head -5 || true
+            fi
+        fi
+    fi
 fi
 
 # ------------------------------------------------- 4. 截图（外部像素校验）

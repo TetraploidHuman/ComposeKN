@@ -101,8 +101,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (153 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (150 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (167 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (164 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -120,14 +120,28 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            **IMM32 文档馈送（IMR_DOCUMENTFEED 的答复结构和两段式约定）**、
            **组字字体（IMR_COMPOSITIONFONT）**、
            **重新转换（IMR_CONFIRMRECONVERTSTRING 的接受/拒绝 + 原文本不重复）**、干净退出、
+           **真实 Win32 消息路径**（用 PostMessage 把真的 WM_MOUSEMOVE / WM_LBUTTONDOWN/UP /
+           WM_MOUSEWHEEL / WM_MOUSEHWHEEL / WM_KEYDOWN/UP 投到窗口自己的消息队列，走主循环
+           GetMessage -> TranslateMessage -> DispatchMessage -> 真实 wndproc 分支：
+           悬停进出、按压/点击、竖向与横向滚轮、真实点击聚焦文本框、真实按键输入字符
+           都必须成立）、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
-           动画按刷新率节流）（37 条）
-  all    = 两者都跑（150 条断言）
+           动画按刷新率节流）（51 条）
+  all    = 两者都跑（164 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个
            子阶段全是 0 帧；原因与取舍见 HANDOVER §17.17）——所以它不会红，但要看
            真实的帧率/CPU 数据请单独跑 `window`。
+
+外部验证（`scripts/test-windows-native.sh`，不依赖程序自述）：
+  1. 宿主日志断言 —— 从 composekn-startup.log 里确认 `mouse:` / `wheel:` / `key:` 行
+     真的出现过（这些行**只有 C++ wndproc 分支会打印**），并确认鼠标消息没有串进
+     触摸通道（`touch:` 行为 0）。光看 Kotlin 侧 PASS 无法排除“断言改成不经过宿主也能过”。
+  2. xdotool 真实注入 —— 往 X 服务器打真的鼠标/键盘事件，走
+     X11 -> wine -> Win32 消息队列 -> wndproc 整条链路；断言两次相隔 (dx,dy) 的点击在
+     客户区坐标里也相隔 (dx,dy)（不依赖窗口装饰偏移），滚轮/键盘消息也都必须到达。
+  3. 截图 —— 抓真实窗口 PNG，检查标题栏像素与颜色数（不是空白窗口）。
 
 性能日志（排查 CPU/帧率时直接拷这个文件）：
   composekn-startup.log —— exe 同目录，含启动诊断 + 每秒一行 GALLERY-STATS
@@ -156,6 +170,8 @@ skiko 的指针输入层只在指针类型是鼠标时才合成 Enter/Exit 事�
                        一根按住的手指送进 Compose（点击被吞、单指被当双指），
                         现在只记一行、不派发
   mouse: 左键 DOWN/UP  鼠标按键（以前完全不进日志，所以"点击来源不明"时无从判断）
+  wheel: 竖直/横向 delta=…  滚轮原始 delta（不折算成"格"）。触控板/精确滚轮送来的是
+                        任意小数倍 WHEEL_DELTA，"滚不动/一顿一顿"时先看这个值
   key: DOWN vk=0x..    键盘事件（prevDown=1 表示系统自动重复）—— Compose 的 clickable 在 Enter/Space
                         的 KeyUp 上也会触发 onClick，所以这条是必要的对照
   hoverbox: 点击/按下/抬起/取消  画廊里那个绿盒子的反馈与 PressInteraction（带坐标：

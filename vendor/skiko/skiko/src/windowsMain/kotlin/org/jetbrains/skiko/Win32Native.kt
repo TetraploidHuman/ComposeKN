@@ -174,6 +174,51 @@ const val SW_WINDOWS_MINIMIZE = 6
 const val SW_WINDOWS_RESTORE = 9
 
 /**
+ * Win32 消息号（自检用）。
+ *
+ * 这些值是 Windows ABI 里固定的常量，Kotlin/Native 这边没有 windows.h 的 cinterop，
+ * 所以就地声明。只放自检真正会投递的那几条 —— 不是要复刻 windows.h。
+ */
+object Win32Message {
+    const val MOUSEMOVE = 0x0200
+    const val LBUTTONDOWN = 0x0201
+    const val LBUTTONUP = 0x0202
+    const val RBUTTONDOWN = 0x0204
+    const val RBUTTONUP = 0x0205
+    const val MBUTTONDOWN = 0x0207
+    const val MBUTTONUP = 0x0208
+    const val MOUSEWHEEL = 0x020A
+    const val MOUSEHWHEEL = 0x020E
+    const val KEYDOWN = 0x0100
+    const val KEYUP = 0x0101
+    const val CHAR = 0x0102
+    const val SYSKEYDOWN = 0x0104
+    const val SYSKEYUP = 0x0105
+    const val UNICHAR = 0x0109
+
+    /** WM_MOUSEWHEEL 的「一格」；delta 可以是它的小数倍（精确触控板）。 */
+    const val WHEEL_DELTA = 120
+}
+
+@SymbolName("composekn_win32_post_test_mouse")
+internal external fun composekn_win32_post_test_mouse(
+    window: COpaquePointer?,
+    message: UInt,
+    x: Int,
+    y: Int,
+    wheelDelta: Int,
+): Boolean
+
+@SymbolName("composekn_win32_post_test_key")
+internal external fun composekn_win32_post_test_key(
+    window: COpaquePointer?,
+    message: UInt,
+    vkOrChar: Int,
+    scanCode: Int,
+    isRepeat: Int,
+): Boolean
+
+/**
  * High-level wrapper over the Win32 C bridge. All calls are main-thread only.
  */
 class Win32Window internal constructor(internal val native: COpaquePointer) : AutoCloseable {
@@ -404,6 +449,42 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      * Uses ReleaseCapture + SendMessage so Compose-injected press can drive it.
      */
     fun beginMove() = composekn_win32_begin_move(native)
+
+    /**
+     * 自检用：把一条**真实的 Win32 鼠标消息**投递到窗口自己的消息队列
+     * （PostMessage -> 主循环 GetMessage/DispatchMessage -> 真实 wndproc 分支）。
+     *
+     * 为什么要它：窗口阶段的自检以前只从 Kotlin 侧合成 `WindowsEvent`，C++ 宿主
+     * 那一层（wndproc 的参数解码 / 坐标换算 / 消息过滤）在自动化里从未被跑过 ——
+     * 历史上的宿主层 bug（笔悬停变成一根按下的手指、Shift+滚轮没实现）就都是
+     * 「只有真机手动操作才第一次执行」。这条断言的是宿主本身。
+     *
+     * [x]/[y] 是**客户区**坐标（滚轮也一样；C 侧按真机格式换成屏幕坐标进 lParam）。
+     * [wheelDelta] 只在 [Win32Message.MOUSEWHEEL] / [Win32Message.MOUSEHWHEEL] 时有效，
+     * 单位是 [Win32Message.WHEEL_DELTA]；精确触控板可以是任意小数倍。
+     */
+    fun postTestMouseMessage(message: Int, x: Int, y: Int, wheelDelta: Int = 0): Boolean =
+        composekn_win32_post_test_mouse(native, message.toUInt(), x, y, wheelDelta)
+
+    /**
+     * 自检用：把一条**真实的 Win32 键盘/字符消息**投递到窗口自己的消息队列。
+     *
+     * [vkOrChar] 对 KEYDOWN/KEYUP 是虚拟键码，对 CHAR/UNICHAR 是字符码点；
+     * [scanCode]/[isRepeat] 用来拼真实的 lParam（只影响宿主诊断日志里那条
+     * `key: … prevDown=…`）。
+     */
+    fun postTestKeyMessage(
+        message: Int,
+        vkOrChar: Int,
+        scanCode: Int = 0,
+        isRepeat: Boolean = false,
+    ): Boolean = composekn_win32_post_test_key(
+        native,
+        message.toUInt(),
+        vkOrChar,
+        scanCode,
+        if (isRepeat) 1 else 0,
+    )
 
     override fun close() {
         composekn_win32_destroy(native)
