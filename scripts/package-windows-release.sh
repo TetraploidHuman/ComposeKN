@@ -68,7 +68,8 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
 界面里可以试：
   · 按钮 / 文本排版（长文本省略、中英混排、多种字号）
   · 输入框（单行/多行、中文输入法、Tab 焦点切换）、复选、开关、滑杆、单选
-  · 进度条（确定 + 无限动画）、卡片、分割线、hover 高亮
+  · 进度条（确定 + 无限动画）、卡片、分割线、hover 高亮（触摸屏上点击也有反馈：
+    触摸不会产生 hover，见 README 末尾"触摸/鼠标/hover"一节）
   · 下拉菜单、对话框（弹层合成）
   · 横向/纵向 Lazy 列表虚拟化 + **鼠标滚轮滚动** + **触摸屏拖动滚动**
     （触摸走 WM_POINTER -> PointerType.Touch；`set COMPOSEKN_TOUCH=0` 可关掉，
@@ -98,16 +99,17 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (139 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (136 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (146 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (143 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
            的位置和像素）、**重新转换的选区握手**、**多点触摸（捏合缩放/不泄漏触点）**、
            **触摸真实事件时间（时间戳原样到达 Compose 指针输入层）+ 按住不动不甩 +
            捏合不滚列表（两根手指都在手势区里）+ **捏合后停住不跳变（gesture pickup
-           不再把整段位移当第一次拖动增量）**，
-           不开窗口（102 条）
+           不再把整段位移当第一次拖动增量）**、
+           **悬停/按压语义（触摸没有 hover 但必须有按压反馈 + 能点；鼠标 hover 必须能进能出）**，
+           不开窗口（109 条）
   window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、
            IME 文本通道、**WM_IME_REQUEST 候选窗锚点（组字中塌缩到组字起点）**、
            **IMM32 文档馈送（IMR_DOCUMENTFEED 的答复结构和两段式约定）**、
@@ -115,7 +117,7 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            **重新转换（IMR_CONFIRMRECONVERTSTRING 的接受/拒绝 + 原文本不重复）**、干净退出、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
            动画按刷新率节流）（37 条）
-  all    = 两者都跑（136 条断言）
+  all    = 两者都跑（143 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个
@@ -129,6 +131,19 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
   想复现「静止」对照：再加 --no-animate 跑一遍（预期 frames/s=+0、cpu≈0ms/s）。
 
 日志：composekn-startup.log（exe 同目录，含启动诊断与事件日志）。
+
+触摸 / 鼠标 / hover（一条已知的"看起来像 bug"的行为）
+----------------------------------------------------
+Compose 的 hover（`Modifier.hoverable` / `collectIsHoveredAsState`）**只对鼠标产生**：
+skiko 的指针输入层只在指针类型是鼠标时才合成 Enter/Exit 事件
+（`InternalPointerEvent.skiko.kt`: `activeHoverEvent = 指针类型 == PointerType.Mouse`）。
+**触摸永远不会有 hover** —— Android 上触摸 `hoverable` 也是同样毫无反应，
+这是上游模型，不是宿主漏发事件。
+
+所以控件（包括本画廊里那个绿盒子）**不能只把可见变化挂在 hoverable 上**，否则触摸屏
+用户看到的就是"点了没反应"。画廊里的绿盒子现在点击也会显示计数并保持高亮；
+鼠标悬停的行为不变。宿主侧能保证的是：触摸必须产生**按压反馈**
+（`PressInteraction.Press/Release` → 涟漪）并能触发 `click`（自检里有断言）。
 EOF
 
 # 注入版本号（heredoc 带引号后无法做变量替换）

@@ -14,6 +14,7 @@ package main
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -27,7 +28,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.interaction.HoverInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -177,6 +180,29 @@ class InteractionProbe {
     var clicked by mutableStateOf(false)
     var clickCount by mutableStateOf(0)
 
+    /**
+     * hover / 按压反馈探针（测试屏里那个橙色可点击方块）。
+     *
+     * 这一组回答的是真机反馈「触摸点了没反应」到底算谁的：
+     *  · hover（`Enter/Exit`）在 Compose 里**只对鼠标**产生 —— skiko 的实现
+     *    `InternalPointerEvent.skiko.kt: activeHoverEvent = id 的类型 == PointerType.Mouse`，
+     *    触摸永远拿不到；Android 上触摸 `hoverable` 也一样。所以「只有 hoverable
+     *    才有可见变化」是**应用侧**的设计问题，不是宿主漏发事件。
+     *  · 但触摸**必须**有 `PressInteraction`（涟漪/自定义按压反馈的来源）并能触发
+     *    click —— 这一半要是断了才是宿主/输入通道的真 bug。
+     */
+    var probeButtonHovered by mutableStateOf(false)
+    var probeButtonPressed by mutableStateOf(false)
+
+    /** `HoverInteraction.Enter` / `Exit` 的**边沿**次数（只有鼠标能加）。 */
+    var probeButtonHoverEnters by mutableStateOf(0)
+    var probeButtonHoverExits by mutableStateOf(0)
+
+    /** `PressInteraction.Press` / `Release` / `Cancel` 的次数（触摸、鼠标都算）。 */
+    var probeButtonPresses by mutableStateOf(0)
+    var probeButtonReleases by mutableStateOf(0)
+    var probeButtonCancels by mutableStateOf(0)
+
     /** 主输入框的内容 + 选区（选区用来断言「点击定位光标」「Ctrl+A 全选」）。 */
     var value by mutableStateOf(TextFieldValue(""))
 
@@ -289,17 +315,60 @@ private fun DeterministicTestScreen(
                     .background(TEST_MARKER),
             )
 
-            // 可点击按钮：点击后颜色变绿（同时驱动重组）
+            // 可点击按钮：点击后颜色变绿（同时驱动重组）。
+            //
+            // 它同时是 **hover / 按压反馈** 的探针（互动源只用来观测，不改像素）：
+            //  · `hoverable` 收到的 `HoverInteraction.Enter/Exit` 只可能来自鼠标
+            //    （Compose 的 hover 事件在 skiko 里只对 `PointerType.Mouse` 合成）；
+            //  · `clickable` 的 `PressInteraction.Press/Release` 则触摸、鼠标都该有
+            //    —— 真机「点了没反应」若出在这一层才是宿主/输入通道的 bug。
+            // 两条断言分别锁死：触摸不能"顺便"产生 hover、鼠标必须能产生 hover。
+            //
+            // ⚠ 这里**直接把互动事件写进探针字段**，而不是用
+            // `collectIsHoveredAsState()` + `SideEffect` 转一手：后者要求
+            // 「协程派发 -> 重组 -> SideEffect」三跳都跑完，离屏驱动器一次
+            // `render(frames=k)` 只给 k 轮，读到的状态会晚一两帧（首版就是这么假失败的）。
+            // 计数只算 0->1 / 1->0 的**边沿**：`hoverable` 和 `clickable` 两个节点都会
+            // 往同一个 source 发 Enter/Exit，不去重的话一次悬停会数出 2 个。
+            val probeButton = remember { MutableInteractionSource() }
+            LaunchedEffect(probeButton) {
+                probeButton.interactions.collect { interaction ->
+                    when (interaction) {
+                        is HoverInteraction.Enter -> {
+                            if (!probe.probeButtonHovered) probe.probeButtonHoverEnters++
+                            probe.probeButtonHovered = true
+                        }
+                        is HoverInteraction.Exit -> {
+                            if (probe.probeButtonHovered) probe.probeButtonHoverExits++
+                            probe.probeButtonHovered = false
+                        }
+                        is PressInteraction.Press -> {
+                            probe.probeButtonPresses++
+                            probe.probeButtonPressed = true
+                        }
+                        is PressInteraction.Release -> {
+                            probe.probeButtonReleases++
+                            probe.probeButtonPressed = false
+                        }
+                        is PressInteraction.Cancel -> {
+                            probe.probeButtonCancels++
+                            probe.probeButtonPressed = false
+                        }
+                    }
+                }
+            }
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(start = 40.dp, top = 96.dp)
                     .size(160.dp, 48.dp)
                     .background(if (probe.clicked) TEST_ACTIVE else TEST_IDLE)
+                    .hoverable(probeButton)
                     // indication = null：去掉 Material 涟漪，让「点击后的颜色」是确定的纯色
-                    // （涟漪是一层半透明叠加，会让像素断言变成模糊匹配）
+                    // （涟漪是一层半透明叠加，会让像素断言变成模糊匹配）；互动源仍然会用，
+                    // 所以 PressInteraction 照样发得出来。
                     .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
+                        interactionSource = probeButton,
                         indication = null,
                     ) {
                         probe.clicked = true
@@ -742,6 +811,120 @@ private fun renderChecks(report: SelfTestReport) {
     app.dispatchEvent(WindowsEvent.TouchEvent(pointerId = 1L, x = clickX, y = clickY, phase = TouchPhase.Up))
     driver.render(800, 600, density = d, frames = 3)
     report.checkEquals("interaction/touch-tap-clicks", clicksBeforeTouch + 1, probe.clickCount)
+
+    // (a2) 「悬停」的语义边界（真机反馈：触摸屏上「悬停/点击试试」的卡片点了永远不显示文字）。
+    //
+    // 结论先写在这里：**触摸不会有 hover，这是 Compose 的模型，不是宿主漏发**。
+    //   Compose 的 hover = `PointerEventType.Enter/Exit`，由 HitPathTracker 只对
+    //   `InternalPointerEvent.activeHoverEvent(id)` 为真的指针合成；skiko 的实现是
+    //   `changes[id]?.type == PointerType.Mouse`（InternalPointerEvent.skiko.kt）——
+    //   触摸指针是 `PointerType.Touch`，永远为假。Android 上触摸 `hoverable` 同样
+    //   毫无反应（Enter 只来自鼠标/触控笔的 hover 事件）。
+    // 所以「只把可见变化挂在 hoverable 上」的控件在触摸屏上必然没反馈 —— 那是应用侧
+    // 设计问题（画廊里那个盒子以前就是这样，本版已改成点击也会显示计数 + 高亮）。
+    //
+    // 但「触摸点了没反应」还有另一半属于宿主真 bug 的可能：按压反馈
+    // （`PressInteraction.Press`，涟漪/自定义高亮的来源）和 click 必须都有。
+    // 下面七条把这几件事分别钉死：
+    //   · 触摸 -> Press/Release 必须有（真 bug 会在这里红）
+    //   · 触摸 -> HoverInteraction.Enter 必须一次都不出现（模型如此，若"顺手"给触摸
+    //     合成 hover，等于偏离上游行为）
+    //   · 触摸 -> click 必须触发
+    //   · 鼠标 -> hover 必须能进能出（CSD 标题栏按钮的悬停高亮就靠它，不能被上面
+    //     那条"触摸不能 hover"误伤）
+    val hoverButtonX = clickX
+    val hoverButtonY = clickY
+    // 交互事件 -> 探针字段之间隔着「协程派发」（`coroutineScope.launch { interactionSource.emit() }`
+    // -> 收集器恢复），离屏驱动器一次 `render(frames=k)` 是 k 轮 (pumpDispatchers + renderFrame)。
+    // 与其把帧数写死（首版写死 2~3 帧，状态还没到，假失败过），不如显式等到状态到位，
+    // 并把用掉的帧数写进 info —— 真机上窗口循环 60Hz 连续 pump，这个延迟无意义。
+    fun settleProbe(want: Boolean, maxFrames: Int = 16, value: () -> Boolean): Int {
+        var used = 0
+        while (used < maxFrames && value() != want) {
+            driver.render(800, 600, density = d, frames = 1)
+            used++
+        }
+        return used
+    }
+
+    // 前面的点击把鼠标停在了这个按钮上：先把鼠标挪到别处（底部滚动区），
+    // 保证下面是从「未 hover」开始的干净状态。顺便这也验证了 hover 的**退出**：
+    // 鼠标确实在按钮上过（前面的点击移动过去了），所以这里必须真的发生一次 Exit。
+    app.dispatchEvent(WindowsEvent.MouseMoveEvent(x = 700, y = contentTop + 500))
+    val awayFrames = settleProbe(false) { probe.probeButtonHovered }
+    report.info("hover 探针：鼠标移开后 ${awayFrames} 帧到位")
+    report.check(
+        "interaction/mouse-move-away-clears-hover",
+        !probe.probeButtonHovered && probe.probeButtonHoverEnters >= 1 && probe.probeButtonHoverExits >= 1,
+        "鼠标移到 (700,${contentTop + 500}) 后 probeButtonHovered=${probe.probeButtonHovered}（期望 false）；" +
+            "Enter=${probe.probeButtonHoverEnters} Exit=${probe.probeButtonHoverExits}（都该 ≥1 —— " +
+            "前面 click() 先把鼠标移到了按钮上，这里必须真的退出）",
+    )
+
+    val hoverEntersBeforeTouch = probe.probeButtonHoverEnters
+    val hoverExitsBeforeTouch = probe.probeButtonHoverExits
+    val pressesBeforeTouch = probe.probeButtonPresses
+    val releasesBeforeTouch = probe.probeButtonReleases
+    val clicksBeforeHoverBoxTouch = probe.clickCount
+    app.dispatchEvent(
+        WindowsEvent.TouchEvent(pointerId = 9L, x = hoverButtonX, y = hoverButtonY, phase = TouchPhase.Down),
+    )
+    val pressFrames = settleProbe(true) { probe.probeButtonPressed }
+    val hoveredWhileTouching = probe.probeButtonHovered
+    val pressedWhileTouching = probe.probeButtonPressed
+    app.dispatchEvent(
+        WindowsEvent.TouchEvent(pointerId = 9L, x = hoverButtonX, y = hoverButtonY, phase = TouchPhase.Up),
+    )
+    val releaseFrames = settleProbe(false) { probe.probeButtonPressed }
+    driver.render(800, 600, density = d, frames = 2)
+    report.info("按压探针：按下 ${pressFrames} 帧到位、抬起 ${releaseFrames} 帧到位")
+
+    report.check(
+        "interaction/touch-press-feedback",
+        pressedWhileTouching && probe.probeButtonPresses == pressesBeforeTouch + 1,
+        "触摸按下后 probeButtonPressed=$pressedWhileTouching（期望 true），" +
+            "PressInteraction=${probe.probeButtonPresses - pressesBeforeTouch} 次（期望 1）",
+    )
+    report.check(
+        "interaction/touch-release-clears-pressed",
+        probe.probeButtonReleases == releasesBeforeTouch + 1 && !probe.probeButtonPressed,
+        "触摸抬起后 ReleaseInteraction=${probe.probeButtonReleases - releasesBeforeTouch} 次（期望 1），" +
+            "probeButtonPressed=${probe.probeButtonPressed}（期望 false），" +
+            "Cancel=${probe.probeButtonCancels}（期望 0）",
+    )
+    report.check(
+        "interaction/touch-does-not-hover",
+        !hoveredWhileTouching && !probe.probeButtonHovered &&
+            probe.probeButtonHoverEnters == hoverEntersBeforeTouch &&
+            probe.probeButtonHoverExits == hoverExitsBeforeTouch,
+        "触摸全程 HoverInteraction.Enter=${probe.probeButtonHoverEnters - hoverEntersBeforeTouch} / " +
+            "Exit=${probe.probeButtonHoverExits - hoverExitsBeforeTouch} 次（都期望 0 —— " +
+            "Compose 的 hover 只对鼠标合成）；按下瞬间 probeButtonHovered=$hoveredWhileTouching（期望 false）",
+    )
+    report.checkEquals(
+        "interaction/touch-tap-hover-probe-clicks",
+        clicksBeforeHoverBoxTouch + 1,
+        probe.clickCount,
+    )
+
+    app.dispatchEvent(WindowsEvent.MouseMoveEvent(x = hoverButtonX, y = hoverButtonY))
+    val enterFrames = settleProbe(true) { probe.probeButtonHovered }
+    report.info("hover 探针：鼠标移上按钮 ${enterFrames} 帧到位")
+    report.check(
+        "interaction/mouse-hover-enters",
+        probe.probeButtonHovered && probe.probeButtonHoverEnters == hoverEntersBeforeTouch + 1,
+        "鼠标移到按钮上：probeButtonHovered=${probe.probeButtonHovered}（期望 true），" +
+            "HoverInteraction.Enter=${probe.probeButtonHoverEnters - hoverEntersBeforeTouch} 次（期望 1）",
+    )
+    app.dispatchEvent(WindowsEvent.MouseMoveEvent(x = 700, y = contentTop + 500))
+    val exitFrames = settleProbe(false) { probe.probeButtonHovered }
+    report.info("hover 探针：鼠标再次移开 ${exitFrames} 帧到位")
+    report.check(
+        "interaction/mouse-hover-exits",
+        !probe.probeButtonHovered && probe.probeButtonHoverExits == hoverExitsBeforeTouch + 1,
+        "鼠标移开按钮：probeButtonHovered=${probe.probeButtonHovered}（期望 false），" +
+            "HoverInteraction.Exit=${probe.probeButtonHoverExits - hoverExitsBeforeTouch} 次（期望 1）",
+    )
 
     // (b) 触摸拖动能滚吗？
     //

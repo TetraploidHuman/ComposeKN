@@ -6,6 +6,7 @@
 package main
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
@@ -13,6 +14,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -104,7 +106,17 @@ class GalleryProbe {
     var darkTheme by mutableStateOf(false)
     var scrollY by mutableStateOf(0)
     var lazyScrollY by mutableStateOf(0)
+    /** hover 探针盒：被鼠标悬停进入的次数（触摸**不会**让它增加，见 [HoverBox]）。 */
     var hoverCount by mutableStateOf(0)
+
+    /**
+     * hover 探针盒：被点击的次数（鼠标、触摸都算）。
+     *
+     * 触摸屏上这是**唯一**能看到反馈的通道：Compose 的 hover（Enter/Exit）在 skiko 里
+     * 只对 `PointerType.Mouse` 合成，触摸永远没有 hover
+     * —— 所以控件不能只把可见变化挂在 hoverable 上。
+     */
+    var hoverBoxClicks by mutableStateOf(0)
 
     /** 多点触摸：捏合缩放的累乘结果（两张手指张开 -> 变大，捏合 -> 变小）。 */
     var pinchScale by mutableStateOf(1f)
@@ -165,6 +177,7 @@ class GalleryProbe {
         textButtonClicks = 0
         iconButtonClicks = 0
         hoverCount = 0
+        hoverBoxClicks = 0
     }
 }
 
@@ -656,10 +669,25 @@ private fun LazyListScope.gallerySections(
     }
 }
 
+/**
+ * hover / 点击探针盒。
+ *
+ * ⚠ 触摸屏用户看不到 hover：Compose 的 hover 是 `PointerEventType.Enter/Exit`，
+ * 而 skiko 只在指针类型是 `PointerType.Mouse` 时才合成这两个事件
+ * （vendor/compose-core/ui/src/skikoMain/.../InternalPointerEvent.skiko.kt:
+ *   `activeHoverEvent = changes[id]?.type == PointerType.Mouse`），
+ * Android 上触摸 `hoverable` 同样毫无反应 —— 这是模型本身如此，不是宿主漏发。
+ * （本宿主把 `PT_PEN` 也送成 `PointerType.Touch`，所以笔在悬停时同样没有 hover，
+ *   见 HANDOVER §17.28 末尾那条尚未实测的隐患。）
+ *
+ * 所以「悬停/点击试试」这个盒子**必须**也把点击做成可见反馈，否则真机触摸用户
+ * 得到的就是「点了没反应」（用户实测反馈，HANDOVER §17.28）。鼠标悬停照旧变色。
+ */
 @Composable
 private fun HoverBox(probe: GalleryProbe) {
     val interactionSource = remember { MutableInteractionSource() }
     val hovered by interactionSource.collectIsHoveredAsState()
+    val pressed by interactionSource.collectIsPressedAsState()
     var entered by remember { mutableStateOf(false) }
     LaunchedEffect(hovered) {
         if (hovered && !entered) {
@@ -668,16 +696,31 @@ private fun HoverBox(probe: GalleryProbe) {
         }
         if (!hovered) entered = false
     }
+    // 悬停 / 按压 / 点过之后都保持高亮 —— 触摸用户只能靠后两者看到反馈。
+    val highlight = hovered || pressed || probe.hoverBoxClicks > 0
     Box(
         modifier = Modifier
             .size(200.dp, 72.dp)
-            .background(if (hovered) Color(0xFF81C784) else Color(0xFFC8E6C9))
+            .background(if (highlight) Color(0xFF81C784) else Color(0xFFC8E6C9))
             .hoverable(interactionSource)
-            .clickable { probe.hoverCount++ },
+            // indication 显式给 LocalIndication（而不是省略）是为了和 hoverable 共用
+            // 同一个 interactionSource —— 这样 pressed 才拿得到状态；波形（涟漪）照旧。
+            .clickable(
+                interactionSource = interactionSource,
+                indication = LocalIndication.current,
+            ) {
+                probe.hoverBoxClicks++
+                winlog("hoverbox: 点击 clicks=${probe.hoverBoxClicks} hovered=$hovered")
+            },
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            if (hovered) "hover ✓ (${probe.hoverCount})" else "悬停/点击试试",
+            text = when {
+                pressed -> "按下中… (clicks=${probe.hoverBoxClicks})"
+                hovered -> "hover ✓ (h=${probe.hoverCount} clicks=${probe.hoverBoxClicks})"
+                probe.hoverBoxClicks > 0 -> "点击 ✓ (clicks=${probe.hoverBoxClicks})"
+                else -> "悬停/点击试试"
+            },
             color = Color.Black,
         )
     }

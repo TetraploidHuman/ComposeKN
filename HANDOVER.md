@@ -2637,3 +2637,85 @@ moveToAwaitTouchSlopState(initialDown, pointerId, initialPositionChange)   // �
 
 **待办**：这个补丁值得回报上游（`processAwaitGesturePickup` 的语义问题：它无法区分
 "被消费掉的位移"与"未被消费的位移"，只能保守地从零开始）。等有 upstream 修法再对齐。
+
+### 17.28 「触摸点不动那个『悬停/点击试试』的卡片」：hover 是鼠标专属（v0.5.10）
+
+#### 真机反馈
+
+> 我发现我无法用触摸让这个悬浮/点击试试的Card显示文字（但是触摸的点击也会被记录）
+
+用户指的是画廊「卡片 / 容器」一节里那个绿色 `HoverBox`：文字只在 `hovered` 为真时才变，
+而触摸永远不会让它为真 —— 而它的点击**确实**在执行（`hoverCount++`），只是那个计数也
+**只在 hover 时才显示**。
+
+#### 根因：Compose 的 hover = `PointerEventType.Enter/Exit`，skiko 只对**鼠标**合成
+
+证据链（都在 `vendor/compose-core` 里，不是猜测）：
+
+1. `hoverable` 只对 `PointerEventType.Enter/Exit` 反应
+   （`foundation/Hoverable.kt` 的 `HoverableNode.onPointerEvent`）。
+2. Enter/Exit 由 `HitPathTracker` 合成，且**只对「active hover 指针」**：
+   `ui/input/pointer/HitPathTracker.kt:584-608`（`internalPointerEvent.activeHoverEvent(it.id)`）。
+3. skiko 的实现把「active hover」定义为**指针类型是鼠标**：
+   `ui/skikoMain/.../InternalPointerEvent.skiko.kt:43`
+   ```kotlin
+   actual fun activeHoverEvent(pointerId: PointerId): Boolean =
+       changes[pointerId.value]?.type == PointerType.Mouse
+   ```
+4. 宿主把触摸派发成 `PointerType.Touch`（`WindowsInputState.updateTouch`）—— 于是
+   `activeHoverEvent` 永远为假，触摸永远拿不到 Enter/Exit。
+
+Android 也一样（Enter 只来自 `ACTION_HOVER_*`，即鼠标/触控笔）。所以**这不是宿主漏发事件，
+而是上游模型**：触摸没有 hover。结论对应用侧同样成立：**把可见变化只挂在 `hoverable` 上的
+控件，在触摸屏上必然毫无反馈** —— 那是设计问题，宿主侧无法（也不应该）替它补 hover。
+
+顺带记录一个容易被误认成"是不是宿主没发 PressInteraction"的点：**不是**。触摸按下会
+正常产生 `PressInteraction.Press`（涟漪/自定义按压反馈的来源）并触发 `click`；
+画廊那个盒子以前只是**没有把点击渲染成任何可见的东西**。
+
+#### 修法（两处，都在样例 + 自检，不动宿主）
+
+1. **`Gallery.kt` 的 `HoverBox`**：点击也变成可见反馈 ——
+   `hoverBoxClicks` 计数、点过后保持高亮、文字按 `按下中… / hover ✓ / 点击 ✓ (clicks=N) /
+   悬停/点击试试` 依次降级显示；并往启动日志写一行
+   `hoverbox: 点击 clicks=N hovered=…`（真机上"点了到底有没有响应"一眼可判）。
+   `clickable(interactionSource = …)` 与 `hoverable` 共用同一个互动源（涟漪照旧）。
+2. **自检新增 7 条断言**（离屏 logic 阶段），把这条边界钉死：
+
+| 断言 | 含义 |
+|---|---|
+| `interaction/mouse-move-away-clears-hover` | 鼠标移开必须真的 Exit（Enter/Exit 计数都 ≥1） |
+| `interaction/touch-press-feedback` | 触摸按下必须有 `PressInteraction.Press`（真 bug 会在这里红） |
+| `interaction/touch-release-clears-pressed` | 抬起必须 `Release`、且没有 `Cancel` |
+| `interaction/touch-does-not-hover` | 触摸全程 `HoverInteraction.Enter/Exit` **必须 0 次**（模型如此） |
+| `interaction/touch-tap-hover-probe-clicks` | 触摸点击必须触发 `click` |
+| `interaction/mouse-hover-enters` | 鼠标移到控件上必须产生 Enter（CSD 标题栏按钮的悬停高亮靠它） |
+| `interaction/mouse-hover-exits` | 鼠标移开必须产生 Exit |
+
+探针实现在自检屏那个橙色可点击方块上：`.hoverable(probeButton)` +
+`.clickable(interactionSource = probeButton, indication = null)`，用一个
+`LaunchedEffect { interactions.collect { … } }` 把互动事件**直接**写进探针字段。
+
+**踩到的坑（写下来省得再犯）**：第一版用 `collectIsHoveredAsState()` + `SideEffect`
+转一手，结果计数器涨了、布尔量却还是 false —— 因为那条路要求"协程派发 → 重组 →
+SideEffect"三跳全跑完，而离屏驱动器一次 `render(frames=k)` 只给 k 轮，读到的是**上一帧**
+的状态（合成事件下就是这个假失败）。改成收集器里直接写字段之后，状态在派发事件时就已经
+到位（`settleProbe` 实测 0 帧）。另外计数只算 0→1 / 1→0 的**边沿**：`hoverable` 和
+`clickable` 两个节点会往同一个 source 各发一次 Enter/Exit，不去重会数出 2。
+
+#### 验证
+
+logic **109**（+7）/ window 37（合计 146）、`all` **143** —— 全绿；打包单文件 exe
+（无 `icudtl.dat`）干净目录复测。
+
+#### 同一条通道上还有一个**没有被测过**的隐患（本次未改，先记录）
+
+`win32_window.cc` 的 WM_POINTER 分支把 `PT_PEN` 也收进来（`pointerType != PT_TOUCH &&
+!= PT_PEN` 才跳过），而**笔在悬停时**（未接触）也会发 `WM_POINTERUPDATE`
+（`POINTER_FLAG_INRANGE` 有、`INCONTACT/DOWN` 没有）。当前代码不看 `pointerFlags`、
+一律当成"按下/移动"（`e.state = 1`），Kotlin 侧 `updateTouch` 对未知 id 的 MOVE 会把它
+**加进活动触点表且 pressed=true** —— 也就是"笔一悬停到窗口上就凭空多出一根按住的手指"，
+而且笔不会发 `WM_POINTERUP`，这根幽灵手指会一直留着（只能等 CAPTURECHANGED）。
+没有笔可以实测，所以**没动**。若要修，最小改法是给 UPDATE 加一句
+「`!touchIsActive(id)` 就忽略」（触摸必然先有 DOWN，因此对触摸零影响），外加把
+`POINTER_INFO.pointerFlags` 的 `INCONTACT` 也纳入判断。
