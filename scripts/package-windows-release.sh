@@ -86,6 +86,10 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · 想看空闲行为：ComposeKN-Windows-Native.exe --no-animate（关掉每帧动画）
   · 想强制后端：set COMPOSEKN_RENDER_API=software（或 gl）——日志里会写明实际用了哪条
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
+  · 触摸板 / 精确滚轮：Win32 的 WM_MOUSEWHEEL `zDelta` **不保证**是 120 的倍数
+    （触控板常送 40/80 这种值），宿主按上游 Compose Desktop 的模型换算成**浮点**的
+    「格」（zDelta / 120），不再被整数除法截断成 0 —— 想确认自己设备的触控板送了什么，
+    看 composekn-startup.log 里的 `wheel: 竖直|横向 delta=…`（原始值，不折算）
 
 自检（自动化测试）
 ------------------
@@ -101,8 +105,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (167 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (164 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (170 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (167 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -113,8 +117,9 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            **悬停/按压语义（触摸没有 hover 但必须有按压反馈 + 能点；鼠标 hover 必须能进能出）**、
            **悬停不会变成"按住的手指"（笔悬停的 WM_POINTERUPDATE 必须被丢掉）**、
            **按住 + 抖动只产生一次 click**、
-           **滚轮翻写约定 + 横向列表（Shift+滚轮 / 横向滚轮能滚、竖直滚轮不动它）**，
-           不开窗口（116 条）
+           **滚轮翻写约定 + 横向列表（Shift+滚轮 / 横向滚轮能滚、竖直滚轮不动它）**、
+           **精确滚轮/触控板（一格以内的 delta 必须原样到达滚动逻辑，不能被整数除法截断）**，
+           不开窗口（118 条）
   window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、
            IME 文本通道、**WM_IME_REQUEST 候选窗锚点（组字中塌缩到组字起点）**、
            **IMM32 文档馈送（IMR_DOCUMENTFEED 的答复结构和两段式约定）**、
@@ -123,11 +128,11 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            **真实 Win32 消息路径**（用 PostMessage 把真的 WM_MOUSEMOVE / WM_LBUTTONDOWN/UP /
            WM_MOUSEWHEEL / WM_MOUSEHWHEEL / WM_KEYDOWN/UP 投到窗口自己的消息队列，走主循环
            GetMessage -> TranslateMessage -> DispatchMessage -> 真实 wndproc 分支：
-           悬停进出、按压/点击、竖向与横向滚轮、真实点击聚焦文本框、真实按键输入字符
-           都必须成立）、
+           悬停进出、按压/点击、竖向与横向滚轮、精确滚轮 zDelta=-40、真实点击聚焦文本框、
+           真实按键输入字符都必须成立）、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
-           动画按刷新率节流）（51 条）
-  all    = 两者都跑（164 条断言）
+           动画按刷新率节流）（52 条）
+  all    = 两者都跑（167 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个

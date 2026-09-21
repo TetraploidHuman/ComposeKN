@@ -148,6 +148,11 @@ internal fun ComposeScene.dispatchWindowsTouchEvent(
  *     触控板横滑）是"横向列表能用滚轮滚"的**唯一**途径，缺了它 `LazyRow` 就只能靠触摸
  *     （真机反馈「横向列表没法用滚轮滚动」，HANDOVER §17.30）。
  *
+ * 精度：delta 是**浮点「格」**（1 格 = 120 个 WHEEL_DELTA 单位）。Win32 只保证
+ * 「带刻度滚轮一格 = 120」，zDelta 本身可以是任意整数（触控板/自由滚轮），所以换算是
+ * `zDelta / 120f` 而不是整数除法 —— 换算后的 0.333 格必须原样到达 Compose
+ * （HANDOVER §17.32）。
+ *
  * 符号约定（血泪教训，别改成取负）：
  *   Win32 WM_MOUSEWHEEL 的 delta/120 > 0 = 滚轮向远离用户方向 = 向上滚（看更早的内容）。
  *   scrollable 内部 `reverseDirection` 对 verticalScroll/LazyColumn 默认是 true，
@@ -162,11 +167,15 @@ internal fun ComposeScene.dispatchWindowsMouseWheelEvent(
     inputState: WindowsInputState,
 ) {
     val shiftPressed = event.isShiftPressed || inputState.modifiers.isShiftPressed
-    val horizontalWheel = event.deltaX != 0
+    val horizontalWheel = event.deltaX != 0f
+    // delta 是**浮点**的「格」：触控板/自由滚轮的 WM_MOUSEWHEEL zDelta 不一定被 120 整除
+    // （40/80/17…），宿主换算出来就是 0.333 这种值。这里原样透传给 Compose 的
+    // `MouseWheelScrollingLogic`（它和 `DesktopScrollable.desktop.kt` 全程按 Float 处理，
+    // 上游 AWT 用的就是 `getPreciseWheelRotation(): Double`）——**不要**取整、不要乘系数。
     val scrollDelta = when {
-        horizontalWheel -> Offset(event.deltaX.toFloat(), 0f)
-        shiftPressed -> Offset(event.deltaY.toFloat(), 0f)
-        else -> Offset(0f, event.deltaY.toFloat())
+        horizontalWheel -> Offset(event.deltaX, 0f)
+        shiftPressed -> Offset(event.deltaY, 0f)
+        else -> Offset(0f, event.deltaY)
     }
 
     sendPointerEvent(

@@ -3021,3 +3021,107 @@ SELFTEST: RESULT FAIL (51 checks, 2 failures)       ← 其余 49 条全绿
 所以它们是「真的走过 wndproc」的、不依赖程序自述的外部证据。同时新增滚轮诊断日志
 `wheel: 竖直|横向 delta=<原始 delta> pos=x,y`（原始 delta，不折算成「格」——触控板/精确
 滚轮送来的是任意小数倍 `WHEEL_DELTA`，折算会掩盖问题）。
+
+### 17.32 触摸板 / 精确滚轮：把一个 zDelta 用整数除法除以 120，等于把细粒度滚动全丢掉（v0.5.14）
+
+#### 根因
+
+宿主把 `WM_MOUSEWHEEL` 的原始 `zDelta` 换算成 Compose 的「格」时用的是**整数除法**：
+
+```kotlin
+// WindowsComposeWindow.translateAndDispatch（旧代码）
+deltaX = if (raw.b == 1) raw.a / 120 else 0,
+deltaY = if (raw.b == 1) 0 else raw.a / 120,
+```
+
+Win32 只保证「一个带刻度的滚轮一格 = `WHEEL_DELTA` = 120」。`zDelta` 本身**不是**保证的
+120 倍数 —— 微软文档要求应用不要假设它是；触控板 / 自由滚轮会送 40、80、17 这种值。
+40 / 120 在整数除法下 = **0**，于是：
+
+* 慢速滑动：一串 `zDelta = ±40` 全部变成 0 → **完全不动**；
+* 快速滑动：只有凑够 120 的那些事件生效 → **一顿一顿**。
+
+#### 上游对齐点（为什么修成浮点）
+
+上游 Compose Desktop 收的是 AWT 的 `MouseWheelEvent.getPreciseWheelRotation(): Double`，
+`ComposeSceneMediator.desktop.kt: onMouseWheelEvent()` **直接**把它当 `scrollDelta`：
+
+```kotlin
+scrollDelta = if (event.isShiftDown) Offset(event.preciseWheelRotation.toFloat(), 0f)
+              else                    Offset(0f, event.preciseWheelRotation.toFloat())
+```
+
+而 `MouseWheelScrollingLogic` / `DesktopScrollable.desktop.kt` 全程按 **Float** 处理
+（`WindowsWinUIConfig.calculateMouseWheelScroll`：`scrollDelta * (bounds/20) * -scrollAmount`）。
+所以「浮点的格」才是上游的数据模型；整数除法是我们自己引入的偏差。
+
+顺带记两条上游行为，避免以后被"优化"掉：
+
+* `DesktopScrollable.desktop.kt` 的 `isPreciseWheelRotation` 在 **Windows 上故意返回
+  false**（注释原文：“On Windows, even free scrolling wheels should trigger animation”）
+  —— 也就是说 Windows 上滚轮是**带动画**的，我们保持默认（不设 precise）就与上游一致。
+* `MouseWheelScrollingLogic` 会丢掉 **< 0.5px** 的滚动量（`isLowScrollingDelta`），
+  并按 `channel.sumOrNull()` 把同一批挂起事件先求和再应用 —— 所以「每格 1/3、连发三发」
+  这种序列是能被推起来的（自检里就是这么测的）。
+
+#### 改法
+
+`WindowsEvent.MouseWheelEvent.deltaX/deltaY` 从 `Int` 改成 `Float`，
+换算改成 `raw.a / WIN32_WHEEL_DELTA.toFloat()`（`WIN32_WHEEL_DELTA = 120`，定义在
+`WindowsEvent.kt`）。mapper 那边只是把 `Offset(event.deltaX, 0f)` 的 `.toFloat()` 去掉
+（本来就是 Float），符号约定、Shift 换轴、横向换轴**一个字节没动**。
+`wheel:` 诊断日志继续打**原始 zDelta**（不折算），因为它就是拿来判断"这台设备到底送了什么"
+的。
+
+#### 为什么**不**加 `WM_GESTURE`
+
+这一条要写清楚，免得以后重复讨论：**上游 Windows/desktop 没有这条路径**。AWT 不会把
+`WM_GESTURE` 交给应用（触控板的双指滚动是系统驱动转成 `WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL`
+之后才到窗口的），`PointerEventType.PanMove` / `TrackpadScrollingLogic` 是给会自己发 pan
+事件的宿主准备的（`AbstractScrollableNode` 只在收到 `PanStart/PanMove/PanEnd` 时才创建它），
+桌面 AWT 从不发。按本仓库「对齐上游、不手搓」的原则，这里只把**系统真的送到窗口**的数据
+（zDelta）走通，不自己造一条手势通道。
+
+真机上的判断依据已经有了：v0.5.13 加的 `wheel: 竖直|横向 delta=<原始 delta>` 日志。
+如果那台机器的触控板日志里全是 `±120`，说明驱动根本没给细粒度数据，**那时候再**考虑
+`WM_POINTER`（`PT_TOUCHPAD`）或 `WM_GESTURE`；如果出现 40/80 这类值，本版的浮点通道就够了。
+
+#### 测试
+
+| 层 | 断言 | 内容 |
+| --- | --- | --- |
+| logic | `interaction/precise-wheel-delta-not-truncated` | 1/3 格必须原样到达 Compose 指针层（钉住 mapper 的浮点契约） |
+| logic | `interaction/precise-wheel-scrolls-list` | 连发 6 × 1/3 格（= 2 格）必须真的推动竖向列表 |
+| window | `window/winmsg-precise-wheel-scrolls` | **真实** `WM_MOUSEWHEEL` zDelta=-40 ×3（= 1 格）必须推动列表 |
+| 脚本 | `win32msg: 真实精确滚轮（zDelta=-40）` | 宿主日志里必须出现 `wheel: 竖直 delta=-40`（只有 C++ 分支会打） |
+
+注意 logic 两条**不能**替代 window 那条：那个整数除法 bug 长在
+`WindowsComposeWindow.translateAndDispatch`（C 侧事件 -> Kotlin 事件的换算）里，
+离屏逻辑阶段是自己构造浮点事件、根本不经过那段代码 —— 这也是为什么先红后绿必须在
+window 阶段取。
+
+#### 先红后绿
+
+把换算退回整数除法（类型仍是 Float，只是先整除再转），重新链接后跑 `--only=window`：
+
+```
+SELFTEST ok   : window/winmsg-wheel-scrolls          ← zDelta=-120（正好一格）整数除法也算得对，
+                                                        所以这条**看不见**这个 bug
+SELFTEST FAIL : window/winmsg-precise-wheel-scrolls — 3 × zDelta=-40（正好 1 格）
+                之后滚动值 24 -> 24（整数除法把 40/120 截断成 0 时值不变）
+SELFTEST: RESULT FAIL (52 checks, 1 failures)
+```
+
+同一个变异版本跑 `--only=logic` 是 **118 全绿** —— 这就是"logic 那两条替代不了 window 那条"
+的实测证据（离屏阶段自己构造浮点事件，根本不经过那段换算代码）。
+
+顺带一个有教育意义的细节：变异版本下脚本的
+`win32msg: 真实精确滚轮（zDelta=-40）` 仍然是 **PASS** —— 因为那条只证明"原始 delta 到了
+wndproc"（日志行照打），**换算**是否正确只能由行为断言（`winmsg-precise-wheel-scrolls`）
+抓。两类外部证据互补，缺一不可。
+
+#### 验证
+
+* logic **118**（+2）/ window **52**（+1）（合计 **170**）、`all` **167** —— 全绿；
+* 外部阶段：`win32msg` 8 条（+1）+ `input` 5 条 + `screenshot` 4 条全绿；
+* 打包单文件 exe（无 `icudtl.dat`）干净目录复测。

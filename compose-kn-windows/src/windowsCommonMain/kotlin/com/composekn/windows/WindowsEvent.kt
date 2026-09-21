@@ -1,6 +1,15 @@
 package com.composekn.windows
 
 /**
+ * Win32 的 `WHEEL_DELTA`：一个带刻度滚轮的**一格**。
+ *
+ * 换算出 Compose 的「格」时要除以它 —— 而且必须用**浮点**除法，因为
+ * `WM_MOUSEWHEEL` 的 `zDelta` 不保证是它的整数倍（见
+ * [WindowsEvent.MouseWheelEvent] 的说明）。
+ */
+const val WIN32_WHEEL_DELTA = 120
+
+/**
  * Represents a Windows platform event.
  */
 sealed class WindowsEvent {
@@ -50,12 +59,25 @@ sealed class WindowsEvent {
 
     /**
      * Mouse wheel event.
+     *
+     * `deltaX`/`deltaY` 的单位是**「格」（= 1/120 个 WHEEL_DELTA）**，而且必须是**浮点**：
+     *
+     * Win32 的 `WM_MOUSEWHEEL` 只保证「一个带刻度的滚轮一格 = 120」，`zDelta` 本身可以是
+     * **任意整数**（微软文档明确要求应用不要假设它是 120 的倍数）—— 触控板 / 自由滚轮会送来
+     * 40、80、17 这种值。这里跟上游 Compose Desktop 的数据模型对齐：上游用的是 AWT 的
+     * `MouseWheelEvent.getPreciseWheelRotation(): Double`，也就是「格」的浮点值
+     * （`ComposeSceneMediator.desktop.kt: onMouseWheelEvent()` 直接把它塞进 `scrollDelta`，
+     * 而 `MouseWheelScrollingLogic` / `DesktopScrollable.desktop.kt` 全程按 Float 处理）。
+     *
+     * 所以这里**不能**是 Int：以前宿主做的是 `rawDelta / 120` 的**整数除法**，
+     * 一格以内的增量（40/80/…）会被截断成 0 —— 触控板「慢速完全不动、快滑一顿一顿」
+     * 就是这么来的（HANDOVER §17.32）。0.333 格是合法输入。
      */
     data class MouseWheelEvent(
         val x: Int,
         val y: Int,
-        val deltaX: Int,
-        val deltaY: Int,
+        val deltaX: Float,
+        val deltaY: Float,
         val isShiftPressed: Boolean = false,
         val isCtrlPressed: Boolean = false,
         val isAltPressed: Boolean = false,

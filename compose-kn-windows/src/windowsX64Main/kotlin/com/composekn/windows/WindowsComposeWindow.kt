@@ -261,8 +261,14 @@ class WindowsComposeWindow(
                         y = raw.y.toInt(),
                         // raw.b == 1 表示来自 WM_MOUSEHWHEEL（横向滚轮 / 触控板横滑）；
                         // 纵向和横向都按「一格 = 120」换算成 Compose 的滚轮单位。
-                        deltaX = if (raw.b == 1) raw.a / 120 else 0,
-                        deltaY = if (raw.b == 1) 0 else raw.a / 120,
+                        //
+                        // ⚠ 必须用**浮点除法**（120f）：zDelta 不保证是 120 的倍数，
+                        // 触控板/自由滚轮会送来 40/80/17 这种值，整数除法会把它截断成 0
+                        // —— 表现就是触控板「慢速完全不动、快滑一顿一顿」（HANDOVER §17.32）。
+                        // 上游对齐点：AWT 的 `getPreciseWheelRotation()` 是 Double，
+                        // 上游直接把它当 scrollDelta 用，全程 Float。
+                        deltaX = if (raw.b == 1) raw.a / WIN32_WHEEL_DELTA.toFloat() else 0f,
+                        deltaY = if (raw.b == 1) 0f else raw.a / WIN32_WHEEL_DELTA.toFloat(),
                         isShiftPressed = raw.modifiers and MOD_SHIFT != 0u,
                         isCtrlPressed = raw.modifiers and MOD_CTRL != 0u,
                         isAltPressed = raw.modifiers and MOD_ALT != 0u,

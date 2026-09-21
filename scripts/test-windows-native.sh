@@ -230,6 +230,9 @@ if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
     check_log_line "真实鼠标按下" "mouse: 左键 DOWN pos="
     check_log_line "真实鼠标抬起" "mouse: 左键 UP pos="
     check_log_line "真实竖向滚轮" "wheel: 竖直 delta=-120"
+    # 触控板/自由滚轮的 zDelta 不是 120 的倍数 —— 宿主必须原样收到、原样换算成
+    # 浮点「格」（40/120），不能整数除法截断成 0（HANDOVER §17.32）。
+    check_log_line "真实精确滚轮（zDelta=-40）" "wheel: 竖直 delta=-40"
     check_log_line "真实横向滚轮" "wheel: 横向 delta=-120"
     check_log_line "真实按键按下" "key: DOWN vk=0x5A"
     check_log_line "真实按键抬起" "key: UP vk=0x5A"

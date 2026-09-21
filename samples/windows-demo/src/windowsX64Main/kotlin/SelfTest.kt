@@ -942,13 +942,13 @@ private fun renderChecks(report: SelfTestReport) {
     //   (3) 反证：**普通竖直滚轮不动它**（上游语义如此 —— 它会落到外层竖直滚动条上）。
     val probeWheelX = ((TIME_PROBE_X_DP + 20) * d).toInt()
     val probeWheelY = contentTop + ((TIME_PROBE_Y_DP + 20) * d).toInt()
-    wheelEvent(app, probeWheelX, probeWheelY, deltaY = 3)
+    wheelEvent(app, probeWheelX, probeWheelY, deltaY = 3f)
     driver.render(800, 600, density = d, frames = 2)
     val plainDelta = probe.lastScrollDelta
-    wheelEvent(app, probeWheelX, probeWheelY, deltaY = -3, shift = true)
+    wheelEvent(app, probeWheelX, probeWheelY, deltaY = -3f, shift = true)
     driver.render(800, 600, density = d, frames = 2)
     val shiftDelta = probe.lastScrollDelta
-    wheelEvent(app, probeWheelX, probeWheelY, deltaX = -3)
+    wheelEvent(app, probeWheelX, probeWheelY, deltaX = -3f)
     driver.render(800, 600, density = d, frames = 2)
     val horizontalDelta = probe.lastScrollDelta
     report.check(
@@ -958,6 +958,38 @@ private fun renderChecks(report: SelfTestReport) {
             horizontalDelta == Offset(-3f, 0f),
         "竖直=$plainDelta（期望 (0,3)）、Shift+竖直=$shiftDelta（期望 (-3,0) —— 把竖直 delta" +
             "原符号搬到横向轴上，对齐上游）、横向=$horizontalDelta（期望 (-3,0)）",
+    )
+
+    // 2.6a2 精确滚轮 / 触控板：**一格以内**的 delta 必须原样到达滚动逻辑（HANDOVER §17.32）。
+    //
+    // Win32 只保证「带刻度滚轮一格 = 120」，`WM_MOUSEWHEEL` 的 zDelta 本身可以是**任意
+    // 整数**（触控板 / 自由滚轮会送 40、80、17…；微软文档明确要求应用不要假设它是 120 的
+    // 倍数）。宿主以前用 `raw.a / 120` 的**整数除法**换算，40/120 直接变 0 ——
+    // 表现就是触控板「慢速完全不动、快滑一顿一顿」。
+    //
+    // 上游的数据模型是浮点的「格」：AWT 的 `MouseWheelEvent.getPreciseWheelRotation()` 是
+    // Double，`ComposeSceneMediator.desktop.kt: onMouseWheelEvent()` 直接把它塞进
+    // `scrollDelta`，而 `MouseWheelScrollingLogic` / `DesktopScrollable.desktop.kt` 全程 Float。
+    // 这里钉两件事：
+    //   (1) 1/3 格必须**原样**到达 Compose 指针层（不被取整）；
+    //   (2) 端到端：连发几发 1/3 格必须真的把竖向列表推动（旧行为是纹丝不动）。
+    val thirdOfNotch = 1f / 3f   // = zDelta 40 / WHEEL_DELTA 120
+    wheelEvent(app, probeWheelX, probeWheelY, deltaY = -thirdOfNotch)
+    driver.render(800, 600, density = d, frames = 2)
+    report.check(
+        "interaction/precise-wheel-delta-not-truncated",
+        probe.lastScrollDelta == Offset(0f, -thirdOfNotch),
+        "1/3 格 -> Compose 指针层看到 ${probe.lastScrollDelta}（期望 (0, -0.3333…)）——" +
+            "取整成 0 就是触控板「滚不动」的根因",
+    )
+    val beforePrecise = scrollState.value
+    repeat(6) { wheelEvent(app, 400, 540, deltaY = -thirdOfNotch) }
+    driver.render(800, 600, density = d, frames = 8)
+    report.check(
+        "interaction/precise-wheel-scrolls-list",
+        scrollState.value > beforePrecise,
+        "6 × 1/3 格（= 2 格）之后 value ${beforePrecise} -> ${scrollState.value}" +
+            "（期望变大；整数除法时这 6 发全是 0）",
     )
 
     // 鼠标滚轮的滚动是**带缓动**的（MouseWheelScrollingLogic 的 threshold + tween），
@@ -983,7 +1015,7 @@ private fun renderChecks(report: SelfTestReport) {
     //     同一个符号搬到横向轴上就是"往列表起点翻"。所以 **Shift+滚轮向下（deltaY<0）
     //     ⇒ 向右滚（看后面的内容）** —— 和 Windows 上其它程序的 Shift+滚轮一致。
     //     （起点 0 时只有"向末端"能动，所以这条同时把方向也钉住了。）
-    wheelEvent(app, hx, hy, deltaY = -3, shift = true)
+    wheelEvent(app, hx, hy, deltaY = -3f, shift = true)
     val afterShift = settleHorizontal()
     report.check(
         "interaction/shift-wheel-scrolls-horizontal-list",
@@ -993,7 +1025,7 @@ private fun renderChecks(report: SelfTestReport) {
     )
     // (3) 反证：普通竖直滚轮**不动**横向列表（此时值非 0，所以"错误映射成横向"的两种符号
     //     都会被这条抓到，不是空断言）。
-    wheelEvent(app, hx, hy, deltaY = -3)
+    wheelEvent(app, hx, hy, deltaY = -3f)
     val afterPlain = settleHorizontal()
     report.check(
         "interaction/plain-wheel-ignores-horizontal-list",
@@ -1008,7 +1040,7 @@ private fun renderChecks(report: SelfTestReport) {
     // （`ComposeSceneMediator` 只有 Shift 改写这一条路），所以 tilt 轮的正负号没有上游
     // 依据可比；而 Windows 文档只说"正 = 向右倾斜"，没说应该往哪滚。留一条"能滚"
     // 的断言在这里，方向等真机 tilt 轮实测（HANDOVER §17.30 有记录）。
-    wheelEvent(app, hx, hy, deltaX = -3)
+    wheelEvent(app, hx, hy, deltaX = -3f)
     val afterHorizontal = settleHorizontal()
     report.check(
         "interaction/horizontal-wheel-scrolls-horizontal-list",
@@ -1910,6 +1942,7 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
     var msgScroll0 = 0
     var msgHScroll0 = 0
     var msgText0 = ""
+    var msgPreciseWheelBase = 0
 
     // 交互阶段由 frameHook **显式**请求下一帧。
     //
@@ -2364,6 +2397,28 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
         }
         if (frame == 106) {
             report.checkEquals("window/winmsg-key-char-inserts-text", "${msgText0}z", probe.text)
+            // 精确滚轮（触控板 / 自由滚轮）：WM_MOUSEWHEEL 的 zDelta **不保证**是 120 的
+            // 倍数，40 是常见值。这一段必须走**真实消息** —— 整数除法那个 bug 就长在
+            // WindowsComposeWindow.translateAndDispatch 里，从 Kotlin 侧合成事件绕不过去
+            // （HANDOVER §17.32）。
+            msgPreciseWheelBase = scrollState.value
+            repeat(3) {
+                postRealMouse(
+                    app, Win32Message.MOUSEWHEEL, 450f,
+                    app.window.logicalHeight - CHROME_DP - 60f,
+                    wheelDelta = -40,
+                )
+            }
+        }
+        if (frame == 108) {
+            report.check(
+                "window/winmsg-precise-wheel-scrolls",
+                scrollState.value > msgPreciseWheelBase,
+                "3 × zDelta=-40（正好 1 格）之后滚动值 ${msgPreciseWheelBase} -> ${scrollState.value}" +
+                    "（整数除法把 40/120 截断成 0 时值不变）",
+            )
+        }
+        if (frame == 110) {
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。
             driveFrames = false
@@ -2710,7 +2765,7 @@ private fun avgLuminanceInRow(a: FrameSnapshot, y: Int, x0: Int, x1: Int): Int {
 
 private fun wheel(app: WindowsComposeApplication, x: Int, y: Int, deltaY: Int) {
     app.dispatchEvent(
-        WindowsEvent.MouseWheelEvent(x = x, y = y, deltaX = 0, deltaY = deltaY),
+        WindowsEvent.MouseWheelEvent(x = x, y = y, deltaX = 0f, deltaY = deltaY.toFloat()),
     )
     app.pumpDispatchers()
 }
@@ -2720,13 +2775,17 @@ private fun wheel(app: WindowsComposeApplication, x: Int, y: Int, deltaY: Int) {
  *
  * `shift = true` 时模拟「按住 Shift 滚滚轮」—— 宿主必须把它翻写成横向 delta
  * （对齐上游 `ComposeSceneMediator.desktop.kt: onMouseWheelEvent`，HANDOVER §17.30）。
+ *
+ * `deltaX`/`deltaY` 是**浮点**的「格」（1 格 = `WIN32_WHEEL_DELTA` = 120）：
+ * 触控板/自由滚轮送来的 zDelta 不保证是 120 的倍数，换算后就是 0.333 这种值
+ * （HANDOVER §17.32）。
  */
 private fun wheelEvent(
     app: WindowsComposeApplication,
     x: Int,
     y: Int,
-    deltaX: Int = 0,
-    deltaY: Int = 0,
+    deltaX: Float = 0f,
+    deltaY: Float = 0f,
     shift: Boolean = false,
 ) {
     app.dispatchEvent(
