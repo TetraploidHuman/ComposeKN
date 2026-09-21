@@ -335,6 +335,29 @@ class WindowsComposeWindow(
                     win.imePopText()   // 这条不带文本，但仍然配对弹一个（FIFO 约定）
                     onEvent(WindowsEvent.ImeReconvertSelectEvent(start = raw.a, end = raw.b))
                 }
+                // 拖放：C 侧的 IDropTarget 把每个回调推成一条事件，负载（文件/文本）
+                // 放在和 IME 一样**严格 1:1 的 FIFO**里 —— 所以这里必须**每个** phase
+                // 都各弹一次（有负载弹负载，没有也弹一个空的），否则后面的事件会整体
+                // 错位一格。
+                Win32Event.DRAG_ENTER, Win32Event.DRAG_OVER,
+                Win32Event.DRAG_LEAVE, Win32Event.DRAG_DROP -> {
+                    val files = win.dragPopFiles()
+                    val text = win.dragPopText().takeIf { it.isNotEmpty() }
+                    onEvent(
+                        WindowsEvent.DragEvent(
+                            phase = when (raw.type) {
+                                Win32Event.DRAG_ENTER -> DragPhase.Enter
+                                Win32Event.DRAG_OVER -> DragPhase.Over
+                                Win32Event.DRAG_LEAVE -> DragPhase.Leave
+                                else -> DragPhase.Drop
+                            },
+                            x = raw.x.toInt(),
+                            y = raw.y.toInt(),
+                            files = files,
+                            text = text,
+                        )
+                    )
+                }
                 Win32Event.SIZE -> onEvent(WindowsEvent.ResizeEvent(width = raw.a, height = raw.b))
                 Win32Event.MOVE -> onEvent(WindowsEvent.MoveEvent(x = raw.x.toInt(), y = raw.y.toInt()))
                 Win32Event.CLOSE -> onEvent(WindowsEvent.CloseEvent)
@@ -434,6 +457,28 @@ class WindowsComposeWindow(
     /** 自检用：合成一条 `IMR_CONFIRMRECONVERTSTRING`；true = 我们接受了这次重转换。 */
     fun imeTestConfirmReconvert(text: String, targetOffset: Int, targetLen: Int): Boolean =
         win32Window?.imeTestConfirmReconvert(text, targetOffset, targetLen) ?: false
+
+    /** 拖放目标注册成功没有（OleInitialize/RegisterDragDrop 失败时为 false）。 */
+    val oleAvailable: Boolean get() = win32Window?.oleAvailable ?: false
+
+    /** 最近一次回给 OLE 的 effect（`Win32Message.DROPEFFECT_NONE/COPY`）。 */
+    val lastDropEffect: Int get() = win32Window?.lastDropEffect ?: 0
+
+    /**
+     * 把 Compose 对当前拖放位置的判定写回宿主（OLE 的 *pdwEffect）。
+     *
+     * 见 [Win32Window.setDropAccept] 的说明：IDropTarget::DragEnter 必须同步回答，
+     * 所以是「ENTER 先乐观接受，Kotlin 判定完纠正后面的 OVER/DROP」。
+     */
+    fun setDropAccept(accept: Boolean): Boolean = win32Window?.setDropAccept(accept) ?: false
+
+    /**
+     * 自检用：直接驱动注册好的 OLE IDropTarget（构造一个真的 IDataObject）。
+     *
+     * phase: 0=DragEnter 1=DragOver 2=DragLeave 3=Drop；kind: 0=文件 1=文本。
+     */
+    fun testSimulateDrag(phase: Int, x: Int, y: Int, kind: Int): Boolean =
+        win32Window?.testSimulateDrag(phase, x, y, kind) ?: false
 
     /**
      * 自检用：把一条**真实的 Win32 鼠标消息** PostMessage 到窗口自己的消息队列。

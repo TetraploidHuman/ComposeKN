@@ -31,6 +31,7 @@ vendor/compose-core.local/
 | 新增 `linuxX64Main` actual | 39 | K/N linuxX64 后端实现（foundation 24、ui 8、ui-text 3、material3 2、ui-util 1、animation-core 1） |
 | 新增 `skikoMain` actual | 1 | `ui-text/.../platform/Dispatcher.skiko.kt`（`FontCacheManagementDispatcher` = `SkikoDispatchers.Main`） |
 | 修改上游 src | 7 | 见 `patches/`：`Dispatchers.Main`→`SkikoDispatchers.Main`、expect 可见性、`ClipMetadata.PlainText`、去 `@PublishedApi`、删 web 测试 |
+| 实现 overlay 占位实现 | 1 | `ui/.../draganddrop/DragAndDrop.linux.kt`：原来是上游原样的 stub（`TODO("Not yet implemented")` + 两个空类），现在 `DragAndDropEvent` 带 `files`/`text`/`positionInWindow` 负载 + `forPlatformDrop(...)` 工厂（宿主在别的模块里，读不到 internal 构造函数）；由 skiko 的 Win32 `IDropTarget` 驱动（HANDOVER §17.33） |
 | 修复 overlay 占位实现 | 1 | `foundation/.../LinuxScrollable.linux.kt`：原来 `calculateMouseWheelScroll` 返回 `Offset.Zero`，导致 K/N 原生后端（Linux **和** mingw 复用同一源集）完全不能滚轮滚动；现在按平台换算（HANDOVER §14.4） |
 | ui-backhandler 替换 | 10 | 来自发布 sources jar（无 `kotlin/` 目录层级），jbMain 改为 `LocalCompatNavigationEventDispatcherOwner` 以兼容 navigationevent 1.1.1 |
 | lifecycle-viewmodel-compose | 2 | 整模块冻结（androidx lifecycle MPP 的 2 个源文件） |

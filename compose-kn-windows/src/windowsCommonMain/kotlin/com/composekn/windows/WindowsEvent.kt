@@ -12,6 +12,21 @@ const val WIN32_WHEEL_DELTA = 120
 /**
  * Represents a Windows platform event.
  */
+/** 拖放事件的阶段（对应 OLE IDropTarget 的四个回调）。 */
+enum class DragPhase {
+    /** 拖放对象进入窗口（`IDropTarget::DragEnter`）。 */
+    Enter,
+
+    /** 在窗口内移动（`IDropTarget::DragOver`）。 */
+    Over,
+
+    /** 离开窗口（`IDropTarget::DragLeave`）。 */
+    Leave,
+
+    /** 在窗口内放下（`IDropTarget::Drop`）。 */
+    Drop,
+}
+
 sealed class WindowsEvent {
     /**
      * Keyboard event.
@@ -55,6 +70,26 @@ sealed class WindowsEvent {
         val isShiftPressed: Boolean = false,
         val isCtrlPressed: Boolean = false,
         val isAltPressed: Boolean = false,
+    ) : WindowsEvent()
+
+    /**
+     * 拖放事件（接收侧）。
+     *
+     * 上游对齐点：desktop 的 `AwtDragAndDropManager` 收到 AWT 的 DropTarget 回调后，
+     * 构造 `DragAndDropEvent` 并调用 `ComposeSceneDragAndDropNode` 的
+     * acceptDragAndDropTransfer / onStarted / onEntered / onMoved / onExited / onDrop /
+     * onEnded —— 我们这边是同一个 root 节点、同一套调用顺序，只是事件来源换成
+     * Win32 的 OLE `IDropTarget`（见 HANDOVER §17.33）。
+     *
+     * 负载（[files]/[text]）跟着事件一起带过来；只有 OLE 的 CF_HDROP /
+     * CF_UNICODETEXT 两种格式，其它格式（图片等）还没接。
+     */
+    data class DragEvent(
+        val phase: DragPhase,
+        val x: Int,
+        val y: Int,
+        val files: List<String>,
+        val text: String?,
     ) : WindowsEvent()
 
     /**

@@ -3125,3 +3125,133 @@ wndproc"（日志行照打），**换算**是否正确只能由行为断言（`w
 * logic **118**（+2）/ window **52**（+1）（合计 **170**）、`all` **167** —— 全绿；
 * 外部阶段：`win32msg` 8 条（+1）+ `input` 5 条 + `screenshot` 4 条全绿；
 * 打包单文件 exe（无 `icudtl.dat`）干净目录复测。
+
+### 17.33 OLE 拖放（接收侧）：让 `Modifier.dragAndDropTarget` 在 Windows 上真的收到文件/文本（v0.5.15）
+
+#### 之前的状态：不是"有 bug"，而是整条路都没接
+
+* `compose-core` 共享 native actual（`vendor/compose-core.local/overlay/ui/src/linuxX64Main/.../draganddrop/DragAndDrop.linux.kt`）
+  是**上游原样的 stub**：`TODO("Not yet implemented")` + 两个空类；
+* skiko 侧的 Win32 宿主连 `RegisterDragDrop` 都没调。
+
+结果：从资源管理器拖一个文件到窗口上，窗口完全没反应 —— 而这是桌面应用的基本功能。
+
+#### 照抄的是什么（上游架构）
+
+* 宿主的入口是 `ComposeScene.rootDragAndDropNode`（`ComposeSceneDragAndDropNode`，skikoMain）：
+  `acceptDragAndDropTransfer / onStarted / onEntered / onMoved / onExited / onDrop / onEnded`。
+* AWT 的实现（`AwtDragAndDropManager.desktop.kt` + `ComposeSceneMediator`）在 root component 上装
+  `java.awt.dnd.DropTarget`（AWT 内部就是 OLE），然后在 `DropTargetListener` 的回调里按上面的顺序调这个
+  root 节点。
+* 我们只把第 1 步换成自己实现的 `IDropTarget`，第 2 步**一模一样**（同一个 root 节点、同一套调用顺序）
+  —— 所以应用侧的 `Modifier.dragAndDropTarget` / `DragAndDropTarget` 一个字节都不用改。
+
+#### 实现
+
+C++（`win32_window.cc` / `win32_bridge.h`）：
+
+* 建窗口时 `OleInitialize(nullptr)` + `RegisterDragDrop(hwnd, ComposeKNDropTarget)`；
+  销毁时先 `RevokeDragDrop` 再 `DestroyWindow`，然后 `Release` + `OleUninitialize`。
+* `ComposeKNDropTarget`：手写 COM vtable（不引 ATL），实现
+  `DragEnter/DragOver/DragLeave/Drop`；
+  * `DragEnter` 解析 `CF_HDROP`（`DragQueryFileW` → `'\n'` 分隔的 UTF-8 路径）
+    与 `CF_UNICODETEXT`（UTF-8）；
+  * `POINTL` 是**屏幕**坐标 → `ScreenToClient` → 和别的鼠标事件同一套客户区坐标；
+  * 事件进既有的 C 侧事件队列（新事件类型 19..22），负载进一条**与事件严格 1:1 的 FIFO**
+    （和 IME 一个约定：Kotlin 每条事件都要各弹一次）。
+* 诊断日志：`drag: ENTER|OVER|DROP|LEAVE pos=x,y files=N textLen=M`（带第一条路径）。
+
+Kotlin / overlay：
+
+* `Win32Native`：事件常量、`dragPopFiles()` / `dragPopText()`、`setDropAccept()`、
+  `lastDropEffect`、`testSimulateDrag()`。
+* `WindowsEvent.DragEvent` + `DragPhase`；`WindowsComposeWindow.translateAndDispatch` 把 4 种事件
+  翻成它（并弹负载）；`WindowsInputMapper.dispatchWindowsDragEvent` 按上游顺序调 root 节点。
+* overlay：`DragAndDropEvent` 从空 stub 变成真有负载（`files` / `text` / `positionInWindow`
+  + 公开工厂 `forPlatformDrop(...)`），`positionInRoot` 如实返回。
+
+#### 一处**已知差异**（写清楚，免得以后被当成 bug）
+
+`IDropTarget::DragEnter` 必须**同步**回答 `*pdwEffect`，而那一刻 Kotlin 还没机会跑
+（OLE 是在消息循环内部直接调我们的 COM 方法；AWT 因为监听器在 EDT 上同步回调，所以它能当场问
+Compose 并 `rejectDrag()`）。我们的策略：
+
+1. `DragEnter`：只要负载里有文件/文本就**乐观接受**（回 `DROPEFFECT_COPY`），事件照常推给 Kotlin；
+2. Kotlin 判定完（`acceptDragAndDropTransfer`）用 `setDropAccept(...)` 回写；
+3. 之后的 `DragOver` / `Drop` 用这个标志回答 effect。
+
+用户可见差别只有一个：**如果这次拖放没有任何 `dragAndDropTarget` 接受，第一次 DragEnter 的瞬间
+光标会短暂显示「可放下」**（一次 DragOver 之后就变成「禁止」）。自检里的
+`window/winmsg-drag-effect-writeback` 钉的就是这条写回链 —— 没有它，「光标永远显示可放下」这种
+bug 在自动化里是看不见的。
+
+#### 自检（11 条 window/winmsg-drag-*）
+
+| 断言 | 内容 |
+| --- | --- |
+| `drag-ole-available` | `OleInitialize` + `RegisterDragDrop` 成功 |
+| `drag-enter-accept-and-payload` | Enter 只走 accept：`onStarted` 到了目标、`CF_HDROP` 解出的两条路径原样到达，**另一个** target（shouldStartDragAndDrop 返回 false）一个事件都没收到 |
+| `drag-enter-accepts` | OLE effect = COPY |
+| `drag-over-enters-target` | DragOver → 命中测试 → `onEntered` + `onMoved` |
+| `drag-position-in-root` | `positionInRoot` = 我们传进去的客户区坐标（命中测试靠它） |
+| `drag-drop-delivers-files` | Drop 到达目标，路径仍然是那两条 |
+| `drag-drop-effect-copy` | Drop 的 effect = COPY（这次操作被接受） |
+| `drag-effect-writeback` | Kotlin 判定 false 之后，宿主回 NONE |
+| `drag-text-accepted` | 文本拖放路由到「只收文本」的框，文件框不受影响 |
+| `drag-text-enters-target` | 文本会话的 Over → onEntered/onMoved |
+| `drag-leave-ends-session` | DragLeave → onExited + onEnded，effect 归 NONE |
+
+脚本侧另有 4 条**外部证据**（只查 C++ 才会打的日志行）：
+`drag: ENTER pos=475,392 files=2`、`第一个=C:\composekn\drop-test-1.txt`、
+`drag: ENTER pos=475,462 files=0 textLen=28`、`drag: LEAVE`。
+
+覆盖边界（诚实版）：`composekn_win32_test_simulate_drag` 构造的是一个**真的 `IDataObject`**
+（最小 COM 实现）并交给注册好的 `IDropTarget`，所以 COM vtable、`FORMATETC`/`TYMED` 解析、
+`CF_HDROP`（`DROPFILES` 头 + 双 NUL 宽字符路径表）、事件/负载 FIFO、Kotlin 派发、Compose 的
+命中测试与回调全都在覆盖内。**没覆盖**的只有「OLE 的模态拖放循环会不会把真实拖放调到这里」
+（Wine/Xvfb 里没有 shell 拖放源，做不了真拖）—— 这一条留给真机验证。
+
+#### 断言先红后绿（第一次跑就是红的）
+
+第一版断言按「Enter 就该收到 `onEntered`」写，跑出来 4 条红：
+
+```
+SELFTEST FAIL : window/winmsg-drag-enter-delivers-files — 文件探针 starts=1 enters=0 files=[C:\composekn\drop-test-1.txt, ...]
+SELFTEST FAIL : window/winmsg-drag-text-routes-to-text-target — 文本探针 starts=1 text=ComposeKN 拖放测试文本 ... enters=0
+SELFTEST FAIL : window/winmsg-drag-drop-ends-session — 放下之后 effect=1（期望 NONE）
+SELFTEST FAIL : window/winmsg-drag-leave-ends-session — exits=0 ends=1 effect=1
+```
+
+两个根因都是**上游语义**（不是实现 bug），改断言而不是改代码：
+
+1. `onEntered` / `onExited` 是 `DragAndDropNode.onMoved`（也就是 DragOver）做**命中测试**时由
+   `dispatchEntered` 补发的 —— 光有 Enter 不会到达子节点；所以断言必须分帧、按真实回调顺序。
+2. Drop 的 effect **就是这次操作的结果**（接受了就是 COPY），不是「会话是否结束」；
+   会话状态要看后续 DragOver 的 effect。
+
+#### fail-before（变异：负载解析没实现）
+
+把 `extractDropPayload()` 改成直接 `return false`（模拟「IDropTarget 注册了、但负载解析没实现」）
+重新链接后跑 `--only=window`：
+
+```
+SELFTEST FAIL : window/winmsg-drag-enter-accept-and-payload — 文件探针 starts=0 enters=0 files=[]
+SELFTEST FAIL : window/winmsg-drag-enter-accepts — OLE effect=0（期望 COPY=1）
+SELFTEST FAIL : window/winmsg-drag-over-enters-target — enters=0 moves=0 effect=0
+SELFTEST FAIL : window/winmsg-drag-position-in-root — positionInRoot=Offset(0.0, 0.0)
+SELFTEST FAIL : window/winmsg-drag-drop-delivers-files — drops=0 ends=0 files=[]
+SELFTEST FAIL : window/winmsg-drag-drop-effect-copy — 放下之后 effect=0
+SELFTEST FAIL : window/winmsg-drag-text-accepted — starts=0
+SELFTEST FAIL : window/winmsg-drag-text-enters-target — enters=0 moves=0
+SELFTEST FAIL : window/winmsg-drag-leave-ends-session — exits=0 ends=0 effect=0
+SELFTEST: RESULT FAIL (63 checks, 9 failures)
+```
+
+11 条里 9 条变红；剩下的 2 条（`drag-ole-available`、`drag-effect-writeback`）恰好是**不依赖负载**
+的那两条 —— 也就是说这组断言确实钉在"负载解析 + 路由"上，而不是在测空转。
+
+#### 验证
+
+* logic **118** / window **63**（+11）（合计 **181**）、`all` —— 见发布说明；
+* 外部阶段：`win32msg` **11** 条（+4）+ `input` 5 条 + `screenshot` 4 条全绿；
+* 打包单文件 exe（无 `icudtl.dat`）干净目录复测。

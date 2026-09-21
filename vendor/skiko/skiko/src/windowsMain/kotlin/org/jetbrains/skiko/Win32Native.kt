@@ -198,6 +198,10 @@ object Win32Message {
 
     /** WM_MOUSEWHEEL 的「一格」；delta 可以是它的小数倍（精确触控板）。 */
     const val WHEEL_DELTA = 120
+
+    /** IDropTarget 往 *pdwEffect 里回的值（Windows 约定）。 */
+    const val DROPEFFECT_NONE = 0
+    const val DROPEFFECT_COPY = 1
 }
 
 @SymbolName("composekn_win32_post_test_mouse")
@@ -207,6 +211,38 @@ internal external fun composekn_win32_post_test_mouse(
     x: Int,
     y: Int,
     wheelDelta: Int,
+): Boolean
+
+@SymbolName("composekn_win32_last_drop_effect")
+internal external fun composekn_win32_last_drop_effect(window: COpaquePointer?): Int
+
+@SymbolName("composekn_win32_ole_available")
+internal external fun composekn_win32_ole_available(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_set_drop_accept")
+internal external fun composekn_win32_set_drop_accept(window: COpaquePointer?, accept: Boolean): Boolean
+
+@SymbolName("composekn_win32_drag_pop_files")
+internal external fun composekn_win32_drag_pop_files(
+    window: COpaquePointer?,
+    buffer: CPointer<ByteVar>,
+    bufferSize: Int,
+): Int
+
+@SymbolName("composekn_win32_drag_pop_text")
+internal external fun composekn_win32_drag_pop_text(
+    window: COpaquePointer?,
+    buffer: CPointer<ByteVar>,
+    bufferSize: Int,
+): Int
+
+@SymbolName("composekn_win32_test_simulate_drag")
+internal external fun composekn_win32_test_simulate_drag(
+    window: COpaquePointer?,
+    phase: Int,
+    x: Int,
+    y: Int,
+    kind: Int,
 ): Boolean
 
 @SymbolName("composekn_win32_post_test_key")
@@ -486,10 +522,62 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
         if (isRepeat) 1 else 0,
     )
 
+    // ---- OLE 拖放（接收侧）----
+
+    /** 拖放目标注册成功没有（OleInitialize/RegisterDragDrop 失败时为 false）。 */
+    val oleAvailable: Boolean get() = composekn_win32_ole_available(native)
+
+    /** 最近一次回给 OLE 的 effect（`DROPEFFECT_NONE` / `DROPEFFECT_COPY`）。 */
+    val lastDropEffect: Int get() = composekn_win32_last_drop_effect(native)
+
+    /**
+     * 把 Compose 侧的判定写回宿主：true = 当前位置有控件愿意接收（OLE 的 effect 回
+     * DROPEFFECT_COPY，光标显示「可放下」）。
+     *
+     * IDropTarget::DragEnter 必须**同步**回答，而那时 Kotlin 还没跑；所以规则是
+     * 「ENTER 先乐观接受，Kotlin 判定完用这条纠正后面的 OVER/DROP」。
+     */
+    fun setDropAccept(accept: Boolean): Boolean = composekn_win32_set_drop_accept(native, accept)
+
+    /**
+     * 弹出与最近一条 drag 事件配对的文件列表（UTF-8，'
+' 分隔）。
+     *
+     * 和 IME 文本一样是**严格 1:1 的 FIFO**：每收到一条 DRAG_* 事件都要调用它一次和
+     * [dragPopText] 一次（没有负载时返回空列表/空串），否则后面的事件会整体错位。
+     */
+    fun dragPopFiles(): List<String> {
+        val joined = dragPopString { buffer, size -> composekn_win32_drag_pop_files(native, buffer, size) }
+        return if (joined.isEmpty()) emptyList() else joined.split('\n').filter { it.isNotEmpty() }
+    }
+
+    /** 弹出与最近一条 drag 事件配对的文本（没有则空串）。 */
+    fun dragPopText(): String =
+        dragPopString { buffer, size -> composekn_win32_drag_pop_text(native, buffer, size) }
+
+    private inline fun dragPopString(pop: (CPointer<ByteVar>, Int) -> Int): String = memScoped {
+        val buffer = allocArray<ByteVar>(DRAG_PAYLOAD_BUFFER_SIZE)
+        val length = pop(buffer, DRAG_PAYLOAD_BUFFER_SIZE)
+        if (length <= 0) "" else StringBytesDecoding(buffer, length)
+    }
+
+    /**
+     * 自检用：直接驱动注册好的 IDropTarget（构造一个真的 IDataObject 交给它）。
+     *
+     * phase: 0=DragEnter 1=DragOver 2=DragLeave 3=Drop；kind: 0=文件 1=文本。
+     * (x, y) 是客户区坐标。覆盖的是我们自己的 COM vtable + 负载解析 + 事件队列 +
+     * Compose 的 dragAndDropTarget；没覆盖的只有「OLE 的模态拖放循环会不会调到这里」。
+     */
+    fun testSimulateDrag(phase: Int, x: Int, y: Int, kind: Int): Boolean =
+        composekn_win32_test_simulate_drag(native, phase, x, y, kind)
+
     override fun close() {
         composekn_win32_destroy(native)
     }
 }
+
+/** 拖放负载缓冲区大小（一次拖进来的路径列表/文本长度上限）。 */
+private const val DRAG_PAYLOAD_BUFFER_SIZE = 8192
 
 @SymbolName("composekn_win32_begin_move")
 internal external fun composekn_win32_begin_move(window: COpaquePointer?)
@@ -765,6 +853,16 @@ data class Win32Event(
          * 文档坐标）。收到后要先把这段原文本选中，随后的组字才会替换它。
          */
         const val IME_RECONVERT_SELECT = 18
+
+        /*
+         * OLE 拖放（接收侧）。事件不带负载：路径/文本要用 [Win32Window.dragPopFiles] /
+         * [Win32Window.dragPopText] 逐条弹（与事件严格 1:1，和 IME 一个约定）。
+         * x/y = 客户区物理像素（DRAG_LEAVE 是 -1,-1）。
+         */
+        const val DRAG_ENTER = 19
+        const val DRAG_OVER = 20
+        const val DRAG_LEAVE = 21
+        const val DRAG_DROP = 22
     }
 }
 

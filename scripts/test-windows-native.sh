@@ -236,6 +236,12 @@ if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
     check_log_line "真实横向滚轮" "wheel: 横向 delta=-120"
     check_log_line "真实按键按下" "key: DOWN vk=0x5A"
     check_log_line "真实按键抬起" "key: UP vk=0x5A"
+    # OLE 拖放：C 侧的 IDropTarget 真的被调到、并且真的从 IDataObject 里解出了负载
+    # （文件名只有 CF_HDROP/FORMATETC 解码对了才会出现在日志里）。
+    check_log_line "拖放进入（文件）" "drag: ENTER pos=475,392 files=2"
+    check_log_line "拖放放下（文件路径）" "第一个=C:\\composekn\\drop-test-1.txt"
+    check_log_line "拖放文本" "drag: ENTER pos=475,462 files=0 textLen=28"
+    check_log_line "拖放离开" "drag: LEAVE"
     # 反证：真实鼠标消息**不该**顺带产生触摸事件（v0.5.11 的「笔悬停变手指」
     # 就是触摸通道串了）。window 阶段全程没有真触摸，所以一条都不该有。
     TOUCH_LINES="$(grep -c '^.*touch: ' "$STARTUP_LOG" 2>/dev/null || true)"

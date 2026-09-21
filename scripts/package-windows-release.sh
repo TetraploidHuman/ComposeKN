@@ -86,6 +86,11 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · 想看空闲行为：ComposeKN-Windows-Native.exe --no-animate（关掉每帧动画）
   · 想强制后端：set COMPOSEKN_RENDER_API=software（或 gl）——日志里会写明实际用了哪条
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
+  · 拖放（接收侧）：从资源管理器拖文件、或从别的应用拖文本到窗口上，
+    `Modifier.dragAndDropTarget` 会收到 onStarted/onEntered/onMoved/onDrop/onEnded。
+    走的是真正的 OLE `IDropTarget`（和 AWT 同一条路），负载格式 CF_HDROP / CF_UNICODETEXT。
+    读负载：`event.files`（路径列表）/ `event.text`（文本）/ `event.positionInWindow`。
+    诊断日志：`drag: ENTER|OVER|DROP|LEAVE pos=x,y files=N textLen=M`。
   · 触摸板 / 精确滚轮：Win32 的 WM_MOUSEWHEEL `zDelta` **不保证**是 120 的倍数
     （触控板常送 40/80 这种值），宿主按上游 Compose Desktop 的模型换算成**浮点**的
     「格」（zDelta / 120），不再被整数除法截断成 0 —— 想确认自己设备的触控板送了什么，
@@ -105,8 +110,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (170 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (167 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (181 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (178 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -130,9 +135,13 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            GetMessage -> TranslateMessage -> DispatchMessage -> 真实 wndproc 分支：
            悬停进出、按压/点击、竖向与横向滚轮、精确滚轮 zDelta=-40、真实点击聚焦文本框、
            真实按键输入字符都必须成立）、
+           **OLE 拖放（接收侧）**：真的 IDropTarget（OleInitialize + RegisterDragDrop）
+           解析 CF_HDROP / CF_UNICODETEXT，按上游 ComposeSceneDragAndDropNode 的顺序
+           派发给 Modifier.dragAndDropTarget（Enter/Over/Drop/Leave、负载、命中位置、
+           effect 写回、shouldStartDragAndDrop 的筛选）、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
-           动画按刷新率节流）（52 条）
-  all    = 两者都跑（167 条断言）
+           动画按刷新率节流）（63 条）
+  all    = 两者都跑（178 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个
@@ -140,7 +149,7 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            真实的帧率/CPU 数据请单独跑 `window`。
 
 外部验证（`scripts/test-windows-native.sh`，不依赖程序自述）：
-  1. 宿主日志断言 —— 从 composekn-startup.log 里确认 `mouse:` / `wheel:` / `key:` 行
+  1. 宿主日志断言 —— 从 composekn-startup.log 里确认 `mouse:` / `wheel:` / `key:` / `drag:` 行
      真的出现过（这些行**只有 C++ wndproc 分支会打印**），并确认鼠标消息没有串进
      触摸通道（`touch:` 行为 0）。光看 Kotlin 侧 PASS 无法排除“断言改成不经过宿主也能过”。
   2. xdotool 真实注入 —— 往 X 服务器打真的鼠标/键盘事件，走
@@ -175,6 +184,9 @@ skiko 的指针输入层只在指针类型是鼠标时才合成 Enter/Exit 事�
                        一根按住的手指送进 Compose（点击被吞、单指被当双指），
                         现在只记一行、不派发
   mouse: 左键 DOWN/UP  鼠标按键（以前完全不进日志，所以"点击来源不明"时无从判断）
+  drag: ENTER/OVER/DROP/LEAVE pos=x,y files=N textLen=M
+                        OLE 拖放（接收侧）：文件数/文本长度；文件路径只记第一条，
+                        全文在事件里（应用侧读 event.files）
   wheel: 竖直/横向 delta=…  滚轮原始 delta（不折算成"格"）。触控板/精确滚轮送来的是
                         任意小数倍 WHEEL_DELTA，"滚不动/一顿一顿"时先看这个值
   key: DOWN vk=0x..    键盘事件（prevDown=1 表示系统自动重复）—— Compose 的 clickable 在 Enter/Space

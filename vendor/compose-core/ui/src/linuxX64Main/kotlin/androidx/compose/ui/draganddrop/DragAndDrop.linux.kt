@@ -19,19 +19,67 @@ package androidx.compose.ui.draganddrop
 import androidx.compose.ui.geometry.Offset
 
 /**
- * A representation of an event sent by the platform during a drag and drop operation.
+ * 拖放传输的数据（**发起侧**：应用自己往外拖）。
+ *
+ * ComposeKN 原生后端目前只实现了**接收侧**（Windows 上是 OLE 的 IDropTarget，
+ * 见 HANDOVER §17.33），所以这里先保留结构：`Modifier.dragAndDropSource` 走
+ * `DragAndDropManager.requestDragAndDropTransfer`（平台默认实现会抛
+ * UnsupportedOperationException / 或者根本不要求应用发起），不影响接收侧。
  */
-actual class DragAndDropEvent private constructor()
+actual class DragAndDropTransferData internal constructor()
+
+/**
+ * 一次拖放会话里由**平台**送进来的事件（接收侧）。
+ *
+ * 上游的对应物：desktop 的 `DragAndDropEvent(dropTargetEvent)` 里裹着 AWT 的
+ * `DropTargetEvent`/`Transferable`，iOS 的裹着 `DropSessionContext`。负载怎么读是
+ * **平台决定**的（上游也是平台扩展：`event.awtEventOrNull`、iOS 的 `session`），
+ * 所以这里给的是 ComposeKN 原生的访问器 [files] / [text]，以及 [positionInWindow]。
+ *
+ * 构造者是宿主（`compose-kn-windows` 的拖放派发）：`DragAndDropEvent.forPlatformDrop(...)`。
+ */
+actual class DragAndDropEvent internal constructor(
+    internal val position: Offset,
+    private val paths: List<String>,
+    private val textValue: String?,
+) {
+    /**
+     * 本次拖放带来的**文件路径**（Windows 上是 OLE 的 `CF_HDROP`）。
+     *
+     * 空列表表示这次拖放没有文件（比如只是拖一段文本）。
+     */
+    val files: List<String> get() = paths
+
+    /** 本次拖放带来的**文本**（Windows 上是 `CF_UNICODETEXT`）；没有则为 null。 */
+    val text: String? get() = textValue
+
+    /**
+     * 事件位置（相对 Compose 根节点的像素坐标）。
+     *
+     * expect 里的 `positionInRoot` 是 internal 的（只有 compose-core 内部用），
+     * 这个公开访问器是给应用/宿主看的。
+     */
+    val positionInWindow: Offset get() = position
+
+    companion object {
+        /**
+         * ComposeKN 扩展：宿主构造一个**入站**拖放事件。
+         *
+         * 为什么需要它：`DragAndDropEvent` 的构造函数是 internal（和上游一致 ——
+         * 事件只能由平台层创建），而宿主在另一个 Gradle 模块里，读不到 internal。
+         * 所以由这里提供一个公开工厂，宿主只负责填负载和坐标。
+         */
+        fun forPlatformDrop(
+            position: Offset,
+            files: List<String> = emptyList(),
+            text: String? = null,
+        ): DragAndDropEvent = DragAndDropEvent(position, files, text)
+    }
+}
 
 /**
  * Returns the position of this [DragAndDropEvent] relative to the root Compose View in the
  * layout hierarchy.
  */
 internal actual val DragAndDropEvent.positionInRoot: Offset
-    get() = TODO("Not yet implemented")
-
-/**
- * Definition for a type representing transferable data. It could be a remote URI,
- * rich text data on the clip board, a local file, or more.
- */
-actual class DragAndDropTransferData private constructor()
+    get() = position

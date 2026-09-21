@@ -9,9 +9,17 @@
 // IME（IMM32）：我们的文本框是 Compose 自绘的，不是系统 EDIT 控件，所以组字/
 // 候选窗的位置和文本都得宿主自己从 IMM32 取回来（对照 AWT 的 awt_Component.cpp）。
 #include <imm.h>
+// OLE 拖放（IDropTarget）：窗口要注册成拖放目标，接收资源管理器/其它应用拖进来的
+// 文件（CF_HDROP）和文本（CF_UNICODETEXT）。对照 AWT 的 DropTarget（AWT 内部也是
+// 走 OLE，见 java.awt.dnd 的 Windows 实现）。
+#include <ole2.h>
+#include <oleidl.h>
+#include <shellapi.h>
+#include <shlobj.h>
 // 上游的 SkLoadICU()（从 exe 同目录 mmap icudtl.dat）被 win32_icu.cc 里的同名版本
 // 覆盖；这里显式引用它，保证链接器把**我们那份**从归档里拉进来。
 #include "SkLoadICU.h"
+#include <algorithm>
 #include <cstdarg>
 #include <string>
 #include <cstdio>
@@ -194,6 +202,29 @@ struct ComposeKNWin32Window {
     // 光标形状（0=箭头 1=手 2=文本I型 3=十字），由 Compose 的 PointerIcon 驱动。
     int cursorKind = 0;
 
+    // ---- OLE 拖放（接收侧）----
+    //
+    // 注册给 RegisterDragDrop 的 IDropTarget（引用计数由它自己管）。
+    IDropTarget* dropTarget = nullptr;
+    bool oleInitialized = false;
+    // Kotlin 侧（Compose 的 dragAndDropTarget）对**当前位置**的判定：true = 有控件
+    // 愿意接收，OLE 的 *pdwEffect 就回 DROPEFFECT_COPY，光标显示「可放下」。
+    //
+    // 为什么要这个标志：DragEnter 必须在**同步**返回里给出 effect，而那会儿 Kotlin
+    // 还没跑（OLE 是在消息循环内部直接调我们的 COM 方法）。AWT 的 DropTargetListener
+    // 能同步问 Compose（它的事件在 EDT 上同步回调），我们做不到 —— 于是第一帧先
+    // 乐观接受（有文件/文本就回 COPY），Kotlin 处理完事件后用这个标志纠正后续
+    // DragOver/Drop 的 effect。用户可见差别：光标最多晚一次 DragOver 才变成「禁止」。
+    bool dropAccepted = false;
+    // 最近一次回给 OLE 的 effect（自检断言「Compose 拒绝时宿主有没有把光标改成禁止」用）。
+    DWORD lastDropEffect = DROPEFFECT_NONE;
+    // 本次拖放会话的负载（ENTER 时解析一次），以及和 drag 事件严格 1:1 的 FIFO。
+    std::string dragSessionFiles;   // '\n' 分隔的 UTF-8 路径
+    std::string dragSessionText;    // UTF-8 文本
+    std::vector<std::string> dragFiles;
+    std::vector<std::string> dragTexts;
+    int dragLogCount = 0;
+
     // ---- IME（IMM32）状态 ----
     // 与 IME 事件一一配对、FIFO 的 UTF-8 文本（事件结构体只有 int32 字段，塞不下字符串）。
     std::vector<std::string> imeTexts;
@@ -253,6 +284,13 @@ static uint32_t queryCurrentModifiers() {
 static void pushEvent(ComposeKNWin32Window* window, const ComposeKNWin32Event& event) {
     window->events.push_back(event);
 }
+
+/**
+ * OLE 拖放目标（IDropTarget）太长了，定义在文件末尾；这里只前向声明。
+ * 注意必须是**文件作用域**的 static（不能声明在匿名 namespace 里再在匿名
+ * namespace 里定义 —— 那两个是不同的实体）。
+ */
+static void composeknInstallDropTarget(ComposeKNWin32Window* window);
 
 /**
  * 滚轮诊断日志。
@@ -1967,6 +2005,9 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
     }
     composeknLog("composekn_win32_create: hwnd=%p ok", (void*)window->hwnd);
 
+    // OLE 拖放：注册成拖放目标（资源管理器拖文件进来、从别的应用拖文本进来）。
+    composeknInstallDropTarget(window);
+
     // 注意：**不要**在窗口刚建好时用 GetDpiForWindow/WM_DPICHANGED 去"校正"尺寸 ——
     // 这时窗口还没真正落到显示器上，dpiScaleOf(window) 会返回 1.0，于是把刚算好的
     // 2 倍缩放又抹掉（真机日志：dp=1100x760 -> px=2200x1520，紧接着又"校正"回 1100x760）。
@@ -2001,7 +2042,20 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
 extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
     if (window == nullptr) return;
     if (window->hwnd != nullptr && IsWindow(window->hwnd)) {
+        // 先摘掉拖放目标再拆窗口：OLE 侧还握着一个指针（RevokeDragDrop 是唯一
+        // 合法的注销点，必须在 DestroyWindow 之前）。
+        if (window->dropTarget != nullptr) {
+            RevokeDragDrop(window->hwnd);
+        }
         DestroyWindow(window->hwnd);
+    }
+    if (window->dropTarget != nullptr) {
+        window->dropTarget->Release();
+        window->dropTarget = nullptr;
+    }
+    if (window->oleInitialized) {
+        OleUninitialize();
+        window->oleInitialized = false;
     }
     delete window;
 }
@@ -2596,4 +2650,415 @@ extern "C" bool composekn_win32_post_test_key(
             break;
     }
     return PostMessageW(window->hwnd, message, wparam, lparam) != FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// OLE 拖放（接收侧）
+//
+// 目标（对照上游）：让 Compose 的 `Modifier.dragAndDropTarget` 在 Windows 上收到
+// 资源管理器拖进来的文件（CF_HDROP）和文本（CF_UNICODETEXT）。
+//
+// 上游的 AWT 实现（ComposeSceneMediator + AwtDragAndDropManager）做的是：
+//   1) 在 root component 上装 java.awt.dnd.DropTarget（AWT 内部就是 OLE
+//      RegisterDragDrop）；
+//   2) DropTargetListener 回调里构造 DragAndDropEvent，调用
+//      ComposeSceneDragAndDropNode 的 acceptDragAndDropTransfer / onStarted /
+//      onEntered / onMoved / onExited / onDrop / onEnded。
+// 我们这里把第 1 步换成自己实现的 IDropTarget，第 2 步完全一样（Kotlin 侧调用
+// 同一个 rootDragAndDropNode）。所以事件语义、回调顺序、accept 的判定都与上游一致。
+//
+// 与 AWT 的一处**已知差异**（写下来免得以后当成 bug）：AWT 的 DropTargetListener
+// 是在 EDT 上**同步**回调的，所以它能在 DragEnter 里立刻问 Compose 并决定
+// accept/reject；我们的 DragEnter 是在 OLE 的消息循环内部被调的，那时 Kotlin 正在
+// 消息循环里睡着，没法同步问。于是策略是：
+//   * DragEnter：只要负载里有文件/文本就乐观接受（回 DROPEFFECT_COPY），
+//     事件照常推给 Kotlin；
+//   * Kotlin 判定完（acceptDragAndDropTransfer）会调 set_drop_accept 回写；
+//   * 之后的 DragOver / Drop 用这个标志回答 effect（光标最迟在一次 DragOver 后
+//     就会变成「禁止放下」）。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/** 宽字符 -> UTF-8（失败返回空串）。 */
+static std::string wideToUtf8(const wchar_t* wide) {
+    if (wide == nullptr) return std::string();
+    const int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return std::string();
+    // 注意：cchWideChar = -1 时转换结果**包含**结尾 NUL，所以缓冲区要 len 字节，
+    // 之后再砍掉那一个字节。
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), len, nullptr, nullptr);
+    out.resize(static_cast<size_t>(len - 1));
+    return out;
+}
+
+/** 从 IDataObject 里取出 CF_HDROP（文件列表）与 CF_UNICODETEXT（文本）。 */
+static bool extractDropPayload(IDataObject* data, std::string& files, std::string& text) {
+    if (data == nullptr) return false;
+    bool any = false;
+    STGMEDIUM medium = {};
+    FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    if (data->GetData(&fmt, &medium) == S_OK) {
+        HDROP drop = static_cast<HDROP>(GlobalLock(medium.hGlobal));
+        if (drop != nullptr) {
+            const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < count; ++i) {
+                const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+                std::vector<wchar_t> buf(static_cast<size_t>(len) + 1, L'\0');
+                if (DragQueryFileW(drop, i, buf.data(), len + 1) > 0) {
+                    if (!files.empty()) files.push_back('\n');
+                    files += wideToUtf8(buf.data());
+                    any = true;
+                }
+            }
+            GlobalUnlock(medium.hGlobal);
+        }
+        ReleaseStgMedium(&medium);
+    }
+    medium = {};
+    fmt.cfFormat = CF_UNICODETEXT;
+    if (data->GetData(&fmt, &medium) == S_OK) {
+        wchar_t* wide = static_cast<wchar_t*>(GlobalLock(medium.hGlobal));
+        if (wide != nullptr) {
+            text = wideToUtf8(wide);
+            any = true;
+            GlobalUnlock(medium.hGlobal);
+        }
+        ReleaseStgMedium(&medium);
+    }
+    return any;
+}
+
+/** POINTL（屏幕坐标）-> 客户区坐标（float，和其它鼠标事件同一套坐标）。 */
+static void dropPointToClient(ComposeKNWin32Window* window, POINTL pt, float* outX, float* outY) {
+    POINT p = { pt.x, pt.y };
+    if (window != nullptr && window->hwnd != nullptr) ScreenToClient(window->hwnd, &p);
+    if (outX != nullptr) *outX = static_cast<float>(p.x);
+    if (outY != nullptr) *outY = static_cast<float>(p.y);
+}
+
+/**
+ * 推一条 drag 事件，并**同步**压入这一条的负载（与事件严格 1:1，Kotlin 侧每条事件
+ * 都要弹一次，和 IME 的约定一样）。
+ */
+static void pushDragEvent(
+    ComposeKNWin32Window* window,
+    int32_t type,
+    float x,
+    float y,
+    const std::string& files,
+    const std::string& text
+) {
+    if (window == nullptr) return;
+    ComposeKNWin32Event e{};
+    e.type = type;
+    e.x = x;
+    e.y = y;
+    e.modifiers = queryCurrentModifiers();
+    pushEvent(window, e);
+    window->dragFiles.push_back(files);
+    window->dragTexts.push_back(text);
+    if (window->dragLogCount < 300) {
+        ++window->dragLogCount;
+        const int fileCount = files.empty() ? 0 : static_cast<int>(std::count(files.begin(), files.end(), '\n')) + 1;
+        composeknLog(
+            "%s pos=%.0f,%.0f files=%d textLen=%d%s",
+            type == COMPOSEKN_WIN32_EVENT_DRAG_ENTER ? "drag: ENTER"
+            : type == COMPOSEKN_WIN32_EVENT_DRAG_OVER ? "drag: OVER"
+            : type == COMPOSEKN_WIN32_EVENT_DRAG_DROP ? "drag: DROP" : "drag: LEAVE",
+            x, y, fileCount, static_cast<int>(text.size()),
+            files.empty() ? "" : (" 第一个=" + files.substr(0, files.find('\n'))).c_str()
+        );
+    }
+}
+
+class ComposeKNDropTarget final : public IDropTarget {
+public:
+    explicit ComposeKNDropTarget(ComposeKNWin32Window* window) : window_(window) {}
+
+    // ---- IUnknown ----
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *ppv = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&refCount_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG count = InterlockedDecrement(&refCount_);
+        if (count == 0) delete this;
+        return static_cast<ULONG>(count);
+    }
+
+    // ---- IDropTarget ----
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD keys, POINTL pt, DWORD* effect) override {
+        window_->dragSessionFiles.clear();
+        window_->dragSessionText.clear();
+        extractDropPayload(data, window_->dragSessionFiles, window_->dragSessionText);
+        const bool supported = !window_->dragSessionFiles.empty() || !window_->dragSessionText.empty();
+        window_->dropAccepted = supported;   // 乐观接受，Kotlin 随后会纠正
+        float x = 0.f, y = 0.f;
+        dropPointToClient(window_, pt, &x, &y);
+        pushDragEvent(window_, COMPOSEKN_WIN32_EVENT_DRAG_ENTER, x, y,
+                      window_->dragSessionFiles, window_->dragSessionText);
+        if (effect != nullptr) {
+            *effect = supported ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            window_->lastDropEffect = *effect;
+        }
+        (void)keys;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD keys, POINTL pt, DWORD* effect) override {
+        float x = 0.f, y = 0.f;
+        dropPointToClient(window_, pt, &x, &y);
+        pushDragEvent(window_, COMPOSEKN_WIN32_EVENT_DRAG_OVER, x, y,
+                      window_->dragSessionFiles, window_->dragSessionText);
+        if (effect != nullptr) {
+            *effect = window_->dropAccepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            window_->lastDropEffect = *effect;
+        }
+        (void)keys;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        pushDragEvent(window_, COMPOSEKN_WIN32_EVENT_DRAG_LEAVE, -1.f, -1.f, std::string(), std::string());
+        window_->dragSessionFiles.clear();
+        window_->dragSessionText.clear();
+        window_->dropAccepted = false;
+        window_->lastDropEffect = DROPEFFECT_NONE;   // 拖放已离开，光标不再显示「可放下」
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL pt, DWORD* effect) override {
+        // Drop 会重新给一次 data object：以它为准（有的实现 DragEnter 之后才准备好数据）。
+        std::string files;
+        std::string text;
+        if (!extractDropPayload(data, files, text)) {
+            files = window_->dragSessionFiles;
+            text = window_->dragSessionText;
+        }
+        float x = 0.f, y = 0.f;
+        dropPointToClient(window_, pt, &x, &y);
+        pushDragEvent(window_, COMPOSEKN_WIN32_EVENT_DRAG_DROP, x, y, files, text);
+        const bool accepted = window_->dropAccepted;
+        window_->dragSessionFiles.clear();
+        window_->dragSessionText.clear();
+        window_->dropAccepted = false;
+        if (effect != nullptr) {
+            *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            window_->lastDropEffect = *effect;
+        }
+        (void)keys;
+        return S_OK;
+    }
+
+private:
+    ~ComposeKNDropTarget() = default;
+    ComposeKNWin32Window* window_ = nullptr;
+    LONG refCount_ = 1;
+};
+
+// ---------------------------------------------------------------------------
+// 自检用的最小 IDataObject
+//
+// 为什么需要它：Wine/Xvfb 里没法真的从资源管理器拖一个文件进来（没有 shell 拖放
+// 源），但**我们自己这一侧**的代码（COM vtable、FORMATETC 解析、CF_HDROP 解码、
+// 事件队列、Kotlin 派发、Compose 的 dragAndDropTarget）全都必须能被自动化测到。
+// 于是这里构造一个**真的 IDataObject**（不是伪造指针），把它交给注册好的
+// IDropTarget —— 只有「OLE 的模态拖放循环会不会把消息送到这里」这一点没覆盖到。
+// ---------------------------------------------------------------------------
+class ComposeKNTestDataObject final : public IDataObject {
+public:
+    /** kind: 0 = CF_HDROP（两个固定路径），1 = CF_UNICODETEXT。 */
+    explicit ComposeKNTestDataObject(int32_t kind) : kind_(kind) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) {
+            *ppv = static_cast<IDataObject*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&refCount_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG count = InterlockedDecrement(&refCount_);
+        if (count == 0) delete this;
+        return static_cast<ULONG>(count);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* fmt, STGMEDIUM* medium) override {
+        if (fmt == nullptr || medium == nullptr) return E_INVALIDARG;
+        if (!supports(fmt->cfFormat)) return DV_E_FORMATETC;
+        HGLOBAL global = nullptr;
+        if (kind_ == 0) {
+            // DROPFILES 头 + 宽字符**双 NUL 结尾**的路径列表（资源管理器放进 CF_HDROP
+            // 的就是这个布局）。用 sizeof 算长度，免得手数字符个数（错一个就少一个 NUL）。
+            static const wchar_t kPaths[] =
+                L"C:\\composekn\\drop-test-1.txt\0"
+                L"C:\\composekn\\drop-test-2.txt\0";
+            const SIZE_T bytes = sizeof(DROPFILES) + sizeof(kPaths);
+            global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+            if (global == nullptr) return E_OUTOFMEMORY;
+            DROPFILES* df = static_cast<DROPFILES*>(GlobalLock(global));
+            if (df == nullptr) { GlobalFree(global); return E_OUTOFMEMORY; }
+            df->pFiles = sizeof(DROPFILES);
+            df->fWide = TRUE;
+            std::memcpy(reinterpret_cast<char*>(df) + sizeof(DROPFILES), kPaths, sizeof(kPaths));
+            GlobalUnlock(global);
+        } else {
+            static const wchar_t kText[] = L"ComposeKN 拖放测试文本";
+            global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(kText));
+            if (global == nullptr) return E_OUTOFMEMORY;
+            wchar_t* dst = static_cast<wchar_t*>(GlobalLock(global));
+            if (dst == nullptr) { GlobalFree(global); return E_OUTOFMEMORY; }
+            std::memcpy(dst, kText, sizeof(kText));
+            GlobalUnlock(global);
+        }
+        medium->tymed = TYMED_HGLOBAL;
+        medium->hGlobal = global;
+        medium->pUnkForRelease = nullptr;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* fmt) override {
+        if (fmt == nullptr) return E_INVALIDARG;
+        return supports(fmt->cfFormat) ? S_OK : DV_E_FORMATETC;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
+        if (out != nullptr) out->ptd = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD, IEnumFORMATETC** out) override {
+        if (out != nullptr) *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA** out) override {
+        if (out != nullptr) *out = nullptr;
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+
+private:
+    bool supports(CLIPFORMAT format) const {
+        return kind_ == 0 ? format == CF_HDROP : format == CF_UNICODETEXT;
+    }
+    ~ComposeKNTestDataObject() = default;
+    LONG refCount_ = 1;
+    int32_t kind_ = 0;
+};
+
+/**
+ * 建 OLE 拖放目标并注册到窗口。OleInitialize 走 STA（和 AWT 一样）；已经在别的
+ * 模式初始化过（RPC_E_CHANGED_MODE）时不当致命错误 —— 只是拖放不可用，应用照常跑。
+ */
+static void composeknInstallDropTarget(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    const HRESULT oleHr = OleInitialize(nullptr);
+    if (!SUCCEEDED(oleHr) && oleHr != S_FALSE) {
+        composeknLog("drag: OleInitialize 失败 hr=0x%08lX（拖放不可用）", (unsigned long)oleHr);
+        return;
+    }
+    window->oleInitialized = true;
+    window->dropTarget = new ComposeKNDropTarget(window);
+    const HRESULT regHr = RegisterDragDrop(window->hwnd, window->dropTarget);
+    if (FAILED(regHr)) {
+        composeknLog("drag: RegisterDragDrop 失败 hr=0x%08lX（拖放不可用）", (unsigned long)regHr);
+        window->dropTarget->Release();
+        window->dropTarget = nullptr;
+        return;
+    }
+    composeknLog("drag: RegisterDragDrop ok（文件/文本拖放已接收）");
+}
+
+}  // namespace
+
+extern "C" int32_t composekn_win32_last_drop_effect(ComposeKNWin32Window* window) {
+    return window == nullptr ? 0 : static_cast<int32_t>(window->lastDropEffect);
+}
+
+extern "C" bool composekn_win32_ole_available(ComposeKNWin32Window* window) {
+    return window != nullptr && window->dropTarget != nullptr;
+}
+
+extern "C" bool composekn_win32_set_drop_accept(ComposeKNWin32Window* window, bool accept) {
+    if (window == nullptr) return false;
+    window->dropAccepted = accept;
+    return true;
+}
+
+extern "C" int32_t composekn_win32_drag_pop_files(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size) {
+    if (window == nullptr || window->dragFiles.empty()) return -1;
+    std::string value = std::move(window->dragFiles.front());
+    window->dragFiles.erase(window->dragFiles.begin());
+    if (buffer == nullptr || buffer_size <= 0) return -1;
+    int32_t count = static_cast<int32_t>(value.size());
+    if (count > buffer_size - 1) count = buffer_size - 1;
+    if (count > 0) std::memcpy(buffer, value.data(), static_cast<size_t>(count));
+    buffer[count] = '\0';
+    return count;
+}
+
+extern "C" int32_t composekn_win32_drag_pop_text(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size) {
+    if (window == nullptr || window->dragTexts.empty()) return -1;
+    std::string value = std::move(window->dragTexts.front());
+    window->dragTexts.erase(window->dragTexts.begin());
+    if (buffer == nullptr || buffer_size <= 0) return -1;
+    int32_t count = static_cast<int32_t>(value.size());
+    if (count > buffer_size - 1) count = buffer_size - 1;
+    if (count > 0) std::memcpy(buffer, value.data(), static_cast<size_t>(count));
+    buffer[count] = '\0';
+    return count;
+}
+
+/**
+ * 自检用：直接驱动注册好的 IDropTarget（不经过 OLE 的模态拖放循环）。
+ *
+ * phase: 0=DragEnter 1=DragOver 2=DragLeave 3=Drop；kind: 0=文件 1=文本。
+ * (x, y) 是**客户区**坐标（内部换成屏幕坐标，和真机 OLE 的 POINTL 一致）。
+ */
+extern "C" bool composekn_win32_test_simulate_drag(
+    ComposeKNWin32Window* window, int32_t phase, int32_t x, int32_t y, int32_t kind) {
+    if (window == nullptr || window->dropTarget == nullptr) return false;
+    POINT pt = { x, y };
+    ClientToScreen(window->hwnd, &pt);
+    POINTL ptl = { pt.x, pt.y };
+    DWORD effect = DROPEFFECT_NONE;
+    if (phase == 2) {
+        window->dropTarget->DragLeave();
+        return true;
+    }
+    ComposeKNTestDataObject* data = new ComposeKNTestDataObject(kind);
+    switch (phase) {
+        case 0:
+            window->dropTarget->DragEnter(data, MK_LBUTTON, ptl, &effect);
+            break;
+        case 1:
+            window->dropTarget->DragOver(MK_LBUTTON, ptl, &effect);
+            break;
+        default:
+            window->dropTarget->Drop(data, MK_LBUTTON, ptl, &effect);
+            break;
+    }
+    data->Release();
+    return true;
 }

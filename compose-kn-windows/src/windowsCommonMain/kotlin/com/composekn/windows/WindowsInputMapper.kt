@@ -14,6 +14,7 @@ import androidx.compose.ui.input.pointer.isAltPressed
 import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.isMetaPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
+import androidx.compose.ui.draganddrop.DragAndDropEvent
 import androidx.compose.ui.scene.ComposeScene
 import com.composekn.windows.internal.*
 
@@ -129,6 +130,62 @@ internal fun ComposeScene.dispatchWindowsTouchEvent(
             "TOUCHDBG phase=${event.phase} id=${event.pointerId} t=${event.timeMillis} " +
                 "pos=${event.x},${event.y} pointers=${pointers.size} result=$result",
         )
+    }
+}
+
+/**
+ * Dispatch a Windows drag & drop event to the Compose scene, returning whether Compose
+ * **accepts** the current drop position.
+ *
+ * 与上游一一对应：`AwtDragAndDropManager`（desktopMain）收到 AWT DropTarget 的回调后就是
+ * 这么调 `ComposeSceneDragAndDropNode` 的 —— 顺序也必须一样，否则 `onEntered` 会先于
+ * `onStarted` 到达 `Modifier.dragAndDropTarget`：
+ *
+ *   DragEnter -> acceptDragAndDropTransfer(); 接受才 onStarted() + onEntered()
+ *   DragOver  -> onMoved()
+ *   DragLeave -> onExited() + onEnded()
+ *   Drop      -> onDrop() + onEnded()
+ *
+ * 返回值给宿主写回 OLE 的 `*pdwEffect`（决定拖放光标是「可放下」还是「禁止」）。
+ */
+@Suppress("DEPRECATION")
+internal fun ComposeScene.dispatchWindowsDragEvent(event: WindowsEvent.DragEvent): Boolean {
+    val root = rootDragAndDropNode
+    val dragEvent = DragAndDropEvent.forPlatformDrop(
+        position = Offset(event.x.toFloat(), event.y.toFloat()),
+        files = event.files,
+        text = event.text,
+    )
+    return when (event.phase) {
+        DragPhase.Enter -> {
+            val accepted = root.acceptDragAndDropTransfer(dragEvent)
+            if (accepted) {
+                root.onStarted(dragEvent)
+                root.onEntered(dragEvent)
+            }
+            accepted
+        }
+        DragPhase.Over -> {
+            root.onMoved(dragEvent)
+            // 上一次 onMoved/onDropTargetValidate 之后的判定：有可接收的控件就继续
+            // 显示「可放下」（上游 AWT 是在 dragOver 里回 dtde.acceptDrag(...)）。
+            root.hasEligibleDropTarget
+        }
+        DragPhase.Leave -> {
+            root.onExited(dragEvent)
+            root.onEnded(dragEvent)
+            false
+        }
+        DragPhase.Drop -> {
+            val consumed = root.onDrop(dragEvent)
+            root.onEnded(dragEvent)
+            // 会话结束，光标不再是「可放下」（消费与否由 onDrop 的返回值决定，
+            // 应用侧通过自己的状态体现）。
+            if (!consumed) {
+                winlog("drag: onDrop 没有被任何 dragAndDropTarget 消费")
+            }
+            false
+        }
     }
 }
 

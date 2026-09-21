@@ -14,6 +14,7 @@ package main
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.draganddrop.dragAndDropTarget
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -53,6 +54,8 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.draganddrop.DragAndDropEvent
+import androidx.compose.ui.draganddrop.DragAndDropTarget
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
@@ -205,6 +208,33 @@ private const val TEXT_Y_DP = 76f
 /** VK_Z（真实 WM_KEYDOWN/WM_KEYUP 用；字符本身走 WM_CHAR）。 */
 private const val VK_Z = 0x5A
 
+/**
+ * 拖放探针（两个不画像素的命中框）的位置/尺寸，单位是**内容**坐标（dp）。
+ *
+ * 一个只收文件、一个只收文本 —— 除了验证负载，也顺手验证
+ * `shouldStartDragAndDrop` 的筛选真的生效（不是「有拖放就发给所有 target」）。
+ * 位置挑在别的指针探针不覆盖的空档（菜单 x520 起、PINCH x560 起、TIME/HSCROLL
+ * 都在左边），而且**不画任何像素**，不会干扰像素断言。
+ */
+private const val DRAG_FILE_X_DP = 430
+private const val DRAG_FILE_Y_DP = 330
+private const val DRAG_TEXT_X_DP = 430
+private const val DRAG_TEXT_Y_DP = 400
+private const val DRAG_W_DP = 90
+private const val DRAG_H_DP = 60
+
+/**
+ * C 侧自检 IDataObject（`ComposeKNTestDataObject`）里固定的两条路径与文本。
+ *
+ * 两边必须一致：C 侧构造的是真的 CF_HDROP / CF_UNICODETEXT，这里断言解出来的就是这份；
+ * 对不上说明 FORMATETC/DROPFILES 解码错了（而不是"断言写错了"）。
+ */
+private val DROP_TEST_FILES = listOf(
+    "C:\\composekn\\drop-test-1.txt",
+    "C:\\composekn\\drop-test-2.txt",
+)
+private const val DROP_TEST_TEXT = "ComposeKN 拖放测试文本"
+
 class InteractionProbe {
     var clicked by mutableStateOf(false)
     var clickCount by mutableStateOf(0)
@@ -310,6 +340,12 @@ class InteractionProbe {
     /** 测试屏里那条横向滚动列表的当前位置（`horizontalScroll` 的 ScrollState.value）。 */
     var horizontalScrollValue by mutableStateOf(0)
 
+    /** 拖放探针：只收文件的框。 */
+    val dragFileProbe = DragProbe()
+
+    /** 拖放探针：只收文本的框。 */
+    val dragTextProbe = DragProbe()
+
     /** 性能自检：true 时界面进入「一直在动画」的状态（withFrameNanos 每帧 +1）。 */
     var animate by mutableStateOf(false)
 
@@ -323,6 +359,71 @@ class InteractionProbe {
 
     fun setText(text: String) {
         value = TextFieldValue(text, TextRange(text.length))
+    }
+}
+
+/**
+ * 拖放探针：记录一个 `Modifier.dragAndDropTarget` 收到的所有阶段与负载。
+ *
+ * 写的是 snapshot state（和别的探针一样）：回调发生在 UI 线程、组合之外，测试在下一帧
+ * 读它。
+ */
+class DragProbe {
+    var starts by mutableStateOf(0)
+    var enters by mutableStateOf(0)
+    var moves by mutableStateOf(0)
+    var exits by mutableStateOf(0)
+    var ends by mutableStateOf(0)
+    var drops by mutableStateOf(0)
+
+    /** `shouldStartDragAndDrop` 被问了几次（宿主 accept 判定会遍历所有 target）。 */
+    var shouldStartCalls by mutableStateOf(0)
+
+    var lastFiles by mutableStateOf(emptyList<String>())
+    var lastText by mutableStateOf<String?>(null)
+    var lastPosition by mutableStateOf(Offset.Zero)
+
+    fun record(event: DragAndDropEvent) {
+        lastFiles = event.files
+        lastText = event.text
+        lastPosition = event.positionInWindow
+    }
+
+    /** 事件总数（断言「这个框一个事件都没收到」时用）。 */
+    fun total(): Int = starts + enters + moves + exits + ends + drops
+}
+
+/** 把拖放事件记进 [probe] 的 [DragAndDropTarget] 实现。 */
+private fun dragTargetFor(probe: DragProbe) = object : DragAndDropTarget {
+    override fun onStarted(event: DragAndDropEvent) {
+        probe.starts++
+        probe.record(event)
+    }
+
+    override fun onEntered(event: DragAndDropEvent) {
+        probe.enters++
+        probe.record(event)
+    }
+
+    override fun onMoved(event: DragAndDropEvent) {
+        probe.moves++
+        probe.record(event)
+    }
+
+    override fun onExited(event: DragAndDropEvent) {
+        probe.exits++
+        probe.record(event)
+    }
+
+    override fun onEnded(event: DragAndDropEvent) {
+        probe.ends++
+        probe.record(event)
+    }
+
+    override fun onDrop(event: DragAndDropEvent): Boolean {
+        probe.drops++
+        probe.record(event)
+        return true
     }
 }
 
@@ -569,6 +670,37 @@ private fun DeterministicTestScreen(
                     )
                 }
             }
+
+            // 拖放探针 A/B：只收文件 / 只收文本。**故意不画背景**（只做命中测试），
+            // 位置挑在别的指针探针不覆盖的空档，免得干扰像素断言。
+            val dragFileTarget = remember { dragTargetFor(probe.dragFileProbe) }
+            val dragTextTarget = remember { dragTargetFor(probe.dragTextProbe) }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = DRAG_FILE_X_DP.dp, y = DRAG_FILE_Y_DP.dp)
+                    .size(DRAG_W_DP.dp, DRAG_H_DP.dp)
+                    .dragAndDropTarget(
+                        shouldStartDragAndDrop = { event ->
+                            probe.dragFileProbe.shouldStartCalls++
+                            event.files.isNotEmpty()
+                        },
+                        target = dragFileTarget,
+                    ),
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = DRAG_TEXT_X_DP.dp, y = DRAG_TEXT_Y_DP.dp)
+                    .size(DRAG_W_DP.dp, DRAG_H_DP.dp)
+                    .dragAndDropTarget(
+                        shouldStartDragAndDrop = { event ->
+                            probe.dragTextProbe.shouldStartCalls++
+                            event.text != null
+                        },
+                        target = dragTextTarget,
+                    ),
+            )
 
             // 底部滚动区（滚轮测试）。
             // ScrollState 由调用方注入：断言时直接读 `scrollState.value`，
@@ -2418,7 +2550,126 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                     "（整数除法把 40/120 截断成 0 时值不变）",
             )
         }
+        // ---- OLE 拖放（接收侧，HANDOVER §17.33）----
+        //
+        // 走的是**真实的 OLE 路径**：C 侧构造一个真的 IDataObject（CF_HDROP /
+        // CF_UNICODETEXT），交给注册到 HWND 上的 IDropTarget —— 覆盖 COM vtable、
+        // FORMATETC 解析、CF_HDROP 解码、事件/负载 FIFO、Kotlin 派发、
+        // Compose 的 Modifier.dragAndDropTarget 命中与回调。唯一没覆盖的是
+        // 「OLE 的模态拖放循环会不会调到这里」（Wine/Xvfb 里没法真拖一个文件）。
         if (frame == 110) {
+            report.check(
+                "window/winmsg-drag-ole-available",
+                app.window.oleAvailable,
+                "OleInitialize + RegisterDragDrop 必须在建窗口时就成功",
+            )
+            // 只收文件的框：位置要落在它**自己**的矩形里（onMoved/onEntered 是按
+            // positionInRoot 做命中测试的 —— 位置错一点就会发给别的框）。
+            simulateDrag(app, 0, DRAG_FILE_X_DP + DRAG_W_DP / 2, DRAG_FILE_Y_DP + DRAG_H_DP / 2, kind = 0)
+        }
+        if (frame == 112) {
+            // Enter 阶段只做 accept：`onStarted` 会到目标，`onEntered` **还不会** ——
+            // 上游把「进入」的判定放在 onMoved 里（DragAndDropNode.onMoved 做命中测试，
+            // 首次进入由 dispatchEntered 补发 onEntered + onMoved）。所以断言要按
+            // 真实的回调顺序分帧，不能指望 Enter 就把 onEntered 送来。
+            report.check(
+                "window/winmsg-drag-enter-accept-and-payload",
+                probe.dragFileProbe.starts == 1 &&
+                    probe.dragFileProbe.enters == 0 &&
+                    probe.dragFileProbe.lastFiles == DROP_TEST_FILES &&
+                    probe.dragFileProbe.lastText == null &&
+                    probe.dragTextProbe.total() == 0,
+                "文件探针 starts=${probe.dragFileProbe.starts} enters=${probe.dragFileProbe.enters} " +
+                    "files=${probe.dragFileProbe.lastFiles} text=${probe.dragFileProbe.lastText} " +
+                    "（文本探针应当一个事件都没收到：shouldStartDragAndDrop 拒了这次会话）",
+            )
+            report.check(
+                "window/winmsg-drag-enter-accepts",
+                app.window.lastDropEffect == Win32Message.DROPEFFECT_COPY,
+                "OLE effect=${app.window.lastDropEffect}（期望 COPY=${Win32Message.DROPEFFECT_COPY}）",
+            )
+            simulateDrag(app, 1, DRAG_FILE_X_DP + DRAG_W_DP / 2, DRAG_FILE_Y_DP + DRAG_H_DP / 2, kind = 0)
+        }
+        if (frame == 114) {
+            report.check(
+                "window/winmsg-drag-over-enters-target",
+                probe.dragFileProbe.enters == 1 && probe.dragFileProbe.moves >= 1 &&
+                    app.window.lastDropEffect == Win32Message.DROPEFFECT_COPY,
+                "enters=${probe.dragFileProbe.enters} moves=${probe.dragFileProbe.moves} " +
+                    "effect=${app.window.lastDropEffect}（DragOver 应当触发 dispatchEntered " +
+                    "-> onEntered + onMoved）",
+            )
+            report.check(
+                "window/winmsg-drag-position-in-root",
+                probe.dragFileProbe.lastPosition ==
+                    Offset(
+                        ((DRAG_FILE_X_DP + DRAG_W_DP / 2) * app.window.dpiScale),
+                        ((DRAG_FILE_Y_DP + DRAG_H_DP / 2 + CHROME_DP) * app.window.dpiScale),
+                    ),
+                "命中测试用的 positionInRoot=${probe.dragFileProbe.lastPosition}",
+            )
+            simulateDrag(app, 3, DRAG_FILE_X_DP + DRAG_W_DP / 2, DRAG_FILE_Y_DP + DRAG_H_DP / 2, kind = 0)
+        }
+        if (frame == 116) {
+            report.check(
+                "window/winmsg-drag-drop-delivers-files",
+                probe.dragFileProbe.drops == 1 && probe.dragFileProbe.ends == 1 &&
+                    probe.dragFileProbe.lastFiles == DROP_TEST_FILES,
+                "drops=${probe.dragFileProbe.drops} ends=${probe.dragFileProbe.ends} " +
+                    "files=${probe.dragFileProbe.lastFiles}",
+            )
+            // Drop 的 effect 就是这次拖放操作的结果：接受了就是 COPY（不是 NONE）——
+            // 「拒绝」的情形要另看（见下面 effect-writeback 那条）。
+            report.check(
+                "window/winmsg-drag-drop-effect-copy",
+                app.window.lastDropEffect == Win32Message.DROPEFFECT_COPY,
+                "放下之后 effect=${app.window.lastDropEffect}（期望 COPY：这次放下被接受了）",
+            )
+            // 会话已经结束（Kotlin 侧 onDrop/onEnded 走完 -> setDropAccept(false)）。
+            // 这时再来一次 DragOver：宿主必须回 NONE。
+            //
+            // 这条是**唯一**能观测到「Kotlin 判定 -> C++ effect」这条写回链的断言：
+            // 没有它的话，"光标一直显示可放下" 这种 bug 在自动化里是看不见的
+            //（DragEnter 是乐观接受，所以 enter/over/drop 全都是 COPY）。
+            simulateDrag(app, 1, DRAG_FILE_X_DP + DRAG_W_DP / 2, DRAG_FILE_Y_DP + DRAG_H_DP / 2, kind = 0)
+        }
+        if (frame == 118) {
+            report.check(
+                "window/winmsg-drag-effect-writeback",
+                app.window.lastDropEffect == Win32Message.DROPEFFECT_NONE,
+                "Kotlin 判定 false 之后，宿主回的 effect=${app.window.lastDropEffect}" +
+                    "（期望 NONE；恒为 COPY 就是光标一直显示「可放下」的 bug）",
+            )
+            // 文本拖放（另一个框，只收文本）
+            simulateDrag(app, 0, DRAG_TEXT_X_DP + DRAG_W_DP / 2, DRAG_TEXT_Y_DP + DRAG_H_DP / 2, kind = 1)
+        }
+        if (frame == 120) {
+            report.check(
+                "window/winmsg-drag-text-accepted",
+                probe.dragTextProbe.starts == 1 && probe.dragTextProbe.lastText == DROP_TEST_TEXT &&
+                    probe.dragTextProbe.lastFiles.isEmpty() &&
+                    probe.dragFileProbe.starts == 1,
+                "文本探针 starts=${probe.dragTextProbe.starts} text=${probe.dragTextProbe.lastText} " +
+                    "文件探针 starts=${probe.dragFileProbe.starts}（应当还是 1：文本会话里文件框被拒）",
+            )
+            simulateDrag(app, 1, DRAG_TEXT_X_DP + DRAG_W_DP / 2, DRAG_TEXT_Y_DP + DRAG_H_DP / 2, kind = 1)
+        }
+        if (frame == 122) {
+            report.check(
+                "window/winmsg-drag-text-enters-target",
+                probe.dragTextProbe.enters == 1 && probe.dragTextProbe.moves >= 1,
+                "enters=${probe.dragTextProbe.enters} moves=${probe.dragTextProbe.moves}",
+            )
+            simulateDrag(app, 2, DRAG_TEXT_X_DP + DRAG_W_DP / 2, DRAG_TEXT_Y_DP + DRAG_H_DP / 2, kind = 1)
+        }
+        if (frame == 124) {
+            report.check(
+                "window/winmsg-drag-leave-ends-session",
+                probe.dragTextProbe.exits == 1 && probe.dragTextProbe.ends == 1 &&
+                    app.window.lastDropEffect == Win32Message.DROPEFFECT_NONE,
+                "exits=${probe.dragTextProbe.exits} ends=${probe.dragTextProbe.ends} " +
+                    "effect=${app.window.lastDropEffect}",
+            )
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。
             driveFrames = false
@@ -2671,6 +2922,30 @@ private fun postRealMouse(
         x = (xDp * scale).toInt(),
         y = (yDp * scale).toInt(),
         wheelDelta = wheelDelta,
+    )
+}
+
+/**
+ * 自检用：直接驱动窗口上注册的 OLE `IDropTarget`（C 侧会构造一个真的 IDataObject）。
+ *
+ * phase: 0=DragEnter 1=DragOver 2=DragLeave 3=Drop；kind: 0=文件 1=文本。
+ *
+ * 坐标是**内容**坐标（dp，不含 CSD 标题栏），这里换算成窗口客户区物理像素 ——
+ * 和真机上 OLE 给的 POINTL（屏幕坐标 -> ScreenToClient）走的是同一条路。
+ */
+private fun simulateDrag(
+    app: WindowsComposeApplication,
+    phase: Int,
+    contentXDp: Int,
+    contentYDp: Int,
+    kind: Int,
+): Boolean {
+    val scale = app.window.dpiScale
+    return app.window.testSimulateDrag(
+        phase = phase,
+        x = (contentXDp * scale).toInt(),
+        y = ((contentYDp + CHROME_DP) * scale).toInt(),
+        kind = kind,
     )
 }
 

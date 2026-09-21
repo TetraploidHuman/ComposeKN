@@ -53,6 +53,18 @@ typedef enum ComposeKNWin32EventType {
      * 范围放在 a = 起始偏移、b = 结束偏移（UTF-16 code unit，文档坐标）。
      */
     COMPOSEKN_WIN32_EVENT_IME_RECONVERT_SELECT = 18,
+    /*
+     * OLE 拖放（接收侧 -> Compose 的 Modifier.dragAndDropTarget）。
+     *
+     * 事件结构体塞不下路径/文本，所以和 IME 一样用一条**严格 1:1 的 FIFO** 配负载：
+     * 每弹一条 drag 事件，必须先弹一次 composekn_win32_drag_pop_files 和一次
+     * composekn_win32_drag_pop_text（没有负载时返回 0 长度，而不是 -1）。
+     *   x/y = 客户区物理像素（LEAVE 是 -1,-1）
+     */
+    COMPOSEKN_WIN32_EVENT_DRAG_ENTER = 19,  /* = IDropTarget::DragEnter */
+    COMPOSEKN_WIN32_EVENT_DRAG_OVER = 20,   /* = IDropTarget::DragOver */
+    COMPOSEKN_WIN32_EVENT_DRAG_LEAVE = 21,  /* = IDropTarget::DragLeave */
+    COMPOSEKN_WIN32_EVENT_DRAG_DROP = 22,   /* = IDropTarget::Drop */
 } ComposeKNWin32EventType;
 
 typedef struct ComposeKNWin32Event {
@@ -245,6 +257,53 @@ bool composekn_win32_ime_composing(ComposeKNWin32Window* window);
 
 /** 自检用：注入一条「IME 提交」事件（Wine 里没有真 IME，驱动不了这条路）。 */
 void composekn_win32_ime_test_commit(ComposeKNWin32Window* window, const char* utf8);
+
+// ---------------------------------------------------------------------------
+// OLE 拖放（接收侧）
+// ---------------------------------------------------------------------------
+
+/**
+ * 最近一次回给 OLE 的 effect（DROPEFFECT_NONE=0 / DROPEFFECT_COPY=1）。
+ *
+ * 自检用它断言「Compose 拒绝这次拖放时，宿主有没有把光标从『可放下』改成『禁止』」。
+ */
+int32_t composekn_win32_last_drop_effect(ComposeKNWin32Window* window);
+
+/** 拖放目标注册成功没有（OleInitialize/RegisterDragDrop 失败时为 false）。 */
+bool composekn_win32_ole_available(ComposeKNWin32Window* window);
+
+/**
+ * 把 Compose 侧的判定写回宿主：true = 当前位置有控件愿意接收，OLE 的 *pdwEffect
+ * 返回 DROPEFFECT_COPY（光标显示「可放下」）；false = DROPEFFECT_NONE。
+ *
+ * 为什么需要它：IDropTarget::DragEnter 必须**同步**回答 effect，而那会儿 Kotlin
+ * 还没机会跑（OLE 在消息循环内部直接调我们）。策略见 win32_window.cc 里
+ * ComposeKNDropTarget 的注释。
+ */
+bool composekn_win32_set_drop_accept(ComposeKNWin32Window* window, bool accept);
+
+/**
+ * 弹出与最近一条 drag 事件配对的负载（FIFO，与 COMPOSEKN_WIN32_EVENT_DRAG_* 严格
+ * 一一对应）。
+ *
+ *   files: UTF-8，多个路径用 '\n' 分隔（没有文件时返回 0）
+ *   text : UTF-8 文本（没有文本时返回 0）
+ * 返回写入的字节数（不含结尾 NUL）；队列为空（说明两边配对错了）返回 -1。
+ */
+int32_t composekn_win32_drag_pop_files(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size);
+int32_t composekn_win32_drag_pop_text(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size);
+
+/**
+ * 自检用：直接驱动注册好的 IDropTarget（构造一个真的 IDataObject 交给它）。
+ *
+ * phase: 0=DragEnter 1=DragOver 2=DragLeave 3=Drop
+ * kind : 0=CF_HDROP（两条固定路径） 1=CF_UNICODETEXT
+ * (x, y) 是**客户区**坐标（内部按真机那样换成屏幕坐标）。
+ */
+bool composekn_win32_test_simulate_drag(
+    ComposeKNWin32Window* window, int32_t phase, int32_t x, int32_t y, int32_t kind);
 
 // ---------------------------------------------------------------------------
 // 自检用：真实 Win32 消息注入（PostMessage -> 主循环 -> 真实 wndproc 分支）

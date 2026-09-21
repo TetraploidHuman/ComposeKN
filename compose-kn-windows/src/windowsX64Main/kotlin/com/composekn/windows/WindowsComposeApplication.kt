@@ -308,6 +308,16 @@ class WindowsComposeApplication(
             is WindowsEvent.TouchEvent -> {
                 scene.dispatchWindowsTouchEvent(event, inputState)
             }
+            is WindowsEvent.DragEvent -> {
+                // 拖放：Compose 的判定要写回宿主，OLE 才能把光标从「可放下」改成
+                // 「禁止」（见 WindowsComposeWindow.setDropAccept 的说明）。
+                val accepted = scene.dispatchWindowsDragEvent(event)
+                window.setDropAccept(accepted)
+                winlog(
+                    "drag: ${event.phase} 位置=(${event.x},${event.y}) 文件=${event.files.size} " +
+                        "文本=${event.text?.length ?: 0} 接受=$accepted"
+                )
+            }
             is WindowsEvent.ImeStartEvent -> {
                 // Compose 侧的文本会话在输入框聚焦时就开了，这里不需要额外动作。
                 winlog("event: IME 组字开始")
