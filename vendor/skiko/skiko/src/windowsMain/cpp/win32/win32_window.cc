@@ -2548,28 +2548,23 @@ extern "C" void composekn_win32_clipboard_get_text(
     CloseClipboard();
 }
 
-extern "C" void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window, const char* text) {
-    (void)window;
-    if (text == nullptr) return;
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
-    if (wlen <= 0) return;
+/** UTF-8 -> CF_UNICODETEXT 的 HGLOBAL（调用方负责 GlobalFree 或交给剪贴板）。 */
+static HGLOBAL utf8ToUnicodeTextGlobal(const char* text) {
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (wlen <= 0) return nullptr;
     HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(wlen) * sizeof(wchar_t));
-    if (global == nullptr) return;
+    if (global == nullptr) return nullptr;
     wchar_t* wide = static_cast<wchar_t*>(GlobalLock(global));
     if (wide == nullptr) {
         GlobalFree(global);
-        return;
+        return nullptr;
     }
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, wlen);
     GlobalUnlock(global);
-    if (!OpenClipboard(nullptr)) {
-        GlobalFree(global);
-        return;
-    }
-    EmptyClipboard();
-    SetClipboardData(CF_UNICODETEXT, global); // clipboard owns `global` on success
-    CloseClipboard();
+    return global;
 }
+
+
 
 // ---------------------------------------------------------------------------
 // 自检用：真实 Win32 消息注入
@@ -3061,4 +3056,504 @@ extern "C" bool composekn_win32_test_simulate_drag(
     }
     data->Release();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 剪贴板：富文本格式（CF_HTML / Rich Text Format / CF_DIBV5）
+//
+// 为什么要自己拼 CF_HTML 头：Windows 的 "HTML Format" 是「一段带偏移头的字节流」，
+// 头里记录 StartHTML/EndHTML/StartFragment/EndFragment 四个**字节偏移**（相对整块
+// 数据，含头本身）。别人（Word/Chrome/WordPad）读的时候就是按这几个偏移去切 HTML，
+// 切错了就是"能粘贴但内容是乱的/空白的"。
+//   官网说明: HTML Clipboard Format (MSDN, "Clipboard Formats" 一节)
+//   头是 ASCII、固定 10 位十进制（这样头长度稳定，先占位算长度再回填偏移）。
+//
+// 图片用 CF_DIBV5（BITMAPV5HEADER + BI_BITFIELDS + RGBA 掩码 + 自上而下）：
+// 32bpp 的 CF_DIB 传统上有「alpha 通道到底算不算数」的歧义（很多老程序忽略它），
+// 而 V5 头带掩码和色彩空间，语义明确。读的时候兼容 V5/INFO/CORE 三种头 + 24bpp。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kHtmlFormatName = "HTML Format";
+constexpr const char* kRtfFormatName = "Rich Text Format";
+
+/** 查一个标准 CF_ 编号或注册格式名（找不到注册格式返回 0）。 */
+static UINT resolveClipboardFormat(const char* name) {
+    if (name == nullptr || name[0] == '\0') return 0;
+    if (name[0] == '#') {
+        return static_cast<UINT>(std::strtoul(name + 1, nullptr, 10));
+    }
+    return RegisterClipboardFormatA(name);
+}
+
+/** 自检用：把 HGLOBAL 里的原始字节按 hex 写进缓冲区（两段式）。 */
+static int32_t copyHex(HGLOBAL global, char* buffer, int32_t buffer_size) {
+    if (global == nullptr) return -1;
+    const SIZE_T size = GlobalSize(global);
+    const void* data = GlobalLock(global);
+    if (data == nullptr) return -1;
+    // 上限 256KB：hex 会让文本翻倍，测试里只关心头几十字节，不需要整块。
+    SIZE_T limit = size > (256 * 1024) ? (256 * 1024) : size;
+    const int32_t needed = static_cast<int32_t>(limit * 2);
+    if (buffer == nullptr || buffer_size < needed) {
+        GlobalUnlock(global);
+        return needed;
+    }
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    static const char* digits = "0123456789abcdef";
+    for (SIZE_T i = 0; i < limit; ++i) {
+        buffer[i * 2] = digits[(bytes[i] >> 4) & 0xF];
+        buffer[i * 2 + 1] = digits[bytes[i] & 0xF];
+    }
+    GlobalUnlock(global);
+    return needed;
+}
+
+/** CF_HTML：把片段包成标准头（UTF-8，偏移是字节偏移）。 */
+static std::string buildCfHtml(const std::string& fragment) {
+    const std::string prefix = "<html><body><!--StartFragment-->";
+    const std::string suffix = "<!--EndFragment--></body></html>";
+    // 先按最终宽度（10 位十进制）占位，算出头长度 —— 头长度稳定，偏移才能回填。
+    const char* headerTemplate =
+        "Version:0.9\r\n"
+        "StartHTML:%010u\r\n"
+        "EndHTML:%010u\r\n"
+        "StartFragment:%010u\r\n"
+        "EndFragment:%010u\r\n";
+    char header[256];
+    std::snprintf(header, sizeof(header), headerTemplate, 0u, 0u, 0u, 0u);
+    const size_t headerLen = std::strlen(header);
+    const size_t startHtml = headerLen;
+    const size_t startFragment = startHtml + prefix.size();
+    const size_t endFragment = startFragment + fragment.size();
+    const size_t endHtml = endFragment + suffix.size();
+    std::snprintf(
+        header, sizeof(header), headerTemplate,
+        static_cast<unsigned>(startHtml), static_cast<unsigned>(endHtml),
+        static_cast<unsigned>(startFragment), static_cast<unsigned>(endFragment)
+    );
+    std::string out;
+    out.reserve(endHtml);
+    out += header;
+    out += prefix;
+    out += fragment;
+    out += suffix;
+    return out;
+}
+
+/** 在 buffer 里找 ASCII 模式，返回命中位置（找不到返回 npos）。 */
+static size_t findAscii(const std::string& haystack, const char* needle, size_t from) {
+    return haystack.find(needle, from);
+}
+
+/** 从 "StartFragment:" 之后解析十进制偏移；解析不到返回 -1。 */
+static long long parseOffsetAfter(const std::string& headerText, const char* key) {
+    const size_t at = findAscii(headerText, key, 0);
+    if (at == std::string::npos) return -1;
+    return std::strtoll(headerText.c_str() + at + std::strlen(key), nullptr, 10);
+}
+
+/** CF_HTML -> 片段 UTF-8（支持 UTF-8/ANSI 与 UTF-16LE 两种宿主编码）。 */
+static bool parseCfHtml(const void* data, size_t size, std::string& out) {
+    if (data == nullptr || size < 2) return false;
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    const bool utf16 = (bytes[0] == 0xFF && bytes[1] == 0xFE);
+    // 头是 ASCII：先把前 512 字节（UTF-16 时就是前 256 个字符）转成 UTF-8 来解析偏移。
+    std::string headerText;
+    size_t headerProbe = size > 512 ? 512 : size;
+    if (utf16) {
+        const int wlen = static_cast<int>(headerProbe / 2);
+        const int len = WideCharToMultiByte(
+            CP_UTF8, 0, reinterpret_cast<const wchar_t*>(data), wlen,
+            nullptr, 0, nullptr, nullptr
+        );
+        if (len > 0) {
+            headerText.resize(static_cast<size_t>(len), '\0');
+            WideCharToMultiByte(
+                CP_UTF8, 0, reinterpret_cast<const wchar_t*>(data), wlen,
+                headerText.data(), len, nullptr, nullptr
+            );
+        }
+    } else {
+        headerText.assign(reinterpret_cast<const char*>(data), headerProbe);
+    }
+    long long startFragment = parseOffsetAfter(headerText, "StartFragment:");
+    long long endFragment = parseOffsetAfter(headerText, "EndFragment:");
+    if (startFragment < 0) {
+        // 没有头（有些程序直接放裸 HTML）：整块当作 HTML。
+        startFragment = 0;
+        endFragment = static_cast<long long>(size);
+    }
+    if (startFragment < 0 || endFragment <= startFragment ||
+        static_cast<size_t>(endFragment) > size) {
+        composeknLog(
+            "clipboard: CF_HTML 偏移不合法 start=%lld end=%lld size=%zu（退回整块）",
+            startFragment, endFragment, size
+        );
+        startFragment = 0;
+        endFragment = static_cast<long long>(size);
+    }
+    if (utf16) {
+        const auto* wide = reinterpret_cast<const wchar_t*>(
+            static_cast<const unsigned char*>(data) + startFragment);
+        const int wlen = static_cast<int>((endFragment - startFragment) / 2);
+        const int len = WideCharToMultiByte(CP_UTF8, 0, wide, wlen, nullptr, 0, nullptr, nullptr);
+        if (len <= 0) return false;
+        out.resize(static_cast<size_t>(len), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wide, wlen, out.data(), len, nullptr, nullptr);
+    } else {
+        out.assign(
+            reinterpret_cast<const char*>(static_cast<const unsigned char*>(data) + startFragment),
+            static_cast<size_t>(endFragment - startFragment)
+        );
+    }
+    return true;
+}
+
+/**
+ * CF_DIB* -> 自上而下 BGRA（stride = width*4）。
+ *
+ * 支持 BITMAPV5HEADER(124) / BITMAPINFOHEADER(40) / BITMAPCOREHEADER(12)，
+ * 32bpp 与 24bpp、BI_RGB 与 32bpp BI_BITFIELDS；自下而上的行会翻转。
+ * 调色板/RLE 等不支持（回 false 并记一行日志）。
+ */
+static bool parseDib(const void* data, size_t size, std::vector<uint8_t>& out, int32_t& width, int32_t& height) {
+    if (data == nullptr || size < 16) return false;
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    uint32_t headerSize = 0;
+    std::memcpy(&headerSize, bytes, 4);
+    int32_t w = 0, h = 0;
+    uint16_t bitCount = 0;
+    uint32_t compression = 0;
+    size_t pixelOffset = 0;
+    bool topDown = false;
+    if (headerSize >= 40) {
+        if (size < 40) return false;
+        int32_t signedHeight = 0;
+        std::memcpy(&w, bytes + 4, 4);
+        std::memcpy(&signedHeight, bytes + 8, 4);
+        std::memcpy(&bitCount, bytes + 14, 2);
+        std::memcpy(&compression, bytes + 16, 4);
+        topDown = signedHeight < 0;
+        h = topDown ? -signedHeight : signedHeight;
+        pixelOffset = headerSize;
+    } else if (headerSize == 12) {
+        int16_t w16 = 0, h16 = 0;
+        std::memcpy(&w16, bytes + 4, 2);
+        std::memcpy(&h16, bytes + 6, 2);
+        std::memcpy(&bitCount, bytes + 10, 2);
+        w = w16;
+        h = h16;
+        compression = 0;   // CORE 头只有 BI_RGB
+        pixelOffset = 12;
+    } else {
+        composeknLog("clipboard: 位图头大小 %u 不认识", headerSize);
+        return false;
+    }
+    if (w <= 0 || h <= 0 || w > 20000 || h > 20000) return false;
+    if (bitCount != 32 && bitCount != 24) {
+        composeknLog("clipboard: %u bpp 位图暂不支持（只做 32/24bpp）", bitCount);
+        return false;
+    }
+    if (compression != 0 /*BI_RGB*/ && compression != 3 /*BI_BITFIELDS*/) {
+        composeknLog("clipboard: 压缩位图暂不支持（biCompression=%u）", compression);
+        return false;
+    }
+    const size_t srcStride = ((static_cast<size_t>(w) * bitCount / 8) + 3) & ~static_cast<size_t>(3);
+    if (pixelOffset + srcStride * static_cast<size_t>(h) > size) {
+        composeknLog("clipboard: 位图数据不够（需要 %zu 字节，只有 %zu）", pixelOffset + srcStride * h, size);
+        return false;
+    }
+    out.assign(static_cast<size_t>(w) * h * 4, 0);
+    for (int32_t y = 0; y < h; ++y) {
+        const int32_t srcY = topDown ? y : (h - 1 - y);
+        const auto* row = bytes + pixelOffset + srcStride * static_cast<size_t>(srcY);
+        uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
+        for (int32_t x = 0; x < w; ++x) {
+            if (bitCount == 32) {
+                dst[x * 4 + 0] = row[x * 4 + 0];
+                dst[x * 4 + 1] = row[x * 4 + 1];
+                dst[x * 4 + 2] = row[x * 4 + 2];
+                dst[x * 4 + 3] = row[x * 4 + 3];
+            } else {
+                dst[x * 4 + 0] = row[x * 3 + 0];
+                dst[x * 4 + 1] = row[x * 3 + 1];
+                dst[x * 4 + 2] = row[x * 3 + 2];
+                dst[x * 4 + 3] = 0xFF;
+            }
+        }
+    }
+    width = w;
+    height = h;
+    return true;
+}
+
+/** BGRA（自上而下）-> CF_DIBV5 字节流（BITMAPV5HEADER + BI_BITFIELDS + 自下而上）。 */
+static std::vector<uint8_t> buildDibV5(int32_t width, int32_t height, const uint8_t* bgra) {
+    const size_t stride = static_cast<size_t>(width) * 4;
+    std::vector<uint8_t> out(sizeof(BITMAPV5HEADER) + stride * static_cast<size_t>(height), 0);
+    auto* header = reinterpret_cast<BITMAPV5HEADER*>(out.data());
+    header->bV5Size = sizeof(BITMAPV5HEADER);
+    header->bV5Width = width;
+    header->bV5Height = height;             // 正数 = 自下而上（最通用的形式）
+    header->bV5Planes = 1;
+    header->bV5BitCount = 32;
+    header->bV5Compression = BI_BITFIELDS;
+    header->bV5SizeImage = static_cast<DWORD>(stride * static_cast<size_t>(height));
+    header->bV5RedMask = 0x00FF0000;
+    header->bV5GreenMask = 0x0000FF00;
+    header->bV5BlueMask = 0x000000FF;
+    header->bV5AlphaMask = 0xFF000000;
+    // LCS_sRGB 在 Windows 头里就是多字符常量 'sRGB'（不是字符串），直接用字面量
+    // 会触发 -Wmultichar；这里显式拼出同样的 4 字节值，语义一致。
+    header->bV5CSType = (static_cast<DWORD>('s') << 24) | (static_cast<DWORD>('R') << 16) |
+                        (static_cast<DWORD>('G') << 8) | static_cast<DWORD>('B');
+    for (int32_t y = 0; y < height; ++y) {
+        const uint8_t* src = bgra + static_cast<size_t>(y) * stride;
+        uint8_t* dst = out.data() + sizeof(BITMAPV5HEADER) + static_cast<size_t>(height - 1 - y) * stride;
+        std::memcpy(dst, src, stride);
+    }
+    return out;
+}
+
+/**
+ * 传统 `CF_DIB`（40 字节 BITMAPINFOHEADER + 32bpp BI_RGB + 自下而上）。
+ *
+ * 为什么要同时放这一份：`CF_DIBV5` 语义明确（带掩码/色彩空间），但**老程序**（画图、
+ * 一部分 Office 版本）只认 `CF_DIB`；只放 V5 的话它们粘贴出来是空的。两份放一起是
+ * 桌面应用（Chrome 等）的常规做法：谁认哪份就拿哪份。
+ * 注意传统 32bpp DIB 的第 4 个字节在规范里是"未使用"，所以不透明像素的颜色照样正确。
+ */
+static std::vector<uint8_t> buildDibLegacy(int32_t width, int32_t height, const uint8_t* bgra) {
+    const size_t stride = static_cast<size_t>(width) * 4;
+    std::vector<uint8_t> out(sizeof(BITMAPINFOHEADER) + stride * static_cast<size_t>(height), 0);
+    auto* header = reinterpret_cast<BITMAPINFOHEADER*>(out.data());
+    header->biSize = sizeof(BITMAPINFOHEADER);
+    header->biWidth = width;
+    header->biHeight = height;             // 正数 = 自下而上
+    header->biPlanes = 1;
+    header->biBitCount = 32;
+    header->biCompression = BI_RGB;
+    header->biSizeImage = static_cast<DWORD>(stride * static_cast<size_t>(height));
+    for (int32_t y = 0; y < height; ++y) {
+        const uint8_t* src = bgra + static_cast<size_t>(y) * stride;
+        uint8_t* dst = out.data() + sizeof(BITMAPINFOHEADER) + static_cast<size_t>(height - 1 - y) * stride;
+        std::memcpy(dst, src, stride);
+    }
+    return out;
+}
+
+/** 把一块字节放进剪贴板（HGLOBAL 所有权的约定见调用点）。 */
+static HGLOBAL bytesToGlobal(const std::vector<uint8_t>& bytes) {
+    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
+    if (global == nullptr) return nullptr;
+    void* dst = GlobalLock(global);
+    if (dst == nullptr) {
+        GlobalFree(global);
+        return nullptr;
+    }
+    if (!bytes.empty()) std::memcpy(dst, bytes.data(), bytes.size());
+    GlobalUnlock(global);
+    return global;
+}
+
+static HGLOBAL stringToGlobal(const std::string& utf8) {
+    return bytesToGlobal(std::vector<uint8_t>(utf8.begin(), utf8.end()));
+}
+
+}  // namespace
+
+extern "C" int32_t composekn_win32_clipboard_get_html(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size) {
+    (void)window;
+    if (!OpenClipboard(nullptr)) return -1;
+    HANDLE handle = GetClipboardData(RegisterClipboardFormatA(kHtmlFormatName));
+    int32_t result = -1;
+    if (handle != nullptr) {
+        void* data = GlobalLock(handle);
+        if (data != nullptr) {
+            std::string fragment;
+            if (parseCfHtml(data, GlobalSize(handle), fragment)) {
+                const int32_t needed = static_cast<int32_t>(fragment.size());
+                if (buffer == nullptr || buffer_size < needed) {
+                    result = needed;   // 两段式：告诉你需要多大
+                } else {
+                    if (needed > 0) std::memcpy(buffer, fragment.data(), static_cast<size_t>(needed));
+                    result = needed;
+                }
+            }
+            GlobalUnlock(handle);
+        }
+    }
+    CloseClipboard();
+    return result;
+}
+
+extern "C" void composekn_win32_clipboard_set_html(ComposeKNWin32Window* window, const char* utf8_html) {
+    composekn_win32_clipboard_set_rich(window, nullptr, utf8_html, nullptr, 0, 0, nullptr);
+}
+
+extern "C" int32_t composekn_win32_clipboard_get_rtf(
+    ComposeKNWin32Window* window, char* buffer, int32_t buffer_size) {
+    (void)window;
+    if (!OpenClipboard(nullptr)) return -1;
+    HANDLE handle = GetClipboardData(RegisterClipboardFormatA(kRtfFormatName));
+    int32_t result = -1;
+    if (handle != nullptr) {
+        void* data = GlobalLock(handle);
+        if (data != nullptr) {
+            const int32_t size = static_cast<int32_t>(GlobalSize(handle));
+            if (buffer == nullptr || buffer_size < size) {
+                result = size;
+            } else {
+                if (size > 0) std::memcpy(buffer, data, static_cast<size_t>(size));
+                result = size;
+            }
+            GlobalUnlock(handle);
+        }
+    }
+    CloseClipboard();
+    return result;
+}
+
+extern "C" void composekn_win32_clipboard_set_rtf(ComposeKNWin32Window* window, const char* utf8_rtf) {
+    composekn_win32_clipboard_set_rich(window, nullptr, nullptr, utf8_rtf, 0, 0, nullptr);
+}
+
+extern "C" int32_t composekn_win32_clipboard_get_image(
+    ComposeKNWin32Window* window, uint8_t* buffer, int32_t buffer_size, int32_t* out_size) {
+    (void)window;
+    if (!OpenClipboard(nullptr)) return -1;
+    // 优先 V5（语义明确），退回老 CF_DIB。
+    HANDLE handle = GetClipboardData(CF_DIBV5);
+    if (handle == nullptr) handle = GetClipboardData(CF_DIB);
+    int32_t result = -1;
+    if (handle != nullptr) {
+        void* data = GlobalLock(handle);
+        if (data != nullptr) {
+            std::vector<uint8_t> pixels;
+            int32_t w = 0, h = 0;
+            if (parseDib(data, GlobalSize(handle), pixels, w, h)) {
+                const int32_t needed = static_cast<int32_t>(pixels.size());
+                if (buffer == nullptr || buffer_size < needed) {
+                    result = needed;
+                } else {
+                    std::memcpy(buffer, pixels.data(), static_cast<size_t>(needed));
+                    result = needed;
+                }
+                if (out_size != nullptr) {
+                    out_size[0] = w;
+                    out_size[1] = h;
+                }
+            }
+            GlobalUnlock(handle);
+        }
+    }
+    CloseClipboard();
+    return result;
+}
+
+extern "C" void composekn_win32_clipboard_set_image(
+    ComposeKNWin32Window* window, int32_t width, int32_t height, const uint8_t* bgra) {
+    composekn_win32_clipboard_set_rich(window, nullptr, nullptr, nullptr, width, height, bgra);
+}
+
+extern "C" int32_t composekn_win32_clipboard_get_raw_hex(
+    ComposeKNWin32Window* window, const char* format_name, char* buffer, int32_t buffer_size) {
+    (void)window;
+    const UINT format = resolveClipboardFormat(format_name);
+    if (format == 0) return -1;
+    if (!OpenClipboard(nullptr)) return -1;
+    HANDLE handle = GetClipboardData(format);
+    const int32_t result = copyHex(handle, buffer, buffer_size);
+    CloseClipboard();
+    return result;
+}
+
+extern "C" void composekn_win32_clipboard_set_rich(
+    ComposeKNWin32Window* window,
+    const char* utf8_text,
+    const char* utf8_html,
+    const char* utf8_rtf,
+    int32_t image_width,
+    int32_t image_height,
+    const uint8_t* bgra) {
+    (void)window;
+    const bool hasText = utf8_text != nullptr;
+    const bool hasHtml = utf8_html != nullptr;
+    const bool hasRtf = utf8_rtf != nullptr;
+    const bool hasImage = bgra != nullptr && image_width > 0 && image_height > 0;
+    if (!hasText && !hasHtml && !hasRtf && !hasImage) return;
+
+    // 先把所有 HGLOBAL 准备好：OpenClipboard 之后再分配会失败（剪贴板被占用），
+    // 而且一旦 EmptyClipboard，任何一步失败都会留下"空剪贴板"。
+    HGLOBAL textGlobal = hasText ? utf8ToUnicodeTextGlobal(utf8_text) : nullptr;
+    std::vector<uint8_t> htmlBlob;
+    HGLOBAL htmlGlobal = nullptr;
+    UINT htmlFormat = 0;
+    if (hasHtml) {
+        const std::string blob = buildCfHtml(std::string(utf8_html));
+        htmlBlob.assign(blob.begin(), blob.end());
+        htmlFormat = RegisterClipboardFormatA(kHtmlFormatName);
+        if (htmlFormat != 0) htmlGlobal = bytesToGlobal(htmlBlob);
+    }
+    HGLOBAL rtfGlobal = nullptr;
+    UINT rtfFormat = 0;
+    if (hasRtf) {
+        rtfFormat = RegisterClipboardFormatA(kRtfFormatName);
+        if (rtfFormat != 0) rtfGlobal = stringToGlobal(std::string(utf8_rtf));
+    }
+    HGLOBAL imageGlobal = nullptr;
+    HGLOBAL imageLegacyGlobal = nullptr;
+    if (hasImage) {
+        imageGlobal = bytesToGlobal(buildDibV5(image_width, image_height, bgra));
+        imageLegacyGlobal = bytesToGlobal(buildDibLegacy(image_width, image_height, bgra));
+    }
+
+    if (!OpenClipboard(nullptr)) {
+        if (textGlobal) GlobalFree(textGlobal);
+        if (htmlGlobal) GlobalFree(htmlGlobal);
+        if (rtfGlobal) GlobalFree(rtfGlobal);
+        if (imageGlobal) GlobalFree(imageGlobal);
+        if (imageLegacyGlobal) GlobalFree(imageLegacyGlobal);
+        composeknLog("clipboard: OpenClipboard 失败，富文本写入放弃");
+        return;
+    }
+    EmptyClipboard();
+    int written = 0;
+    if (textGlobal != nullptr && SetClipboardData(CF_UNICODETEXT, textGlobal) != nullptr) {
+        ++written;
+    } else if (textGlobal != nullptr) {
+        GlobalFree(textGlobal);
+    }
+    if (htmlGlobal != nullptr && SetClipboardData(htmlFormat, htmlGlobal) != nullptr) {
+        ++written;
+    } else if (htmlGlobal != nullptr) {
+        GlobalFree(htmlGlobal);
+    }
+    if (rtfGlobal != nullptr && SetClipboardData(rtfFormat, rtfGlobal) != nullptr) {
+        ++written;
+    } else if (rtfGlobal != nullptr) {
+        GlobalFree(rtfGlobal);
+    }
+    if (imageGlobal != nullptr && SetClipboardData(CF_DIBV5, imageGlobal) != nullptr) {
+        ++written;
+    } else if (imageGlobal != nullptr) {
+        GlobalFree(imageGlobal);
+    }
+    if (imageLegacyGlobal != nullptr && SetClipboardData(CF_DIB, imageLegacyGlobal) != nullptr) {
+        ++written;
+    } else if (imageLegacyGlobal != nullptr) {
+        GlobalFree(imageLegacyGlobal);
+    }
+    CloseClipboard();
+    composeknLog(
+        "clipboard: 写入 %d 个格式（文本=%d HTML=%zu 字节 RTF=%d 位图=%d）",
+        written, hasText ? 1 : 0, htmlBlob.size(), hasRtf ? 1 : 0, hasImage ? 1 : 0
+    );
+}
+
+extern "C" void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window, const char* text) {
+    composekn_win32_clipboard_set_rich(window, text, nullptr, nullptr, 0, 0, nullptr);
 }

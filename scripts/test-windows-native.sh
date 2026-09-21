@@ -242,6 +242,10 @@ if [ -z "$ONLY" ] || [ "$ONLY" = "window" ]; then
     check_log_line "拖放放下（文件路径）" "第一个=C:\\composekn\\drop-test-1.txt"
     check_log_line "拖放文本" "drag: ENTER pos=475,462 files=0 textLen=28"
     check_log_line "拖放离开" "drag: LEAVE"
+    # 富文本剪贴板：C 侧日志必须体现「一次事务写多个格式」（文本 + HTML 同时进去，
+    # 分两次写会把前一次擦掉）以及位图（CF_DIBV5 + 传统 CF_DIB 两份）。
+    check_log_line "剪贴板多格式写入（文本+HTML）" "个格式（文本=1 HTML="
+    check_log_line "剪贴板位图写入" "位图=1"
     # 反证：真实鼠标消息**不该**顺带产生触摸事件（v0.5.11 的「笔悬停变手指」
     # 就是触摸通道串了）。window 阶段全程没有真触摸，所以一条都不该有。
     TOUCH_LINES="$(grep -c '^.*touch: ' "$STARTUP_LOG" 2>/dev/null || true)"

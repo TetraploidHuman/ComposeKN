@@ -3255,3 +3255,113 @@ SELFTEST: RESULT FAIL (63 checks, 9 failures)
 * logic **118** / window **63**（+11）（合计 **181**）、`all` —— 见发布说明；
 * 外部阶段：`win32msg` **11** 条（+4）+ `input` 5 条 + `screenshot` 4 条全绿；
 * 打包单文件 exe（无 `icudtl.dat`）干净目录复测。
+
+### 17.34 富文本剪贴板：HTML（CF_HTML）/ RTF / 位图（CF_DIBV5 + CF_DIB）（v0.5.16）
+
+#### 之前的状态
+
+剪贴板桥只有 `CF_UNICODETEXT`（纯文本），`ClipEntry` 也只能装文本。桌面应用复制一段
+带格式的内容（网页/Word）时，我们只能拿到纯文本；往剪贴板放图片也完全不行。
+
+#### 上游对齐点
+
+桌面 Compose 的 `ClipEntry` 是个**壳**：desktop 上它包着 AWT 的 `Transferable`，格式能力
+由平台决定，应用用平台扩展 `asAwtTransferable` 去读；`clipMetadata` 在上游桌面上至今是
+`TODO("ClipMetadata is not implemented")`（CMP-1260）。所以这里同样是"平台层决定能读什么"，
+我们提供的是原生访问器（和之前的 `files` / `text` 一个路子）：
+
+| 格式 | Windows 底层 | `ClipEntry` 访问器 |
+| --- | --- | --- |
+| 纯文本 | `CF_UNICODETEXT` | `getPlainText()` |
+| HTML | 注册格式 `"HTML Format"`（即 CF_HTML） | `getHtml()` |
+| RTF | 注册格式 `"Rich Text Format"` | `getRtf()` |
+| 位图 | `CF_DIBV5` + 传统 `CF_DIB` | `getImage()` |
+
+写入口是 `ClipEntry.withPlainText / withHtml / withRtf / withImage`（HTML/RTF 建议同时带
+`plainText`：不认富文本的程序会退回纯文本，Word/Chrome 复制时就是这么放的）。
+
+#### CF_HTML 那条最容易错的地方：**偏移 **
+
+Windows 的 "HTML Format" 不是"一段 HTML"，而是：
+
+```
+Version:0.9\r\n
+StartHTML:%010u\r\n      <- 整块数据里 <html> 的**字节**偏移（头部本身也算在计数里）
+EndHTML:%010u\r\n        <- 整块数据的长度
+StartFragment:%010u\r\n  <- <!--StartFragment--> 之后那段的字节偏移
+EndFragment:%010u\r\n
+<html><body><!--StartFragment-->……片段……<!--EndFragment--></body></html>
+```
+
+四个偏移都是**字节**偏移（不是字符），而且头部用固定 10 位十进制（这样头长度稳定，可以
+先占位算长度再回填）。片段里一旦有中文/emoji，按字符数算就会错位 —— 别人读到的是切歪的
+HTML。自检里专门放了**非 ASCII 片段**（`<b>ComposeKN</b> 富文本 <i>clipboard</i> ✔`），
+并且断言方式不是"读回来等于写进去"，而是：**把原始字节捞出来、用测试自己的解析逻辑**去核
+这四个偏移（`window/clipboard-html-cf-header`）。实测一次：
+
+```
+Version/StartHTML=105/EndHTML=216/StartFragment=137/EndFragment=184 共 216 字节
+偏移切片与片段一致=true
+```
+
+（105 = 头长度；105+32 = 137 = 片段起点，`<html><body><!--StartFragment-->` 正好 32 字节；
+184 + 32 = 216 = 整块长度。三个数互相对得上。）
+
+读的时候也兼容两种"别人写的"变体：UTF-16LE（带 BOM，偏移按它的字节算，切完再转 UTF-8）
+和没有头的裸 HTML（退回整块）。
+
+#### 位图：为什么同时写两份、为什么读的时候要翻行
+
+* **写**：`CF_DIBV5`（`BITMAPV5HEADER` + `BI_BITFIELDS` + RGBA 掩码 + `LCS_sRGB`）语义明确，
+  但**老程序**（画图、部分 Office）只认传统 `CF_DIB`（40 字节头 + 32bpp `BI_RGB`），只写 V5
+  它们粘贴出来是空的 —— 所以两份一起放（Chrome 等桌面程序也是这么干的）。
+* **行序**：DIB 默认**自下而上**（`biHeight > 0`），而 Compose/skiko 的像素缓冲是自上而下。
+  写的时候翻转、读的时候按 `biHeight` 的正负决定要不要再翻回来。
+* **读**还兼容 24bpp / `BITMAPCOREHEADER`(12) / V5(124) / INFO(40)；调色板和 RLE 压缩不支持
+  （回 null 并记一行日志）。
+* 自检用的是 **2×2 四色**（左上红/右上绿/左下蓝/右下白），断言读回来**逐像素相等** ——
+  纯色块根本查不出行序翻转和 BGRA/ARGB 串通道，四色一眼就能定位。
+
+#### 其它
+
+* **一次事务写多个格式**：Windows 是「`EmptyClipboard` + 多次 `SetClipboardData`」才算一次
+  写入，分几次调用会把前面写的擦掉。所以平台层是 `WaylandClipboard.setRich(text, html, rtf, image)`
+  一个调用，C 侧新增 `composekn_win32_clipboard_set_rich(...)`；自检里
+  `window/clipboard-html-single-transaction` 钉的就是"文本 + HTML 必须来自同一次写入"。
+* **Linux 侧仍是纯文本**：Wayland 的剪贴板要 `wl_data_source` 一次声明**多个 MIME**
+  （`text/plain;charset=utf-8`、`text/html`、`image/png`…）并在 `send` 回调里按对方要的 MIME
+  回数据，现有 C 桥（`wayland_window.cc`）只实现了单一 text/plain。所以 skiko 的
+  `WaylandClipboard`（linuxMain）里这几个新方法先按"不支持"实现（读回 null、写只写文本），
+  共享的 `PlatformClipboard` 两边都能编、Linux 行为不回归。补齐要动协议层，单独一轮。
+* `ClipEntry.clipMetadata` 保持上游桌面一样的状态（stub/`PlainText`）—— 判断有哪些格式就
+  看那几个访问器谁不是 null。
+
+#### 自检（新增 9 条 window/clipboard-*）
+
+| 断言 | 内容 |
+| --- | --- |
+| `clipboard-rich-manager` | 窗口阶段拿得到 Compose 的 ClipboardManager |
+| `clipboard-html-roundtrip` | `setClip(withHtml)` → `getClip().getHtml()` 原样往返 |
+| `clipboard-html-plaintext-fallback` | 同一次写入里的纯文本回退也读得回来 |
+| `clipboard-html-single-transaction` | 文本与 HTML 来自同一次写入（分开写会互相擦掉） |
+| `clipboard-html-cf-header` | **独立解析**原始字节里的四个偏移（含非 ASCII 片段） |
+| `clipboard-rtf-roundtrip` | RTF 原样往返 |
+| `clipboard-rtf-has-no-html` | 只写 RTF 时不该读出 HTML |
+| `clipboard-image-roundtrip` | 2×2 四色**逐像素**相等（行序/通道/stride） |
+| `clipboard-image-dib-structure` | CF_DIBV5 头 = 124 / 32bpp / BI_BITFIELDS，且传统 CF_DIB 头 = 40 也同时在 |
+
+脚本侧另有 2 条外部证据：`clipboard: 写入 …（文本=1 HTML=` 与 `位图=1`
+（C 侧只打这两行，Kotlin 侧改不动）。
+
+#### 关于 fail-before（诚实版）
+
+这一轮的证据是**独立结构校验**而不是变异：`window/clipboard-html-cf-header` 与
+`clipboard-image-dib-structure` 都是拿**原始字节**、用测试自己的代码按**文档格式**解析的，
+不是"拿自己的读函数读回来"——写歪了偏移或头字段就会红。按变异方式再做一轮（例如把
+`StartHTML` 里的头长度去掉）要再花两次链接（~20 分钟），这次没有做，留作需要时的补充证据。
+
+#### 验证
+
+* logic **118** / window **72**（+9）（合计 **190**）、`all` **187** —— 全绿；
+* 外部阶段：`win32msg` **13** 条（+2）+ `input` 5 条 + `screenshot` 4 条全绿；
+* 打包单文件 exe（无 `icudtl.dat`）干净目录复测。

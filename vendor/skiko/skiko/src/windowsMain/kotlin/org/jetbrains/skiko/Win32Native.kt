@@ -236,6 +236,37 @@ internal external fun composekn_win32_drag_pop_text(
     bufferSize: Int,
 ): Int
 
+@SymbolName("composekn_win32_clipboard_get_html")
+internal external fun composekn_win32_clipboard_get_html(
+    window: COpaquePointer?, buffer: CPointer<ByteVar>, bufferSize: Int,
+): Int
+
+@SymbolName("composekn_win32_clipboard_set_rich")
+internal external fun composekn_win32_clipboard_set_rich(
+    window: COpaquePointer?,
+    utf8Text: CPointer<ByteVar>?,
+    utf8Html: CPointer<ByteVar>?,
+    utf8Rtf: CPointer<ByteVar>?,
+    imageWidth: Int,
+    imageHeight: Int,
+    bgra: CPointer<UByteVar>?,
+)
+
+@SymbolName("composekn_win32_clipboard_get_rtf")
+internal external fun composekn_win32_clipboard_get_rtf(
+    window: COpaquePointer?, buffer: CPointer<ByteVar>, bufferSize: Int,
+): Int
+
+@SymbolName("composekn_win32_clipboard_get_image")
+internal external fun composekn_win32_clipboard_get_image(
+    window: COpaquePointer?, buffer: CPointer<UByteVar>?, bufferSize: Int, outSize: CPointer<IntVar>,
+): Int
+
+@SymbolName("composekn_win32_clipboard_get_raw_hex")
+internal external fun composekn_win32_clipboard_get_raw_hex(
+    window: COpaquePointer?, formatName: CPointer<ByteVar>, buffer: CPointer<ByteVar>, bufferSize: Int,
+): Int
+
 @SymbolName("composekn_win32_test_simulate_drag")
 internal external fun composekn_win32_test_simulate_drag(
     window: COpaquePointer?,
@@ -571,10 +602,106 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     fun testSimulateDrag(phase: Int, x: Int, y: Int, kind: Int): Boolean =
         composekn_win32_test_simulate_drag(native, phase, x, y, kind)
 
+    // ---- 剪贴板：富文本格式（CF_HTML / RTF / CF_DIBV5）----
+
+    /** CF_HTML 里的**片段**（头里的偏移解析在 C 侧做掉）。null = 没有 HTML。 */
+    fun clipboardGetHtml(): String? =
+        clipboardPopString { buffer, size -> composekn_win32_clipboard_get_html(native, buffer, size) }
+
+    /** 注册格式 "Rich Text Format" 的内容。null = 没有 RTF。 */
+    fun clipboardGetRtf(): String? =
+        clipboardPopString { buffer, size -> composekn_win32_clipboard_get_rtf(native, buffer, size) }
+
+    /**
+     * 剪贴板里的位图（统一转成 BGRA、自上而下、stride = width*4）。
+     *
+     * 两段式：先问需要多大（C 侧回 `CF_DIBV5`/`CF_DIB` 解出来的实际字节数），再取。
+     * null = 没有位图，或格式不支持（调色板/RLE/非 24/32bpp —— C 侧会记一行日志）。
+     */
+    fun clipboardGetImage(): ClipboardImage? = memScoped {
+        val out = allocArray<IntVar>(2)
+        val needed = composekn_win32_clipboard_get_image(native, null, 0, out)
+        if (needed <= 0) return@memScoped null
+        val width = out[0]
+        val height = out[1]
+        if (width <= 0 || height <= 0) return@memScoped null
+        val pixels = ByteArray(needed)
+        val written = pixels.usePinned { pinned ->
+            composekn_win32_clipboard_get_image(
+                native, pinned.addressOf(0).reinterpret<UByteVar>(), needed, out,
+            )
+        }
+        if (written != needed) return@memScoped null
+        ClipboardImage(width, height, pixels)
+    }
+
+    /**
+     * **一次事务**把多个格式放进剪贴板（传 null/0 表示不放这个格式）。
+     *
+     * 必须是"一次"：Windows 的 `EmptyClipboard` + 多次 `SetClipboardData` 才是一个
+     * 事务，分几次调用会把前一次的内容擦掉。
+     */
+    fun clipboardSetRich(
+        text: String?,
+        html: String?,
+        rtf: String?,
+        image: ClipboardImage?,
+    ) {
+        val imagePixels = image?.pixels
+        useCStringOrNull(text) { textPtr ->
+            useCStringOrNull(html) { htmlPtr ->
+                useCStringOrNull(rtf) { rtfPtr ->
+                    if (imagePixels == null) {
+                        composekn_win32_clipboard_set_rich(
+                            native, textPtr, htmlPtr, rtfPtr, 0, 0, null,
+                        )
+                    } else {
+                        imagePixels.usePinned { pinned ->
+                            composekn_win32_clipboard_set_rich(
+                                native, textPtr, htmlPtr, rtfPtr,
+                                image!!.width, image.height,
+                                pinned.addressOf(0).reinterpret<UByteVar>(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 自检用：把剪贴板里某个格式的**原始字节**按 hex 读出来（独立校验 CF_HTML 头、
+     * 位图头到底长什么样）。formatName 见 C 侧说明（注册格式名或 `#8`/`#17`）。
+     */
+    fun clipboardGetRawHex(formatName: String): String? =
+        clipboardPopString { buffer, size ->
+            formatName.useCString { name ->
+                composekn_win32_clipboard_get_raw_hex(native, name, buffer, size)
+            }
+        }
+
+    /** 两段式读字符串：先问大小，再取。空串/失败都返回 null。 */
+    private inline fun clipboardPopString(pop: (CPointer<ByteVar>, Int) -> Int): String? = memScoped {
+        val probe = allocArray<ByteVar>(CLIPBOARD_PROBE_SIZE)
+        val needed = pop(probe, CLIPBOARD_PROBE_SIZE)
+        if (needed <= 0) return@memScoped null
+        if (needed < CLIPBOARD_PROBE_SIZE) return@memScoped StringBytesDecoding(probe, needed)
+        val buffer = allocArray<ByteVar>(needed + 1)
+        val written = pop(buffer, needed + 1)
+        if (written <= 0) null else StringBytesDecoding(buffer, written)
+    }
+
     override fun close() {
         composekn_win32_destroy(native)
     }
 }
+
+/** 富文本读缓冲的探测大小：够装绝大多数 HTML/RTF 片段，超了就走第二趟。 */
+private const val CLIPBOARD_PROBE_SIZE = 64 * 1024
+
+/** `value == null` 时传 null 指针给 C；否则临时 NUL 结尾并把指针交出去。 */
+private inline fun <R> useCStringOrNull(value: String?, block: (CPointer<ByteVar>?) -> R): R =
+    if (value == null) block(null) else value.useCString(block)
 
 /** 拖放负载缓冲区大小（一次拖进来的路径列表/文本长度上限）。 */
 private const val DRAG_PAYLOAD_BUFFER_SIZE = 8192

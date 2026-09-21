@@ -1,5 +1,6 @@
 @file:OptIn(
     androidx.compose.ui.InternalComposeUiApi::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
     androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
     kotlinx.cinterop.ExperimentalForeignApi::class,
 )
@@ -58,6 +59,8 @@ import androidx.compose.ui.draganddrop.DragAndDropEvent
 import androidx.compose.ui.draganddrop.DragAndDropTarget
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -68,6 +71,7 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.isPrimaryPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
+import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalWindowInfo
@@ -105,6 +109,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.jetbrains.skia.ColorAlphaType
+import org.jetbrains.skia.ColorType
+import org.jetbrains.skia.Image
+import org.jetbrains.skia.ImageInfo
 import org.jetbrains.skiko.Win32Message
 
 // =====================================================================
@@ -234,6 +242,43 @@ private val DROP_TEST_FILES = listOf(
     "C:\\composekn\\drop-test-2.txt",
 )
 private const val DROP_TEST_TEXT = "ComposeKN 拖放测试文本"
+
+/** 富文本剪贴板测试用的 HTML 片段（故意含非 ASCII，验证 UTF-8 字节偏移没算错）。 */
+private const val CLIP_HTML_FRAGMENT =
+    "<b>ComposeKN</b> 富文本 <i>clipboard</i> ✔"
+
+/** RTF 片段（RTF 是 ASCII，非 ASCII 走 \uN 转义 —— 这里只测"原样往返"）。 */
+private const val CLIP_RTF = "{\\rtf1\\ansi\\b ComposeKN}\\par "
+
+/** 富文本条目里的纯文本回退（不认 HTML 的程序该拿到它）。 */
+private const val CLIP_PLAIN = "ComposeKN 富文本回退文本"
+
+/**
+ * 2×2 测试位图：左上红 / 右上绿 / 左下蓝 / 右下白。
+ *
+ * 为什么用「四个角四种色」而不是纯色块：位图剪贴板最经典的 bug 就是**行序搞反**
+ * （CF_DIB 默认自下而上），以及 stride/通道顺序错位 —— 纯色块全都看不出来，
+ * 四色一眼就能看出是翻转了还是串通道了。
+ */
+private fun clipboardTestImage(): ImageBitmap {
+    // BGRA、自上而下、stride = 2*4
+    val bgra = byteArrayOf(
+        // 第 0 行：红(0,0) 绿(1,0)
+        0x00, 0x00, 0xFF.toByte(), 0xFF.toByte(),
+        0x00, 0xFF.toByte(), 0x00, 0xFF.toByte(),
+        // 第 1 行：蓝(0,1) 白(1,1)
+        0xFF.toByte(), 0x00, 0x00, 0xFF.toByte(),
+        0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(),
+    )
+    val info = ImageInfo(2, 2, ColorType.BGRA_8888, ColorAlphaType.UNPREMUL)
+    return Image.makeRaster(info, bgra, 8).toComposeImageBitmap()
+}
+
+/** 期望的 2×2 ARGB 像素（自上而下）。 */
+private val CLIP_IMAGE_EXPECTED_ARGB = intArrayOf(
+    0xFFFF0000.toInt(), 0xFF00FF00.toInt(),
+    0xFF0000FF.toInt(), 0xFFFFFFFF.toInt(),
+)
 
 class InteractionProbe {
     var clicked by mutableStateOf(false)
@@ -2075,6 +2120,10 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
     var msgHScroll0 = 0
     var msgText0 = ""
     var msgPreciseWheelBase = 0
+    // 富文本剪贴板检查用的原始字节（hex，供独立解析）
+    var rawHtmlHex: String? = null
+    var rawV5Hex: String? = null
+    var rawDibHex: String? = null
 
     // 交互阶段由 frameHook **显式**请求下一帧。
     //
@@ -2670,6 +2719,113 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                 "exits=${probe.dragTextProbe.exits} ends=${probe.dragTextProbe.ends} " +
                     "effect=${app.window.lastDropEffect}",
             )
+        }
+
+        // ---- 富文本剪贴板（HANDOVER §17.34）----
+        //
+        // 走的是**真实的 Compose API**：LocalClipboardManager.setClip(ClipEntry.withXxx(...))
+        // -> 共享的 PlatformClipboard（overlay）-> skiko 的剪贴板 shim -> Win32 桥
+        // （CF_HTML / "Rich Text Format" / CF_DIBV5 + CF_DIB）-> 再读回来。
+        if (frame == 126) {
+            val cm = probe.clipboardManager
+            report.check("window/clipboard-rich-manager", cm != null)
+            if (cm != null) {
+                cm.setClip(ClipEntry.withHtml(CLIP_HTML_FRAGMENT, plainText = CLIP_PLAIN))
+                // 原始字节留到下一帧用**独立逻辑**解析（不是拿自己的读函数读回来）。
+                rawHtmlHex = app.window.clipboardGetRawHex("HTML Format")
+            }
+        }
+        if (frame == 128) {
+            val entry = probe.clipboardManager?.getClip()
+            report.checkEquals("window/clipboard-html-roundtrip", CLIP_HTML_FRAGMENT, entry?.getHtml())
+            report.checkEquals("window/clipboard-html-plaintext-fallback", CLIP_PLAIN, entry?.getPlainText())
+            report.check(
+                "window/clipboard-html-single-transaction",
+                // 文本 + HTML 必须来自**同一次**写入：分两次写会把前一次擦掉。
+                entry?.getHtml() == CLIP_HTML_FRAGMENT && entry?.getPlainText() == CLIP_PLAIN,
+                "HTML=${entry?.getHtml()?.take(24)} 纯文本=${entry?.getPlainText()}",
+            )
+            probe.clipboardManager?.setClip(ClipEntry.withRtf(CLIP_RTF))
+        }
+        if (frame == 130) {
+            // 独立解析 CF_HTML 头：偏移是**字节**偏移（片段里有中文和 ✔，算错就露馅）。
+            val bytes = rawHtmlHex?.let { hexToBytes(it) }
+            val text = bytes?.decodeToString()
+            val expectedFragment = CLIP_HTML_FRAGMENT.encodeToByteArray()
+            val startFragment = text?.let { parseDecimalAfter(it, "StartFragment:") } ?: -1
+            val endFragment = text?.let { parseDecimalAfter(it, "EndFragment:") } ?: -1
+            val startHtml = text?.let { parseDecimalAfter(it, "StartHTML:") } ?: -1
+            val endHtml = text?.let { parseDecimalAfter(it, "EndHTML:") } ?: -1
+            val fragmentSlice = if (bytes != null && startFragment >= 0 && endFragment in (startFragment + 1)..bytes.size) {
+                bytes.copyOfRange(startFragment, endFragment)
+            } else {
+                null
+            }
+            // StartHTML 指的是**头部之后**那个 <html> 的字节偏移（头本身也在计数里），
+            // 所以不是 0；EndHTML 才是整块的长度。
+            val htmlSlice = if (bytes != null && startHtml in 0 until endHtml && endHtml <= bytes.size) {
+                bytes.copyOfRange(startHtml, endHtml).decodeToString()
+            } else {
+                null
+            }
+            report.check(
+                "window/clipboard-html-cf-header",
+                bytes != null && text != null &&
+                    text.startsWith("Version:0.9") &&
+                    startHtml > 0 && startHtml < startFragment &&
+                    endFragment < endHtml && endHtml == bytes.size &&
+                    htmlSlice != null && htmlSlice.startsWith("<html>") && htmlSlice.endsWith("</html>") &&
+                    fragmentSlice != null && fragmentSlice.contentEquals(expectedFragment),
+                "Version/StartHTML=$startHtml/EndHTML=$endHtml/StartFragment=$startFragment/" +
+                    "EndFragment=$endFragment 共 ${bytes?.size} 字节；" +
+                    "偏移切片与片段一致=${fragmentSlice?.contentEquals(expectedFragment)}",
+            )
+            val entry = probe.clipboardManager?.getClip()
+            report.checkEquals("window/clipboard-rtf-roundtrip", CLIP_RTF, entry?.getRtf())
+            report.check(
+                "window/clipboard-rtf-has-no-html",
+                entry?.getHtml() == null && entry?.getRtf() == CLIP_RTF,
+                "只写 RTF 时不该读出 HTML（getHtml=${entry?.getHtml()}）",
+            )
+            probe.clipboardManager?.setClip(ClipEntry.withImage(clipboardTestImage()))
+        }
+        if (frame == 132) {
+            val image = probe.clipboardManager?.getClip()?.getImage()
+            val pixels = image?.let { img ->
+                IntArray(img.width * img.height).also { img.readPixels(it) }
+            }
+            report.check(
+                "window/clipboard-image-roundtrip",
+                image != null && image.width == 2 && image.height == 2 &&
+                    pixels != null && pixels.contentEquals(CLIP_IMAGE_EXPECTED_ARGB),
+                "读回的位图 ${image?.width}x${image?.height} 像素=" +
+                    pixels?.joinToString { "0x${it.toUInt().toString(16)}" } +
+                    "（期望 0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff —— " +
+                    "顺序错=行序翻转，通道错=BGRA/ARGB 搞反）",
+            )
+            rawV5Hex = app.window.clipboardGetRawHex("#17")
+            rawDibHex = app.window.clipboardGetRawHex("#8")
+        }
+        if (frame == 134) {
+            // CF_DIBV5 头：124 字节、2x2、32bpp、BI_BITFIELDS(3)、biHeight>0（自下而上）。
+            val v5 = rawV5Hex?.let { hexToBytes(it) }
+            val v5Header = v5?.let { readIntLe(it, 0) to readIntLe(it, 8) }
+            val v5Bits = v5?.let { readShortLe(it, 14) }
+            val v5Compression = v5?.let { readIntLe(it, 16) }
+            // 传统 CF_DIB 也必须同时存在（老程序只认它），40 字节头、32bpp。
+            val dib = rawDibHex?.let { hexToBytes(it) }
+            val dibHeader = dib?.let { readIntLe(it, 0) }
+            val dibBits = dib?.let { readShortLe(it, 14) }
+            report.check(
+                "window/clipboard-image-dib-structure",
+                v5 != null && v5.size >= 124 && v5Header?.first == 124 &&
+                    v5Header.second == 2 && v5Bits == 32 && v5Compression == 3 &&
+                    dib != null && dib.size >= 40 && dibHeader == 40 && dibBits == 32,
+                "CF_DIBV5 头=${v5Header?.first} 高=${v5Header?.second} ${v5Bits}bpp " +
+                    "compression=$v5Compression；CF_DIB 头=$dibHeader ${dibBits}bpp",
+            )
+        }
+        if (frame == 136) {
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。
             driveFrames = false
@@ -2948,6 +3104,45 @@ private fun simulateDrag(
         kind = kind,
     )
 }
+
+/** hex -> 字节（自检里独立解析剪贴板原始数据用；K/N 上没有 Character.digit）。 */
+private fun hexToBytes(hex: String): ByteArray =
+    ByteArray(hex.length / 2) { i ->
+        ((hexDigit(hex[i * 2]) shl 4) or hexDigit(hex[i * 2 + 1])).toByte()
+    }
+
+private fun hexDigit(c: Char): Int = when (c) {
+    in '0'..'9' -> c - '0'
+    in 'a'..'f' -> c - 'a' + 10
+    in 'A'..'F' -> c - 'A' + 10
+    else -> error("非法 hex 字符: $c")
+}
+
+/** 从 "StartFragment:" 之后解析十进制（解析不到返回 -1）。 */
+private fun parseDecimalAfter(text: String, key: String): Int {
+    val at = text.indexOf(key)
+    if (at < 0) return -1
+    var i = at + key.length
+    var value = 0
+    var digits = 0
+    while (i < text.length && text[i].isDigit()) {
+        value = value * 10 + (text[i] - '0')
+        i++
+        digits++
+    }
+    return if (digits == 0) -1 else value
+}
+
+/** 小端读 4 字节（剪贴板位图头是 little-endian）。 */
+private fun readIntLe(bytes: ByteArray, offset: Int): Int =
+    (bytes[offset].toInt() and 0xFF) or
+        ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
+        ((bytes[offset + 2].toInt() and 0xFF) shl 16) or
+        ((bytes[offset + 3].toInt() and 0xFF) shl 24)
+
+/** 小端读 2 字节。 */
+private fun readShortLe(bytes: ByteArray, offset: Int): Int =
+    (bytes[offset].toInt() and 0xFF) or ((bytes[offset + 1].toInt() and 0xFF) shl 8)
 
 /** 投递一条**真实**的 Win32 键盘/字符消息（同 [postRealMouse] 的说明）。 */
 private fun postRealKey(

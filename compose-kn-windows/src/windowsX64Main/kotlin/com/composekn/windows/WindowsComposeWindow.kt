@@ -473,6 +473,18 @@ class WindowsComposeWindow(
     fun setDropAccept(accept: Boolean): Boolean = win32Window?.setDropAccept(accept) ?: false
 
     /**
+     * 自检用：把剪贴板里某个格式的**原始字节**按 hex 读出来。
+     *
+     * 用途是独立校验「我们写进去的 CF_HTML 头 / 位图头到底长什么样」—— 只做
+     * `setHtml` -> `getHtml` 的往返是查不出「头里的偏移写错了」的（自己的读函数
+     * 可能正好用同样错的逻辑读回来）。
+     *
+     * formatName：注册格式名（`"HTML Format"` / `"Rich Text Format"`）或 `#<标准格式号>`
+     * （`#8` = CF_DIB、`#17` = CF_DIBV5）。
+     */
+    fun clipboardGetRawHex(formatName: String): String? = win32Window?.clipboardGetRawHex(formatName)
+
+    /**
      * 自检用：直接驱动注册好的 OLE IDropTarget（构造一个真的 IDataObject）。
      *
      * phase: 0=DragEnter 1=DragOver 2=DragLeave 3=Drop；kind: 0=文件 1=文本。

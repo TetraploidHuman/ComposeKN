@@ -86,6 +86,11 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · 想看空闲行为：ComposeKN-Windows-Native.exe --no-animate（关掉每帧动画）
   · 想强制后端：set COMPOSEKN_RENDER_API=software（或 gl）——日志里会写明实际用了哪条
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
+  · 富文本剪贴板：`Clipboard.getClipEntry()` / `ClipEntry.withHtml/withRtf/withImage`
+    支持 HTML（CF_HTML）、RTF、位图（CF_DIBV5 + 传统 CF_DIB）与纯文本回退；
+    `ClipEntry.getHtml()/getRtf()/getImage()/getPlainText()` 读回来。
+    一次写入会把条目里所有格式放进同一个剪贴板事务（分开写会互相擦掉）。
+    ⚠ Linux/Wayland 侧目前仍是纯文本（多 MIME 那条协议还没接）。
   · 拖放（接收侧）：从资源管理器拖文件、或从别的应用拖文本到窗口上，
     `Modifier.dragAndDropTarget` 会收到 onStarted/onEntered/onMoved/onDrop/onEnded。
     走的是真正的 OLE `IDropTarget`（和 AWT 同一条路），负载格式 CF_HDROP / CF_UNICODETEXT。
@@ -110,8 +115,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (181 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (178 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (190 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (187 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -135,13 +140,16 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            GetMessage -> TranslateMessage -> DispatchMessage -> 真实 wndproc 分支：
            悬停进出、按压/点击、竖向与横向滚轮、精确滚轮 zDelta=-40、真实点击聚焦文本框、
            真实按键输入字符都必须成立）、
+           **富文本剪贴板**：clipboard.setClip(ClipEntry.withHtml/withRtf/withImage)
+           -> CF_HTML（标准偏移头，含非 ASCII 片段）/ 注册格式 Rich Text Format /
+           CF_DIBV5 + 传统 CF_DIB，再读回来（含 2×2 四色逐像素校验与独立头解析）、
            **OLE 拖放（接收侧）**：真的 IDropTarget（OleInitialize + RegisterDragDrop）
            解析 CF_HDROP / CF_UNICODETEXT，按上游 ComposeSceneDragAndDropNode 的顺序
            派发给 Modifier.dragAndDropTarget（Enter/Over/Drop/Leave、负载、命中位置、
            effect 写回、shouldStartDragAndDrop 的筛选）、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
-           动画按刷新率节流）（63 条）
-  all    = 两者都跑（178 条断言）
+           动画按刷新率节流）（72 条）
+  all    = 两者都跑（187 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个
@@ -184,6 +192,8 @@ skiko 的指针输入层只在指针类型是鼠标时才合成 Enter/Exit 事�
                        一根按住的手指送进 Compose（点击被吞、单指被当双指），
                         现在只记一行、不派发
   mouse: 左键 DOWN/UP  鼠标按键（以前完全不进日志，所以"点击来源不明"时无从判断）
+  clipboard: 写入 N 个格式（文本=… HTML=… 字节 RTF=… 位图=…）
+                        富文本剪贴板写入摘要（一次事务里放了几个格式）
   drag: ENTER/OVER/DROP/LEAVE pos=x,y files=N textLen=M
                         OLE 拖放（接收侧）：文件数/文本长度；文件路径只记第一条，
                         全文在事件里（应用侧读 event.files）

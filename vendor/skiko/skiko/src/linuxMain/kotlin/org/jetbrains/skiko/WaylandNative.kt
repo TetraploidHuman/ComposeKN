@@ -192,6 +192,23 @@ object WaylandClipboard {
     fun setText(text: String) = memScoped {
         composekn_clipboard_set_text(text.cstr.ptr)
     }
+
+    // ---- 富文本格式：Wayland 侧**还没实现** ----
+    //
+    // 不是"忘了写"：Wayland 的剪贴板是 `wl_data_source` 一次声明**多个 MIME 类型**
+    // （text/plain;charset=utf-8、text/html、image/png…），然后在 `send` 回调里按
+    // 对方要的 MIME 回数据；接收侧是 `wl_data_offer.receive(mime)`。现在的 C 桥
+    // （wayland_window.cc）只实现了单一 text/plain 那条路，所以这里先把接口留出来、
+    // 让 compose-core 那份**共享**的 PlatformClipboard 两边都能编过：
+    //   * 读：回 null（= 没有这个格式）；
+    //   * 写：只写文本，HTML/RTF/位图**忽略**。
+    // 补齐要动 C 侧协议（多 MIME + send 回调），单独一轮做 —— 见 HANDOVER §17.34。
+    fun getHtml(): String? = null
+    fun getRtf(): String? = null
+    fun getImage(): ClipboardImage? = null
+    fun setRich(text: String?, html: String?, rtf: String?, image: ClipboardImage?) {
+        if (text != null) setText(text)
+    }
 }
 
 internal fun COpaquePointer.drainWaylandEvents(): List<WaylandEvent> = memScoped {

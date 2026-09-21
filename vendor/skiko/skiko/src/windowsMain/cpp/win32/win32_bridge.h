@@ -359,6 +359,80 @@ void composekn_win32_set_title(ComposeKNWin32Window* window, const char* title);
 void composekn_win32_clipboard_get_text(ComposeKNWin32Window* window, char* buffer, size_t buffer_size, bool* ok);
 void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window, const char* text);
 
+// ---------------------------------------------------------------------------
+// 剪贴板：富文本格式（CF_HTML / Rich Text Format / CF_DIBV5）
+//
+// 上游对齐点：桌面 Compose 的 `ClipEntry` 是「包住平台原生条目」的壳
+// （desktop 是 AWT `Transferable`，用 `asAwtTransferable` 读），格式能力由平台决定。
+// 我们这边同样由平台决定：Windows 用 CF_HTML（标准 HTML Clipboard Format，带
+// StartHTML/EndHTML/StartFragment/EndFragment 偏移头）、注册格式 "Rich Text Format"、
+// 以及 CF_DIBV5（32bpp BGRA 位图）。
+//
+// 所有 get 都是「写进你给的缓冲区」的两段式约定：
+//   * 没有这个格式/读不出来 -> 返回 -1；
+//   * 缓冲区太小 -> 返回**需要的字节数**（调用方按这个值重新开缓冲再调一次）；
+//   * 成功 -> 返回写入的字节数（不含结尾 NUL）。
+// ---------------------------------------------------------------------------
+
+/**
+ * **一次事务**里把多种格式放进剪贴板（Windows 的剪贴板是"一次 EmptyClipboard + 多次
+ * SetClipboardData"的模型 —— 分几次调用会把前一次的内容擦掉）。
+ *
+ * 传 nullptr / 0 表示"这个格式不要放"。text 会转成 CF_UNICODETEXT，html 会包上标准
+ * CF_HTML 头，rtf 走注册格式 "Rich Text Format"，image 走 CF_DIBV5。
+ *
+ * 这是 `Clipboard.setClipEntry()` 的平台层实现：应用给一个条目，里面有哪些格式就写哪些
+ * （Word/Chrome 都是这么放的 —— 老程序拿文本、支持 HTML 的拿 HTML）。
+ */
+void composekn_win32_clipboard_set_rich(
+    ComposeKNWin32Window* window,
+    const char* utf8_text,
+    const char* utf8_html,
+    const char* utf8_rtf,
+    int32_t image_width,
+    int32_t image_height,
+    const uint8_t* bgra);
+
+/**
+ * CF_HTML 里的**片段**（`<!--StartFragment-->` 与 `<!--EndFragment-->` 之间的那段 HTML），
+ * 不是整个剪贴板 blob —— 头部的偏移解析在 C 侧做掉，应用只需要管 HTML 本身。
+ */
+int32_t composekn_win32_clipboard_get_html(ComposeKNWin32Window* window, char* buffer, int32_t buffer_size);
+
+/** 把 HTML 片段包成标准 CF_HTML 头写进剪贴板（UTF-8）。 */
+void composekn_win32_clipboard_set_html(ComposeKNWin32Window* window, const char* utf8_html);
+
+/** 注册格式 "Rich Text Format" 的内容（RTF 本身是 ASCII，带 \uN 转义）。 */
+int32_t composekn_win32_clipboard_get_rtf(ComposeKNWin32Window* window, char* buffer, int32_t buffer_size);
+void composekn_win32_clipboard_set_rtf(ComposeKNWin32Window* window, const char* utf8_rtf);
+
+/**
+ * CF_DIBV5 位图，统一转成 **BGRA、每像素 4 字节、自上而下、stride = width*4**。
+ *
+ * 两段式：`buffer == NULL || buffer_size == 0` 时只回需要的字节数（没有图片回 -1）；
+ * 否则把尺寸写进 out[0]=width、out[1]=height 并返回写入的字节数。
+ *
+ * 读的时候支持 CF_DIBV5(124 字节头) / CF_DIB(40 字节头) / CF_DIB(12 字节 CORE 头)，
+ * 32bpp 与 24bpp、自上而下与自下而上都处理；**调色板/压缩格式（RLE 等）不支持**
+ * （回 -1 并记一行日志），需要的话再补。
+ */
+int32_t composekn_win32_clipboard_get_image(
+    ComposeKNWin32Window* window, uint8_t* buffer, int32_t buffer_size, int32_t* out_size);
+
+/** width/height 是像素；`bgra` 必须自上而下、stride = width*4。 */
+void composekn_win32_clipboard_set_image(
+    ComposeKNWin32Window* window, int32_t width, int32_t height, const uint8_t* bgra);
+
+/**
+ * 自检用：把剪贴板里某个格式的**原始字节**（hex）读出来，供测试独立校验
+ * 「我们写进去的 CF_HTML 头/位图头到底长什么样」。
+ *
+ * format_name：`"HTML Format"` / `"Rich Text Format"`（注册格式名），或以 `#` 开头的
+ * 标准格式号（例如 `"#8"` = CF_DIB、`"#17"` = CF_DIBV5）。没有该格式回 -1。
+ */
+int32_t composekn_win32_clipboard_get_raw_hex(
+    ComposeKNWin32Window* window, const char* format_name, char* buffer, int32_t buffer_size);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
