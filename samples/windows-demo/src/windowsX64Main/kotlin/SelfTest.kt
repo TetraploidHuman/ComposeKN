@@ -248,6 +248,15 @@ class InteractionProbe {
     var lastPointerUptime by mutableStateOf(-1L)
     var lastPointerPosition by mutableStateOf(Offset.Zero)
 
+    /**
+     * 探针收到的指针事件次数 + 最后一次的 `pressed`。
+     *
+     * 「悬停不能变成一根凭空按下的手指」这条断言靠它（§17.29）：悬停事件应当在
+     * 宿主侧就被丢掉 —— 探针既不该收到事件，更不该看到 `pressed=true`。
+     */
+    var pointerEventCount by mutableStateOf(0)
+    var lastPointerPressed by mutableStateOf(false)
+
     /** 性能自检：true 时界面进入「一直在动画」的状态（withFrameNanos 每帧 +1）。 */
     var animate by mutableStateOf(false)
 
@@ -453,7 +462,8 @@ private fun DeterministicTestScreen(
             )
 
             // 事件时间戳探针：把 Compose 指针输入层看到的 `uptimeMillis` 记下来。
-            // 不消费事件、不画像素 —— 只是「宿主到底喂了什么时间给我」的观测点（§17.24）。
+            // 不消费事件、不画像素 —— 只是「宿主到底喂了什么时间给我」的观测点（§17.24），
+            // 顺带记录 pressed（§17.29：悬停事件根本不该到这里）。
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -466,6 +476,8 @@ private fun DeterministicTestScreen(
                                 e.changes.forEach { change ->
                                     probe.lastPointerUptime = change.uptimeMillis
                                     probe.lastPointerPosition = change.position
+                                    probe.lastPointerPressed = change.pressed
+                                    probe.pointerEventCount++
                                 }
                             }
                         }
@@ -686,6 +698,39 @@ private fun logicChecks(report: SelfTestReport) {
         "logic/gallery-probe-summary",
         probe.summary().contains("clicks=0") && probe.summary().contains("theme=light"),
         probe.summary(),
+    )
+
+    // 触点状态机（HANDOVER §17.29）：**只有 DOWN 能新建触点**。
+    // 笔悬停时 Windows 一直发 WM_POINTERUPDATE，它们到这里就是"没有 DOWN 的 Move"；
+    // 老实现把任意新 id 都当成按下加进表里 → Compose 那边凭空多一根按住的手指。
+    // 这条在纯逻辑层直接盯住状态机（离屏那条测的是端到端「探针根本收不到事件」）。
+    val touchState = WindowsInputState()
+    val hoverMove = touchState.updateTouch(
+        WindowsEvent.TouchEvent(pointerId = 1L, x = 5, y = 6, phase = TouchPhase.Move),
+    )
+    val hoverUp = touchState.updateTouch(
+        WindowsEvent.TouchEvent(pointerId = 1L, x = 5, y = 6, phase = TouchPhase.Up),
+    )
+    val realDown = touchState.updateTouch(
+        WindowsEvent.TouchEvent(pointerId = 1L, x = 5, y = 6, phase = TouchPhase.Down),
+    )
+    val realMove = touchState.updateTouch(
+        WindowsEvent.TouchEvent(pointerId = 1L, x = 7, y = 8, phase = TouchPhase.Move),
+    )
+    val realUp = touchState.updateTouch(
+        WindowsEvent.TouchEvent(pointerId = 1L, x = 7, y = 8, phase = TouchPhase.Up),
+    )
+    report.check(
+        "logic/inputstate-touch-needs-down",
+        hoverMove.isEmpty() && hoverUp.isEmpty() &&
+            touchState.droppedUntrackedTouchCount == 2 &&
+            realDown.size == 1 && realDown[0].pressed &&
+            realMove.size == 1 && realMove[0].pressed && realMove[0].position == Offset(7f, 8f) &&
+            realUp.size == 1 && !realUp[0].pressed &&
+            touchState.activeTouchCount == 0,
+        "无主 MOVE/UP 应丢（实际 ${hoverMove.size}/${hoverUp.size} 条，期望 0/0；累计丢弃 " +
+            "${touchState.droppedUntrackedTouchCount} 期望 2）；真实 DOWN→MOVE→UP 应照常" +
+            "（${realDown.size}/${realMove.size}/${realUp.size} 条，抬起后触点 ${touchState.activeTouchCount} 期望 0）",
     )
 }
 
@@ -924,6 +969,100 @@ private fun renderChecks(report: SelfTestReport) {
         !probe.probeButtonHovered && probe.probeButtonHoverExits == hoverExitsBeforeTouch + 1,
         "鼠标移开按钮：probeButtonHovered=${probe.probeButtonHovered}（期望 false），" +
             "HoverInteraction.Exit=${probe.probeButtonHoverExits - hoverExitsBeforeTouch} 次（期望 1）",
+    )
+
+    // (a3) 悬停（**没有 DOWN** 的 MOVE/UP）不能变成一根凭空按下的手指（HANDOVER §17.29）。
+    //
+    // 真机现场（v0.5.10 日志）：笔悬停时 Windows 一直发 WM_POINTERUPDATE，日志里表现为
+    // `touch: MOVE id=253 … active=0`（C++ 触点表只在 DOWN 时加人，所以 active=0 就说明
+    // 这根"手指"从来没按下过）。老实现把这些事件也当成触摸加进表里（pressed=true）——
+    // Compose 对没见过的 id 取 previousDown=false，于是 `changedToDown` 成立，
+    // 悬停就变成"有人按住不放"：点击被吞（fastAll{changedToUp} 不再成立）、单指被当双指。
+    //
+    // 断言两件事：悬停事件**根本不到** Compose（探针计数不变、pressed 不变），
+    // 以及宿主自己记下了「丢掉过 2 条无主事件」（MOVE + UP 各一条）。
+    val hoverProbeX = ((TIME_PROBE_X_DP + 20) * d).toInt()
+    val hoverProbeY = contentTop + ((TIME_PROBE_Y_DP + 20) * d).toInt()
+    val pointerEventsBeforeHover = probe.pointerEventCount
+    val pressedBeforeHover = probe.lastPointerPressed
+    val droppedBeforeHover = app.droppedUntrackedTouchCount
+    app.dispatchEvent(
+        WindowsEvent.TouchEvent(
+            pointerId = 41L, x = hoverProbeX, y = hoverProbeY,
+            phase = TouchPhase.Move, timeMillis = 6000L,
+        ),
+    )
+    driver.render(800, 600, density = d, frames = 2)
+    app.dispatchEvent(
+        WindowsEvent.TouchEvent(
+            pointerId = 41L, x = hoverProbeX, y = hoverProbeY,
+            phase = TouchPhase.Up, timeMillis = 6010L,
+        ),
+    )
+    driver.render(800, 600, density = d, frames = 2)
+    report.check(
+        "interaction/touch-hover-does-not-press",
+        probe.pointerEventCount == pointerEventsBeforeHover &&
+            probe.lastPointerPressed == pressedBeforeHover &&
+            !probe.lastPointerPressed &&
+            app.activeTouchCount == 0 &&
+            app.droppedUntrackedTouchCount == droppedBeforeHover + 2,
+        "悬停 MOVE+UP 之后：探针收到事件 ${probe.pointerEventCount - pointerEventsBeforeHover} 条（期望 0）、" +
+            "lastPointerPressed=${probe.lastPointerPressed}（期望 false）、" +
+            "activeTouchCount=${app.activeTouchCount}（期望 0）、" +
+            "宿主丢弃无主事件 ${app.droppedUntrackedTouchCount - droppedBeforeHover} 条（期望 2）",
+    )
+
+    // (a4) 按住 + 抖动 ≈ 真机形状（v0.5.10 日志里那次是 645ms / 66 条 ~100Hz 的静止上报）：
+    //      **恰好一次** click / Press / Release，不能有 Cancel。
+    //      真机日志里同一时刻出现过「按住期间 onClick 被调 10 次」——那次的来源还没定论
+    //      （触摸流里只有一对 DOWN/UP，所以最可能是鼠标/键盘路径，v0.5.11 加了这两条
+    //      通道的日志去定位）。这里先把"触摸按住抖动"这条路径本身钉死。
+    val clicksBeforeHold = probe.clickCount
+    val pressesBeforeHold = probe.probeButtonPresses
+    val releasesBeforeHold = probe.probeButtonReleases
+    val cancelsBeforeHold = probe.probeButtonCancels
+    val holdId = 42L
+    val holdX = hoverButtonX
+    val holdY = hoverButtonY
+    app.dispatchEvent(
+        WindowsEvent.TouchEvent(
+            pointerId = holdId, x = holdX, y = holdY,
+            phase = TouchPhase.Down, timeMillis = 7000L,
+        ),
+    )
+    driver.render(800, 600, density = d, frames = 1)
+    for (i in 1..40) {
+        // 总位移始终远小于 slop（~18px），但每一步都在动 —— 真机数字转换器就是这样
+        val dx = if (i % 3 == 0) 3 else -2
+        val dy = if (i % 4 == 0) 2 else -1
+        app.dispatchEvent(
+            WindowsEvent.TouchEvent(
+                pointerId = holdId, x = holdX + dx, y = holdY + dy,
+                phase = TouchPhase.Move, timeMillis = 7000L + i * 16L,
+            ),
+        )
+        driver.render(800, 600, density = d, frames = 1)
+    }
+    app.dispatchEvent(
+        WindowsEvent.TouchEvent(
+            pointerId = holdId, x = holdX, y = holdY,
+            phase = TouchPhase.Up, timeMillis = 7000L + 41 * 16L,
+        ),
+    )
+    driver.render(800, 600, density = d, frames = 3)
+    report.check(
+        "interaction/touch-hold-jitter-clicks-once",
+        probe.clickCount == clicksBeforeHold + 1 &&
+            probe.probeButtonPresses == pressesBeforeHold + 1 &&
+            probe.probeButtonReleases == releasesBeforeHold + 1 &&
+            probe.probeButtonCancels == cancelsBeforeHold &&
+            !probe.probeButtonHovered,
+        "按住 650ms + 40 次抖动（~100Hz、总位移 <slop）后：click=${probe.clickCount - clicksBeforeHold}（期望 1）、" +
+            "Press=${probe.probeButtonPresses - pressesBeforeHold}（期望 1）、" +
+            "Release=${probe.probeButtonReleases - releasesBeforeHold}（期望 1）、" +
+            "Cancel=${probe.probeButtonCancels - cancelsBeforeHold}（期望 0）、" +
+            "probeButtonHovered=${probe.probeButtonHovered}（期望 false）",
     )
 
     // (b) 触摸拖动能滚吗？

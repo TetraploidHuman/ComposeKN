@@ -57,6 +57,14 @@ class WindowsComposeApplication(
      */
     val activeTouchCount: Int get() = inputState.activeTouchCount
 
+    /**
+     * 「没有 DOWN 的 MOVE/UP」被宿主丢弃的次数。
+     *
+     * 笔悬停时（不接触数字转换器）Windows 会一直发 `WM_POINTERUPDATE`，到达宿主时
+     * 同样是"移动"事件；丢掉它们的原因见 `WindowsInputState.updateTouch` / HANDOVER §17.29。
+     */
+    val droppedUntrackedTouchCount: Int get() = inputState.droppedUntrackedTouchCount
+
     /** 打开后每条触摸事件都 println 一行（自检/真机排查触摸问题时用）。 */
     var debugTouchTrace: Boolean
         get() = inputState.debugTouchTrace

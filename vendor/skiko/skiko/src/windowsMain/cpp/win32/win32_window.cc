@@ -154,6 +154,13 @@ struct ComposeKNWin32Window {
     int touchLogNext = 0;
     // 这台机器上见过多少次「同一毫秒内两条移动事件」（上面那个 bug 的现场特征）。
     int touchSameTickMoveCount = 0;
+    // 笔悬停（没有 DOWN 的 WM_POINTERUPDATE）的计数 + 日志节流状态。
+    int touchHoverCount = 0;
+    int touchHoverLogCount = 0;
+    uint32_t touchHoverLastId = 0;
+    // 输入诊断（点不动/点击来源定位用）：鼠标按键与按键事件的日志条数上限。
+    int mouseLogCount = 0;
+    int keyLogCount = 0;
     // 当前按下的指针集合 + 本次手势的摘要。
     //
     // 为什么需要「最大同时触点数」：真机反馈「双指缩放的时候列表也跟着滚」时必须能一眼
@@ -1113,6 +1120,18 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             e.b = static_cast<int32_t>((lParam >> 16) & 0xFF);
             e.modifiers = queryCurrentModifiers();
             pushEvent(window, e);
+            // 诊断：Compose 的 clickable 在 **KeyUp**（VK_RETURN / VK_SPACE）上会
+            // `performClick()`，所以"点击来源不明"时也必须能看见键盘通道
+            // （v0.5.10 真机日志里按住期间 onClick 被调 10 次，就需要这条来排除/确认）。
+            // 上限 600 行：按住一个键狂抖也压不垮日志。
+            if (window != nullptr && window->keyLogCount < 600) {
+                ++window->keyLogCount;
+                // prevDown = lParam bit30「这条消息之前那个键是否已经按下」：
+                // 对 KeyDown 来说 1 就是**系统的自动重复**（按住不放），KeyUp 恒为 1。
+                composeknLog("key: %s vk=0x%02X prevDown=%d",
+                             e.state == 1u ? "DOWN" : "UP", vk,
+                             (lParam & (1L << 30)) != 0 ? 1 : 0);
+            }
             break;
         }
         case WM_CHAR:
@@ -1173,6 +1192,17 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             e.b = 0;
             e.modifiers = queryCurrentModifiers();
             pushEvent(window, e);
+            // 诊断：鼠标按键**从来不进日志**，于是「onClick 被调了 N 次但触摸流里只有一对
+            // DOWN/UP」这种现场完全无从判断（v0.5.10 真机日志里出现过按住期间 onClick 被调
+            // 10 次）。鼠标按下/抬起量很少，全记（上限 600 行防呆）。
+            if (window != nullptr && window->mouseLogCount < 600) {
+                ++window->mouseLogCount;
+                composeknLog("mouse: %s %s pos=%ld,%ld",
+                             buttonId == 272u ? "左键" : buttonId == 274u ? "右键" : "中键",
+                             e.state == 1u ? "DOWN" : "UP",
+                             static_cast<long>(GET_X_LPARAM(lParam)),
+                             static_cast<long>(GET_Y_LPARAM(lParam)));
+            }
             break;
         }
         case WM_MOUSEWHEEL: {
@@ -1232,11 +1262,57 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             const uint32_t pointerId = static_cast<uint32_t>(GET_POINTERID_WPARAM(wParam));
             // 只认触摸/笔：鼠标（EnableMouseInPointer 之后也会产生 WM_POINTER）走
             // WM_MOUSE* 通道，否则一次移动会变成两条事件。
+            POINTER_INPUT_TYPE pointerType = PT_POINTER;
+            bool havePointerType = false;
             if (message != WM_POINTERCAPTURECHANGED && g_getPointerType != nullptr) {
-                POINTER_INPUT_TYPE pointerType = PT_POINTER;
-                if (g_getPointerType(pointerId, &pointerType) &&
-                    pointerType != PT_TOUCH && pointerType != PT_PEN) {
-                    break;
+                if (g_getPointerType(pointerId, &pointerType)) {
+                    havePointerType = true;
+                    if (pointerType != PT_TOUCH && pointerType != PT_PEN) {
+                        break;
+                    }
+                }
+            }
+            const char* typeName = !havePointerType ? "?"
+                                 : pointerType == PT_TOUCH ? "TOUCH"
+                                 : pointerType == PT_PEN   ? "PEN"
+                                                           : "OTHER";
+            // ------------------------------------------------------------------
+            // 悬停（**没有 DOWN 的 WM_POINTERUPDATE**）不是触摸事件，必须丢掉。
+            //
+            // 笔悬停（离屏幕还有距离）时 Windows 会一直发 WM_POINTERUPDATE：
+            // POINTER_FLAG_INRANGE 有，POINTER_FLAG_INCONTACT / DOWN 没有。这类事件
+            // 以前被当成"触摸移动"送进 Compose，Kotlin 侧对没见过的 id 会建一根
+            // **pressed=true** 的触点 —— 悬停期间 Compose 就以为有人按住不放
+            // （点击被吞、单指被当双指、速度估计器被喂进悬停轨迹）。真机日志见 HANDOVER §17.29。
+            //
+            // 判据取"保守交集"：既不在我们的触点表里、又没有任何"接触"标志。
+            // 触摸的 UPDATE 一定有 DOWN 在前（表里就有），所以对触摸零影响。
+            // ------------------------------------------------------------------
+            if (message == WM_POINTERUPDATE && !touchIsActive(window, pointerId) &&
+                g_getPointerInfo != nullptr) {
+                POINTER_INFO hoverInfo{};
+                if (g_getPointerInfo(pointerId, &hoverInfo)) {
+                    const bool inContact = (hoverInfo.pointerFlags & POINTER_FLAG_INCONTACT) != 0;
+                    const bool isDownFlag = (hoverInfo.pointerFlags & POINTER_FLAG_DOWN) != 0;
+                    if (!inContact && !isDownFlag) {
+                        POINT hoverPt = hoverInfo.ptPixelLocation;
+                        ScreenToClient(hwnd, &hoverPt);
+                        ++window->touchHoverCount;
+                        // 悬停轨迹可能几百条/秒：只记前几条 + 换指针时的第一条。
+                        if (window->touchHoverLogCount < 6 ||
+                            window->touchHoverLastId != pointerId) {
+                            ++window->touchHoverLogCount;
+                            window->touchHoverLastId = pointerId;
+                            composeknLog(
+                                "pointer: 悬停（不是触摸，已丢弃）id=%u type=%s flags=0x%lX "
+                                "pos=%ld,%ld 累计=%d",
+                                pointerId, typeName,
+                                static_cast<unsigned long>(hoverInfo.pointerFlags),
+                                static_cast<long>(hoverPt.x), static_cast<long>(hoverPt.y),
+                                window->touchHoverCount);
+                        }
+                        return 0;  // 处理掉了，但不产生任何 Compose 事件
+                    }
                 }
             }
             ComposeKNWin32Event e{};
@@ -1279,12 +1355,17 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 POINT pt{};
                 bool got = false;
                 uint32_t rawTime = 0;
+                // 有的驱动把「首次接触」也放在 WM_POINTERUPDATE 里（带 POINTER_FLAG_DOWN），
+                // 而不是发 WM_POINTERDOWN。这种必须当成 DOWN 建触点，否则整段接触都收不到
+                // （配合 Kotlin 侧「没有 DOWN 的 MOVE 一律丢弃」会把整根手指吞掉）。
+                bool updateCarriesDown = false;
                 if (g_getPointerInfo != nullptr) {
                     POINTER_INFO info{};
                     if (g_getPointerInfo(pointerId, &info)) {
                         pt = info.ptPixelLocation;
                         // dwTime = 「消息收到时的系统 tick」（毫秒）；0 时退回消息时间。
                         rawTime = info.dwTime;
+                        updateCarriesDown = (info.pointerFlags & POINTER_FLAG_DOWN) != 0;
                         got = true;
                     }
                 }
@@ -1300,7 +1381,9 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 }
                 e.type = message == WM_POINTERDOWN ? COMPOSEKN_WIN32_EVENT_TOUCH_DOWN
                        : message == WM_POINTERUP   ? COMPOSEKN_WIN32_EVENT_TOUCH_UP
-                                                   : COMPOSEKN_WIN32_EVENT_TOUCH_MOVE;
+                       : (updateCarriesDown && !touchIsActive(window, pointerId))
+                             ? COMPOSEKN_WIN32_EVENT_TOUCH_DOWN
+                             : COMPOSEKN_WIN32_EVENT_TOUCH_MOVE;
                 e.state = (message == WM_POINTERUP) ? 0u : 1u;
                 e.x = static_cast<float>(pt.x);
                 e.y = static_cast<float>(pt.y);
@@ -1317,7 +1400,17 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             if (prev != nullptr && e.type == COMPOSEKN_WIN32_EVENT_TOUCH_MOVE &&
                 eventTime == prev->time && (e.x != prev->x || e.y != prev->y)) {
                 // 诊断核心：同一毫秒里两条**移动**事件 —— 速度估计器的时间轴被压扁的现场。
+                // 只在次数变化时记（以前把累计值写在"手势结束"里，每个手势结束都重复打一遍
+                // 同一个数字，日志里刷了几百行一模一样的 "累计 … 1 次"）。
                 ++window->touchSameTickMoveCount;
+                if (window->touchSameTickMoveCount <= 3) {
+                    composeknLog(
+                        "touch: 同一毫秒内两条移动事件（第 %d 次）id=%u t=%ums "
+                        "pos=(%.0f,%.0f)←(%.0f,%.0f)（修复后应为 0）",
+                        window->touchSameTickMoveCount, pointerId, eventTime,
+                        static_cast<double>(e.x), static_cast<double>(e.y),
+                        static_cast<double>(prev->x), static_cast<double>(prev->y));
+                }
             }
 
             // ---- 触点表 + 本次手势摘要 ----
@@ -1362,16 +1455,16 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 ++window->touchLogCount;
                 if (prev != nullptr) {
                     composeknLog(
-                        "touch: %-12s id=%u t=%ums dt=%ums d=(%+.0f,%+.0f) pos=%.0f,%.0f active=%zu",
+                        "touch: %-12s id=%u t=%ums dt=%ums d=(%+.0f,%+.0f) pos=%.0f,%.0f active=%zu type=%s",
                         phase, pointerId, eventTime, eventTime - prev->time,
                         static_cast<double>(e.x - prev->x), static_cast<double>(e.y - prev->y),
                         static_cast<double>(e.x), static_cast<double>(e.y),
-                        window->touchActiveIds.size());
+                        window->touchActiveIds.size(), typeName);
                 } else {
-                    composeknLog("touch: %-12s id=%u t=%ums pos=%.0f,%.0f active=%zu",
+                    composeknLog("touch: %-12s id=%u t=%ums pos=%.0f,%.0f active=%zu type=%s",
                                  phase, pointerId, eventTime,
                                  static_cast<double>(e.x), static_cast<double>(e.y),
-                                 window->touchActiveIds.size());
+                                 window->touchActiveIds.size(), typeName);
                 }
             }
             if (gestureEnded) {
@@ -1391,10 +1484,6 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                     static_cast<double>(window->touchGesture.lastY - window->touchGesture.startY),
                     window->touchGesture.maxSimultaneous);
                 window->touchGesture = ComposeKNWin32Window::TouchGestureSummary{};
-                if (window->touchSameTickMoveCount > 0) {
-                    composeknLog("touch: 本进程累计「同一毫秒内两条移动事件」%d 次（修复后应为 0）",
-                                 window->touchSameTickMoveCount);
-                }
             }
             storeTouchSample(window, pointerId, eventTime, e.x, e.y);
             // 明确"我处理了这条指针消息"（不交给 DefWindowProc）：

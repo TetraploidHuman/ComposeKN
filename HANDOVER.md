@@ -2719,3 +2719,130 @@ logic **109**（+7）/ window 37（合计 146）、`all` **143** —— 全绿�
 没有笔可以实测，所以**没动**。若要修，最小改法是给 UPDATE 加一句
 「`!touchIsActive(id)` 就忽略」（触摸必然先有 DOWN，因此对触摸零影响），外加把
 `POINTER_INFO.pointerFlags` 的 `INCONTACT` 也纳入判断。
+
+### 17.29 真机日志（v0.5.10）三个发现：hover 修好了 / 笔悬停会凭空多一根手指 / 还有 10 次来源不明的 click（v0.5.11）
+
+用户在真机上跑 v0.5.10 并把 `composekn-startup.log` 发了回来。三条结论，逐条都有日志行做证。
+
+#### (1) ✅ 「悬停/点击试试」的触摸反馈修好了
+
+日志里每次触摸点那个绿盒子都会写一行（点击次数单调递增）：
+
+```
+[12:55:23.268] hoverbox: 点击 clicks=1 hovered=false
+[12:55:23.734] hoverbox: 点击 clicks=2 hovered=false
+[12:55:24.098] hoverbox: 点击 clicks=3 hovered=false
+```
+
+`hovered=false` 每次都成立 —— 正是 §17.28 的结论（触摸拿不到 hover，所以可见反馈必须由
+`click`/`pressed` 提供，而不是靠 `hoverable`）。这条不用再改。
+
+#### (2) ⚠️ 真 bug：**笔悬停会被当成一根"按住的手指"**（§17.28 里预估的隐患，这次抓到了现场）
+
+日志里出现了大量**没有 DOWN 的 MOVE**：
+
+```
+[12:55:28.611] touch: MOVE  id=253 t=5391ms pos=1312,796 active=0
+[12:55:28.615] touch: MOVE  id=253 t=5399ms dt=8ms d=(+0,+0) pos=1312,796 active=0
+...  （250~300Hz，位置缓慢游走）
+[12:55:28.981] touch: DOWN  id=253 t=5759ms pos=1173,789 active=1     ← 真接触
+[12:55:29.240] touch: UP    id=253 t=6029ms pos=1159,786 active=0
+[12:55:29.245] touch: MOVE  id=253 t=6029ms pos=1159,787 active=0    ← 又回到悬停
+```
+
+`active=0` 是关键：C++ 侧的触点表只在 `WM_POINTERDOWN` 时加人，所以 `active=0` 的 MOVE
+= "这根指针从来没有按下过" = **笔在悬停**（`POINTER_FLAG_INRANGE` 有、`INCONTACT` 没有；
+接触时会先来 DOWN，抬起后又会回到悬停 —— 同一个 id 反复出现正是笔的行为）。
+一个 `t=0ms 时长=0ms 事件=1` 的"手势结束"跟着每条悬停事件刷屏，也是同一个原因。
+
+**为什么这是 bug**（老代码路径，逐行可查）：
+
+1. `WindowsInputState.updateTouch()` 把**任何**没见过的 id 都写进触点表，且
+   `pressed = phase != Up` → 悬停 MOVE 被当成 `pressed=true` 的触点；
+2. Compose 的 `PointerInputChangeEventProducer`（`PointerInputEventProcessor.kt:194-198`）
+   对**没见过的 id** 取 `previousDown = false` → `pressed && !previousPressed` 成立
+   → `changedToDown` 成立 → `PointerInputEventProcessor.process` 会对它做命中测试并加进
+   `HitPathTracker`；
+3. 于是 Compose 以为有人**按住不放**：`changes.fastAll { it.changedToUp() }` 不再成立
+   （点击被吞）、单指被当成双指（捏合/缩放误触发）、速度估计器被喂进悬停轨迹。
+
+日志里的连带噪音：`touch: 本进程累计「同一毫秒内两条移动事件」1 次（修复后应为 0）`
+在每个手势结束时重复打印（累计值不变、行却刷了几百行），而那个"1 次"正是悬停/抬起
+同毫秒造成的，不是真接触。
+
+**修法（三处，都在"只有 DOWN 才算按下"这一条原则上）**：
+
+| 位置 | 改动 |
+|---|---|
+| `WindowsInputState.updateTouch`（Kotlin） | 只有 `Down` 能新建触点；没有 DOWN 的 MOVE/UP 直接丢弃（计数 `droppedUntrackedTouchCount` 供自检） |
+| `win32_window.cc`（C++） | 悬停判据 = `WM_POINTERUPDATE` + 不在触点表 + `pointerFlags` 里既没有 `INCONTACT` 也没有 `DOWN` → 记一条 `pointer: 悬停（不是触摸，已丢弃）… type=PEN/TOUCH flags=0x…`，**不派发**（只记前 6 条，其余只计数） |
+| `win32_window.cc`（C++） | 反过来：`WM_POINTERUPDATE` 带 `POINTER_FLAG_DOWN`（有的驱动把首次接触放在 UPDATE 里）且不在触点表 → 当成 **DOWN** 建触点，否则配合 Kotlin 那条"没 DOWN 就丢"会把整根手指吞掉 |
+
+触摸的 UPDATE 必然有 DOWN 在前（触点表里有），所以这个判据对触摸**零影响**。
+
+**先红后绿**（临时把 Kotlin 那条守卫退回老行为，重新链接后跑 `--only=logic`）：
+
+```
+SELFTEST FAIL : logic/inputstate-touch-needs-down — 无主 MOVE/UP 应丢（实际 1/1 条，期望 0/0；累计丢弃 0 期望 2）
+SELFTEST FAIL : interaction/touch-hover-does-not-press — 悬停 MOVE+UP 之后：探针收到事件 3 条（期望 0）、
+                宿主丢弃无主事件 0 条（期望 2）
+```
+
+装回修复后两条都过。新增/相关的自检：
+
+* `logic/inputstate-touch-needs-down`：纯状态机（悬停 MOVE/UP 丢弃、真实 DOWN→MOVE→UP 照常）；
+* `interaction/touch-hover-does-not-press`：端到端（悬停事件**根本到不了** Compose：
+  时间探针计数不变、`lastPointerPressed` 不变、`activeTouchCount=0`、宿主记下丢弃 2 条）；
+* `interaction/touch-hold-jitter-clicks-once`：按住 650ms + 40 次抖动（~100Hz、总位移 < slop）
+  → **恰好一次** click / Press / Release、无 Cancel（真机那次是 645ms/66 条静止上报）。
+
+#### (3) ❓ 还有 10 次**来源不明**的 `hoverbox: 点击`（本次只加了日志，没下结论）
+
+同一次按住（id=252，25.810 DOWN → 26.488 UP，645ms、66 条 MOVE、位移 (+7,−5)）期间，
+`onClick` 被调了 **10 次**（clicks=4…13，间隔 5~19ms）：
+
+```
+[12:55:25.810] touch: DOWN id=252 t=2594ms pos=1058,805 active=1
+[12:55:26.379] hoverbox: 点击 clicks=4 hovered=false
+...
+[12:55:26.488] hoverbox: 点击 clicks=13 hovered=false
+[12:55:26.488] touch: UP   id=252 t=3239ms pos=1065,800 active=0
+```
+
+**触摸流里只有一对 DOWN/UP**，而 Compose 的 `clickable` 只在 `changedToUp()` 时
+`performClick()`（或键盘 Enter/Space 的 KeyUp）—— 所以这 10 次不可能来自触摸通道：
+
+* 那次按住期间**还没有**悬停事件（id=253 的悬停从 28.611 才开始，晚了 2.1 秒），排除 (2)；
+* 说明来源是**鼠标**或**键盘**通道 —— 而这两条通道以前**完全不进日志**。
+
+所以 v0.5.11 把这两条通道补上（量小、都带上限）：
+
+* `mouse: 左键 DOWN pos=x,y` —— 每个鼠标按下/抬起一行（上限 600）；
+* `key: DOWN vk=0x0D prevDown=0` —— 每个按键事件一行（`prevDown` 就是 lParam bit30：
+  KeyDown 上为 1 = 系统自动重复；上限 600）；
+* `touch: … type=TOUCH/PEN` —— 触摸行加上指针类型（这次就是靠它才能确认 (2) 到底是笔还是触摸屏）；
+* `hoverbox: 按下 pos=… / 抬起 / 取消（按下被吞）` —— 画布里那个盒子把 `PressInteraction`
+  也记进日志，带**节点内坐标**：指针路径的坐标是按下点，键盘路径用的是 `centerOffset`
+  （控件正中心），一眼能分开。
+
+下次真机日志里这 10 行应该会有对应的 `mouse:` 或 `key:` 行（或者 `hoverbox: 按下` 的坐标
+全都等于控件中心 → 键盘路径）。在那之前不下结论。
+
+#### 一个待定的设计问题：笔该走触摸通道还是鼠标通道
+
+本宿主把 `PT_PEN` 也收进触摸通道（当初是为了修「触摸屏能点不能滑」），代价是：
+
+* 笔悬停拿不到 hover（skiko 只对 `PointerType.Mouse` 合成 Enter/Exit，见 §17.28）——
+  也就是说**笔用户看不到任何 hover 效果**；
+* 笔拖动会像手指一样滚动列表；
+* 就是 (2) 那类"悬停被当成按下"的风险面。
+
+上游 AWT/Compose Desktop 的笔是**被系统提升成鼠标**的（所以笔能 hover、但拖不动列表）。
+要不要把 `PT_PEN` 交回 DefWindowProc（让系统提升成鼠标、与上游一致）需要真机验证 ——
+**必须有笔实测**才能改（没有笔就测不了"提升到底有没有发生"，赌错会让笔彻底没反应）。
+这个问题留给用户决定。
+
+#### 验证
+
+logic **112**（+3）/ window 37（合计 **149**）、`all` **146** —— 全绿；打包单文件 exe
+（无 `icudtl.dat`）干净目录复测。

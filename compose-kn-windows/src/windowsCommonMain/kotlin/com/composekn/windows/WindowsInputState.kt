@@ -106,14 +106,41 @@ class WindowsInputState {
 
     val activeTouchCount: Int get() = activeTouches.size
 
+    /**
+     * 「没有 DOWN 的 MOVE/UP」被丢掉的次数（诊断用）。
+     *
+     * 这不是异常输入：**笔在悬停时**（不接触数字转换器）Windows 会持续发
+     * `WM_POINTERUPDATE`，到达这里时同样是 `TouchPhase.Move`。这类事件必须在
+     * 触点表之外丢弃，理由见 [updateTouch]。
+     */
+    var droppedUntrackedTouchCount: Int = 0
+        private set
+
     /** 打开后每一条触摸事件都会 println 一行（自检/真机排查触摸问题时用）。 */
     var debugTouchTrace: Boolean = false
 
     /**
      * 更新触点表，返回本次事件应该发给 Compose 的完整触点列表。
+     *
+     * **只有 `DOWN` 会新建触点**：没有先见过 DOWN 的 MOVE/UP 一律丢弃。
+     *
+     * 为什么必须丢（v0.5.10 的真机日志抓到的现场，见 HANDOVER §17.29）：笔悬停时
+     * Windows 会一直发 `WM_POINTERUPDATE`（`POINTER_FLAG_INRANGE` 有、`INCONTACT`
+     * 没有）。老实现把**任何**没见过的 id 都当成"按下"加进表里
+     * （`pressed = phase != Up`），于是 Compose 那边凭空多出一根**按住的手指**：
+     * `PointerInputChangeEventProducer` 对没见过的 id 取 `previousDown = false`
+     * → `changedToDown` 成立 → 命中测试与手势识别器都以为有人按下。
+     * 真机后果：悬停期间控件处于"被按住"状态（`fastAll { changedToUp() }` 不再成立
+     * → 点击被吞）、单指手势被当成双指、速度估计器被喂进悬停轨迹。
      */
     fun updateTouch(event: WindowsEvent.TouchEvent): List<ComposeScenePointer> {
         val position = Offset(event.x.toFloat(), event.y.toFloat())
+        val tracked = activeTouches.containsKey(event.pointerId)
+        if (!tracked && event.phase != TouchPhase.Down) {
+            // 悬停（或丢了 DOWN 的残事件）：不建触点、不派发。
+            droppedUntrackedTouchCount++
+            return emptyList()
+        }
         // 抬起事件也要更新位置：Compose 要求 Release 事件带上该触点的最终位置。
         activeTouches[event.pointerId] = position
         val pressed = event.phase != TouchPhase.Up

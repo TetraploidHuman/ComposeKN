@@ -13,6 +13,7 @@ import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -695,6 +696,22 @@ private fun HoverBox(probe: GalleryProbe) {
             probe.hoverCount++
         }
         if (!hovered) entered = false
+    }
+    // 诊断：把「按下/抬起/取消」也记进日志（带**节点内坐标**）。
+    //
+    // 为什么要坐标：v0.5.10 的真机日志里出现过「一次 645ms 的按住期间 onClick 被调 10 次」，
+    // 而触摸流里只有一对 DOWN/UP —— 说明多半是另一条通道（鼠标或键盘 Enter/Space）。
+    // 这条日志能把两者分开：指针路径的 `pressPosition` 是**按下点**，
+    // 键盘路径用的是 `centerOffset`（控件正中心，恒等于 (w/2,h/2)）。
+    LaunchedEffect(interactionSource) {
+        interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is PressInteraction.Press -> winlog("hoverbox: 按下 pos=${interaction.pressPosition}")
+                is PressInteraction.Release -> winlog("hoverbox: 抬起")
+                is PressInteraction.Cancel -> winlog("hoverbox: 取消（按下被吞）")
+                else -> {}
+            }
+        }
     }
     // 悬停 / 按压 / 点过之后都保持高亮 —— 触摸用户只能靠后两者看到反馈。
     val highlight = hovered || pressed || probe.hoverBoxClicks > 0
