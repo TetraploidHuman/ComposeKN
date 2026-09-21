@@ -71,7 +71,9 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · 进度条（确定 + 无限动画）、卡片、分割线、hover 高亮（触摸屏上点击也有反馈：
     触摸不会产生 hover，见 README 末尾"触摸/鼠标/hover"一节）
   · 下拉菜单、对话框（弹层合成）
-  · 横向/纵向 Lazy 列表虚拟化 + **鼠标滚轮滚动** + **触摸屏拖动滚动**
+  · 横向/纵向 Lazy 列表虚拟化 + **鼠标滚轮滚动**（横向列表：**Shift+滚轮** 或横向滚轮/
+    触控板横滑 —— 与上游 Compose Desktop 一致；普通竖直滚轮会落到外层竖直列表上）
+    + **触摸屏拖动滚动**
     （触摸走 WM_POINTER -> PointerType.Touch；`set COMPOSEKN_TOUCH=0` 可关掉，
       退回系统「触摸提升成鼠标」的老行为）
   · Canvas 绘制（渐变/路径/描边/旋转）、FlowRow 自动换行、主题切换（深/浅色）
@@ -99,8 +101,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (149 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (146 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (153 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (150 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -110,8 +112,9 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            不再把整段位移当第一次拖动增量）**、
            **悬停/按压语义（触摸没有 hover 但必须有按压反馈 + 能点；鼠标 hover 必须能进能出）**、
            **悬停不会变成"按住的手指"（笔悬停的 WM_POINTERUPDATE 必须被丢掉）**、
-           **按住 + 抖动只产生一次 click**，
-           不开窗口（112 条）
+           **按住 + 抖动只产生一次 click**、
+           **滚轮翻写约定 + 横向列表（Shift+滚轮 / 横向滚轮能滚、竖直滚轮不动它）**，
+           不开窗口（116 条）
   window = 真实窗口（剪贴板往返、Ctrl+A/C/X/V 复制粘贴、逐帧渲染、合成点击/滚轮、
            IME 文本通道、**WM_IME_REQUEST 候选窗锚点（组字中塌缩到组字起点）**、
            **IMM32 文档馈送（IMR_DOCUMENTFEED 的答复结构和两段式约定）**、
@@ -119,7 +122,7 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            **重新转换（IMR_CONFIRMRECONVERTSTRING 的接受/拒绝 + 原文本不重复）**、干净退出、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
            动画按刷新率节流）（37 条）
-  all    = 两者都跑（146 条断言）
+  all    = 两者都跑（150 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个

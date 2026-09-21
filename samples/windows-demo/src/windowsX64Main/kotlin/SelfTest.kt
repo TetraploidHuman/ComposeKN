@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,6 +32,7 @@ import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.interaction.HoverInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.PressInteraction
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -59,6 +61,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.input.pointer.isCtrlPressed
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.isPrimaryPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
@@ -176,6 +179,16 @@ private const val TIME_PROBE_Y_DP = 300
 private const val TIME_PROBE_W_DP = 260
 private const val TIME_PROBE_H_DP = 120
 
+/**
+ * 横向滚动探针（`horizontalScroll`）的位置/尺寸。
+ *
+ * (300, 256)dp + 120x32dp：刻意避开所有像素断言的矩形（见 [DeterministicTestScreen] 里的注释）。
+ */
+private const val HSCROLL_X_DP = 300
+private const val HSCROLL_Y_DP = 256
+private const val HSCROLL_W_DP = 120
+private const val HSCROLL_H_DP = 32
+
 class InteractionProbe {
     var clicked by mutableStateOf(false)
     var clickCount by mutableStateOf(0)
@@ -256,6 +269,19 @@ class InteractionProbe {
      */
     var pointerEventCount by mutableStateOf(0)
     var lastPointerPressed by mutableStateOf(false)
+
+    /**
+     * 探针看到的最后一个滚轮 `scrollDelta` + 滚轮事件数。
+     *
+     * 用来钉住「宿主把滚轮翻成什么 delta」这条约定（HANDOVER §17.30）：
+     * 竖直滚轮必须给 `(0, y)`、Shift+竖直滚轮必须给 `(y, 0)`（对齐上游
+     * `ComposeSceneMediator.desktop.kt: onMouseWheelEvent`）、横向滚轮给 `(x, 0)`。
+     */
+    var lastScrollDelta by mutableStateOf(Offset.Zero)
+    var scrollEventCount by mutableStateOf(0)
+
+    /** 测试屏里那条横向滚动列表的当前位置（`horizontalScroll` 的 ScrollState.value）。 */
+    var horizontalScrollValue by mutableStateOf(0)
 
     /** 性能自检：true 时界面进入「一直在动画」的状态（withFrameNanos 每帧 +1）。 */
     var animate by mutableStateOf(false)
@@ -473,6 +499,11 @@ private fun DeterministicTestScreen(
                         awaitPointerEventScope {
                             while (true) {
                                 val e = awaitPointerEvent()
+                                if (e.type == PointerEventType.Scroll) {
+                                    probe.lastScrollDelta =
+                                        e.changes.firstOrNull()?.scrollDelta ?: Offset.Zero
+                                    probe.scrollEventCount++
+                                }
                                 e.changes.forEach { change ->
                                     probe.lastPointerUptime = change.uptimeMillis
                                     probe.lastPointerPosition = change.position
@@ -483,6 +514,33 @@ private fun DeterministicTestScreen(
                         }
                     },
             )
+
+            // 横向滚动探针：120dp 视口 + 12 个 40dp 方块（内容 480dp）。
+            // 位置 (300, 256)dp 是刻意挑的：像素断言覆盖的矩形（菜单 x520..780/y332..462、
+            // 弹层 (400,200)、对话框中心行、底部滚动区 y480..600）都不含它。
+            // 它存在的唯一理由：`Scrollable.toSingleAxisDeltaFromAngle()` 让**横向**滚动条
+            // 忽略纯竖直的滚轮 delta，所以"横向列表能不能用滚轮滚"完全取决于宿主把滚轮翻成
+            // 什么 scrollDelta（HANDOVER §17.30）。
+            val horizontalState = remember { ScrollState(0) }
+            // 在**组合中**读一次（这样值一变这个作用域就重组），再由 SideEffect 写进探针 ——
+            // 直接在 SideEffect 里读 state 不会建立订阅，探针会一直是 0。
+            val horizontalValue = horizontalState.value
+            SideEffect { probe.horizontalScrollValue = horizontalValue }
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset(x = HSCROLL_X_DP.dp, y = HSCROLL_Y_DP.dp)
+                    .size(HSCROLL_W_DP.dp, HSCROLL_H_DP.dp)
+                    .horizontalScroll(horizontalState),
+            ) {
+                repeat(12) { index ->
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .background(if (index % 2 == 0) Color(0xFF405060) else Color(0xFF607080)),
+                    )
+                }
+            }
 
             // 底部滚动区（滚轮测试）。
             // ScrollState 由调用方注入：断言时直接读 `scrollState.value`，
@@ -836,6 +894,98 @@ private fun renderChecks(report: SelfTestReport) {
         "interaction/wheel-up-scrolls-back",
         scrollState.value < scrolledDown,
         "down=$scrolledDown afterUp=${scrollState.value}",
+    )
+
+    // 2.6a 滚轮 -> scrollDelta 的翻写约定 + **横向列表能不能用滚轮滚**（HANDOVER §17.30）。
+    //
+    // 真机反馈：「横向列表没法用滚轮滚动，只能用触摸」。根因不在"没送滚轮"，而在**翻写约定**：
+    // `MouseWheelScrollingLogic.canConsumeDelta()` 用
+    // `Scrollable.toSingleAxisDeltaFromAngle()`（阈值 PI/4）把二维 scrollDelta 投到滚动轴上 ——
+    // **横向**滚动条对纯竖直的 delta 直接返回 0（`if (angle >= PI/4) if (Vertical) y else 0f`），
+    // 于是 `LazyRow`/`horizontalScroll` 对普通竖直滚轮完全无感。
+    // 上游 Compose Desktop 的答案是 `ComposeSceneMediator.desktop.kt: onMouseWheelEvent()`：
+    //   scrollDelta = if (event.isShiftDown) Offset(wheelRotation, 0f) else Offset(0f, wheelRotation)
+    // 也就是 **Shift + 滚轮 = 横向滚动**（外加真的横向滚轮/触控板横滑）。宿主以前原样透传
+    // `(0, deltaY)`，Shift 那条完全没实现 → 横向列表除了触摸没别的办法。
+    //
+    // 三层断言：
+    //   (1) `scrollDelta` 本身：竖直=(0,y)、Shift+竖直=**原符号搬到 x 轴**、横向=(x,0)（钉住翻写约定）；
+    //   (2) 端到端：Shift+滚轮 / 横向滚轮 能推动一条真的 `horizontalScroll`；
+    //   (3) 反证：**普通竖直滚轮不动它**（上游语义如此 —— 它会落到外层竖直滚动条上）。
+    val probeWheelX = ((TIME_PROBE_X_DP + 20) * d).toInt()
+    val probeWheelY = contentTop + ((TIME_PROBE_Y_DP + 20) * d).toInt()
+    wheelEvent(app, probeWheelX, probeWheelY, deltaY = 3)
+    driver.render(800, 600, density = d, frames = 2)
+    val plainDelta = probe.lastScrollDelta
+    wheelEvent(app, probeWheelX, probeWheelY, deltaY = -3, shift = true)
+    driver.render(800, 600, density = d, frames = 2)
+    val shiftDelta = probe.lastScrollDelta
+    wheelEvent(app, probeWheelX, probeWheelY, deltaX = -3)
+    driver.render(800, 600, density = d, frames = 2)
+    val horizontalDelta = probe.lastScrollDelta
+    report.check(
+        "interaction/wheel-scroll-delta-mapping",
+        plainDelta == Offset(0f, 3f) &&
+            shiftDelta == Offset(-3f, 0f) &&
+            horizontalDelta == Offset(-3f, 0f),
+        "竖直=$plainDelta（期望 (0,3)）、Shift+竖直=$shiftDelta（期望 (-3,0) —— 把竖直 delta" +
+            "原符号搬到横向轴上，对齐上游）、横向=$horizontalDelta（期望 (-3,0)）",
+    )
+
+    // 鼠标滚轮的滚动是**带缓动**的（MouseWheelScrollingLogic 的 threshold + tween），
+    // 所以断言前要等它停稳，否则"没动/动了"都可能读到中间值。
+    fun settleHorizontal(): Int {
+        var last = -1
+        var stable = 0
+        var guard = 0
+        while (guard++ < 200 && stable < 3) {
+            driver.render(800, 600, density = d, frames = 1)
+            val v = probe.horizontalScrollValue
+            stable = if (v == last) stable + 1 else 0
+            last = v
+        }
+        return probe.horizontalScrollValue
+    }
+
+    val hx = ((HSCROLL_X_DP + HSCROLL_W_DP / 2) * d).toInt()
+    val hy = contentTop + ((HSCROLL_Y_DP + HSCROLL_H_DP / 2) * d).toInt()
+    val hBase = probe.horizontalScrollValue
+    // (2) Shift+滚轮 -> 横向列表动起来。
+    //     方向说明：WM_MOUSEWHEEL 的正 delta = 滚轮向前（远离用户）= 竖直列表里"往前翻"；
+    //     同一个符号搬到横向轴上就是"往列表起点翻"。所以 **Shift+滚轮向下（deltaY<0）
+    //     ⇒ 向右滚（看后面的内容）** —— 和 Windows 上其它程序的 Shift+滚轮一致。
+    //     （起点 0 时只有"向末端"能动，所以这条同时把方向也钉住了。）
+    wheelEvent(app, hx, hy, deltaY = -3, shift = true)
+    val afterShift = settleHorizontal()
+    report.check(
+        "interaction/shift-wheel-scrolls-horizontal-list",
+        afterShift > hBase,
+        "Shift+滚轮向下（deltaY=-3 -> scrollDelta (-3,0)）之后 horizontalScroll=$afterShift" +
+            "（期望 > $hBase = 向右滚）",
+    )
+    // (3) 反证：普通竖直滚轮**不动**横向列表（此时值非 0，所以"错误映射成横向"的两种符号
+    //     都会被这条抓到，不是空断言）。
+    wheelEvent(app, hx, hy, deltaY = -3)
+    val afterPlain = settleHorizontal()
+    report.check(
+        "interaction/plain-wheel-ignores-horizontal-list",
+        afterPlain == afterShift,
+        "竖直滚轮之后 horizontalScroll=$afterPlain（期望不变=$afterShift）—— " +
+            "上游 toSingleAxisDeltaFromAngle 让横向滚动条忽略纯竖直 delta（画廊里这种滚轮" +
+            "会落到外层竖直列表上）",
+    )
+    // 真的横向滚轮 / 触控板横滑（WM_MOUSEHWHEEL）：必须能推动横向列表。
+    //
+    // ⚠ 这里**只断言"能滚"、不钉方向**：上游 AWT 的 MouseWheelEvent 根本没有横向分量
+    // （`ComposeSceneMediator` 只有 Shift 改写这一条路），所以 tilt 轮的正负号没有上游
+    // 依据可比；而 Windows 文档只说"正 = 向右倾斜"，没说应该往哪滚。留一条"能滚"
+    // 的断言在这里，方向等真机 tilt 轮实测（HANDOVER §17.30 有记录）。
+    wheelEvent(app, hx, hy, deltaX = -3)
+    val afterHorizontal = settleHorizontal()
+    report.check(
+        "interaction/horizontal-wheel-scrolls-horizontal-list",
+        afterHorizontal != afterPlain,
+        "横向滚轮（deltaX=-3）之后 horizontalScroll=$afterHorizontal（期望 != $afterPlain）",
     )
 
     // 2.6b 触摸：手指拖动必须能滚动列表（真机反馈「Windows 触摸屏能点击、不能滑动」）
@@ -2336,6 +2486,32 @@ private fun avgLuminanceInRow(a: FrameSnapshot, y: Int, x0: Int, x1: Int): Int {
 private fun wheel(app: WindowsComposeApplication, x: Int, y: Int, deltaY: Int) {
     app.dispatchEvent(
         WindowsEvent.MouseWheelEvent(x = x, y = y, deltaX = 0, deltaY = deltaY),
+    )
+    app.pumpDispatchers()
+}
+
+/**
+ * 滚轮事件的可控版本：竖直 / Shift+竖直 / 横向（`WM_MOUSEHWHEEL`）。
+ *
+ * `shift = true` 时模拟「按住 Shift 滚滚轮」—— 宿主必须把它翻写成横向 delta
+ * （对齐上游 `ComposeSceneMediator.desktop.kt: onMouseWheelEvent`，HANDOVER §17.30）。
+ */
+private fun wheelEvent(
+    app: WindowsComposeApplication,
+    x: Int,
+    y: Int,
+    deltaX: Int = 0,
+    deltaY: Int = 0,
+    shift: Boolean = false,
+) {
+    app.dispatchEvent(
+        WindowsEvent.MouseWheelEvent(
+            x = x,
+            y = y,
+            deltaX = deltaX,
+            deltaY = deltaY,
+            isShiftPressed = shift,
+        ),
     )
     app.pumpDispatchers()
 }

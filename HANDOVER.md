@@ -2846,3 +2846,92 @@ SELFTEST FAIL : interaction/touch-hover-does-not-press — 悬停 MOVE+UP 之后
 
 logic **112**（+3）/ window 37（合计 **149**）、`all` **146** —— 全绿；打包单文件 exe
 （无 `icudtl.dat`）干净目录复测。
+
+### 17.30 「横向列表没法用滚轮滚动」：缺的是上游那条 **Shift+滚轮 → 横向** 改写（v0.5.12）
+
+真机反馈：「横向列表我貌似没法用滚轮滚动，现在只能用触摸滚动」。
+
+#### 根因：横向滚动条**故意忽略**纯竖直的滚轮 delta，而上游的改写我们没实现
+
+`MouseWheelScrollingLogic.canConsumeDelta()` 把二维 `scrollDelta` 投到滚动轴上：
+
+```kotlin
+// foundation/gestures/Scrollable.kt:633  （commonMain，所以桌面平台一样）
+fun Offset.toSingleAxisDeltaFromAngle(): Float {
+    val angle = atan2(this.y.absoluteValue, this.x.absoluteValue)
+    return if (angle >= PI / 4) { if (orientation == Vertical) this.y else 0f }   // 偏竖直
+           else                 { if (orientation == Horizontal) this.x else 0f } // 偏水平
+}
+```
+
+纯竖直的滚轮（`x = 0`）角度是 90°，**横向**滚动条拿到的是 `0f` → `canConsumeDelta` 直接
+返回 false。所以 `LazyRow` / `horizontalScroll` 对普通竖直滚轮**完全无感** —— 事件会继续
+冒泡，落到外层的竖直滚动条上（画廊里就是这样：横向那一行上滚轮滚的是整页）。
+
+上游 Compose Desktop 的答案在 `ui/src/desktopMain/.../ComposeSceneMediator.desktop.kt`：
+
+```kotlin
+private fun ComposeScene.onMouseWheelEvent(position: Offset, event: MouseWheelEvent) =
+    sendPointerEvent(
+        eventType = PointerEventType.Scroll,
+        position = position,
+        scrollDelta = if (event.isShiftDown) Offset(event.preciseWheelRotation.toFloat(), 0f)
+                      else                    Offset(0f, event.preciseWheelRotation.toFloat()),
+        ...
+```
+
+也就是 **Shift + 滚轮 = 横向滚动**（再加上真的横向滚轮 / 触控板横滑）。宿主以前是"原样透传"
+`(deltaX, deltaY)`：竖直那条对，**Shift 那条压根没有** → 横向列表除了触摸没有别的办法。
+
+#### 修法（`WindowsInputMapper.dispatchWindowsMouseWheelEvent`）
+
+```kotlin
+val horizontalWheel = event.deltaX != 0        // WM_MOUSEHWHEEL / 触控板横滑
+val shiftPressed = event.isShiftPressed || inputState.modifiers.isShiftPressed
+val scrollDelta = when {
+    horizontalWheel -> Offset(event.deltaX.toFloat(), 0f)
+    shiftPressed    -> Offset(event.deltaY.toFloat(), 0f)   // ← 上游那条
+    else            -> Offset(0f, event.deltaY.toFloat())
+}
+```
+
+**方向**：竖直 delta 的**符号原样搬到 x 轴**（不取负），这正是上游的写法（同一个
+`preciseWheelRotation` 变量）。落到用户手上就是：**Shift + 滚轮向下 = 向右滚（看后面的内容）**，
+和 Windows 上其它程序的 Shift+滚轮一致；竖直轮的行为一个字节都没改（`deltaY` 仍是原样透传）。
+
+> 顺带记一个"查过的坑"，免得下次又绕：AWT 的 `getWheelRotation()` 符号在**不同平台不一样**。
+> 本机实测（Xvfb + xdotool 注入真实 X11 滚轮 + 一个 20 行的 Java AWT 程序）：
+> 滚轮**向上**（X11 button 4）→ `rotation = -1`；向下（button 5）→ `+1`。而 Win32
+> `WM_MOUSEWHEEL` 是**正 = 向前/远离用户（上）**。两边符号相反，所以**不能**照抄"上游表达式"
+> 里的符号，只能照抄"**同一个变量、同一个轴关系**"：我们的竖直通道已经实测正确
+> （v0.4.5 起用户一直在用），所以把同一个 `deltaY` 放到 x 轴上就得到了 Windows 上正确的
+> Shift+滚轮。横向滚轮（tilt 轮）的**方向**没有上游依据（AWT 的 MouseWheelEvent 没有横向
+> 分量），本次只断言"能滚"，方向留给真机 tilt 轮实测。
+
+#### 自检：+4 条（都用真的 `horizontalScroll` + 真的滚轮事件）
+
+| 断言 | 内容 |
+|---|---|
+| `interaction/wheel-scroll-delta-mapping` | 探针读到的 `scrollDelta`：竖直=(0,3)、Shift+竖直=(-3,0)、横向=(-3,0) |
+| `interaction/shift-wheel-scrolls-horizontal-list` | Shift+滚轮向下 → 横向列表 `ScrollState.value` 变大（向右滚） |
+| `interaction/plain-wheel-ignores-horizontal-list` | **反证**：普通竖直滚轮不动它（值停在非 0 处，所以"错映射成横向"的两个符号都会被抓到） |
+| `interaction/horizontal-wheel-scrolls-horizontal-list` | 横向滚轮（`WM_MOUSEHWHEEL`）必须能推动它（只断言"能滚"） |
+
+测试屏新增一条 120dp 视口 / 12×40dp 内容的 `horizontalScroll` 探针，放在 (300,256)dp ——
+刻意避开所有像素断言的矩形（菜单 x520..780/y332..462、弹层 (400,200)、对话框中心行、
+底部滚动区 y480..600），这条位置约束写在代码注释里了。
+
+**先红后绿**（临时把 mapper 退回"原样透传"，重新链接后跑 `--only=logic`）：
+
+```
+SELFTEST FAIL : interaction/wheel-scroll-delta-mapping — Shift+竖直=Offset(0.0, 3.0)（期望 (3,0)…）
+SELFTEST FAIL : interaction/shift-wheel-scrolls-horizontal-list — 之后 horizontalScroll=0（期望 > 0）
+SELFTEST FAIL : interaction/horizontal-wheel-scrolls-horizontal-list — …
+```
+
+装回修复后四条全过。
+
+#### 验证
+
+logic **116**（+4）/ window 37（合计 **153**）、`all` **150** —— 全绿；打包单文件 exe
+（无 `icudtl.dat`）干净目录复测。

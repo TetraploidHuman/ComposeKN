@@ -134,23 +134,40 @@ internal fun ComposeScene.dispatchWindowsTouchEvent(
 
 /**
  * Dispatch a Windows mouse wheel event to the Compose scene.
+ *
+ * 三条通道合成一个 `scrollDelta`：
+ *
+ *  1. **竖直滚轮**（`WM_MOUSEWHEEL`）→ `Offset(0, deltaY)`；
+ *  2. **横向滚轮 / 触控板横滑**（`WM_MOUSEHWHEEL`）→ `Offset(deltaX, 0)`；
+ *  3. **Shift + 竖直滚轮** → `Offset(deltaY, 0)` —— 这一条**是对齐上游 Compose Desktop 的
+ *     关键**：`ComposeSceneMediator.desktop.kt: onMouseWheelEvent()` 里
+ *     `scrollDelta = if (event.isShiftDown) Offset(wheelRotation, 0f) else Offset(0f, wheelRotation)`。
+ *     为什么非要有它：`MouseWheelScrollingLogic.canConsumeDelta()` 用
+ *     `Scrollable.toSingleAxisDeltaFromAngle()`（阈值 PI/4）把二维 delta 投到滚动轴上 ——
+ *     **横向滚动条对纯竖直的 delta 直接返回 0**（不消费）。所以 Shift+滚轮（或真的横向滚轮/
+ *     触控板横滑）是"横向列表能用滚轮滚"的**唯一**途径，缺了它 `LazyRow` 就只能靠触摸
+ *     （真机反馈「横向列表没法用滚轮滚动」，HANDOVER §17.30）。
+ *
+ * 符号约定（血泪教训，别改成取负）：
+ *   Win32 WM_MOUSEWHEEL 的 delta/120 > 0 = 滚轮向远离用户方向 = 向上滚（看更早的内容）。
+ *   scrollable 内部 `reverseDirection` 对 verticalScroll/LazyColumn 默认是 true，
+ *   `canConsumeDelta` / `dispatchMouseWheelScroll` 都会先做一次 reverseIfNeeded()：
+ *     scrollDelta.y < 0 → 向上滚；scrollDelta.y > 0 → 向下滚。
+ *   因此这里**原样透传**（Shift 那条也只是换轴、不取负，与上游一致）。曾经写成 -deltaY
+ *   （以为「正数 = 向下」），结果 canConsume=false（value=0 时判定「无法向上滚」）→
+ *   滚轮整体失效，由自检 interaction/wheel-scroll 抓到（HANDOVER §14.4）。
  */
 internal fun ComposeScene.dispatchWindowsMouseWheelEvent(
     event: WindowsEvent.MouseWheelEvent,
     inputState: WindowsInputState,
 ) {
-    // 符号约定（血泪教训，别改成取负）：
-    //   Win32 WM_MOUSEWHEEL 的 delta/120 > 0 = 滚轮向远离用户方向 = 向上滚（看更早的内容）。
-    //   scrollable 内部 `reverseDirection` 对 verticalScroll/LazyColumn 默认是 true，
-    //   `canConsumeDelta` / `dispatchMouseWheelScroll` 都会先做一次 reverseIfNeeded()：
-    //     scrollDelta.y < 0 → 向上滚；scrollDelta.y > 0 → 向下滚。
-    //   因此这里**原样透传**。曾经写成 -deltaY（以为「正数 = 向下」），结果
-    //   canConsume=false（value=0 时判定「无法向上滚」）→ 滚轮整体失效，
-    //   由自检 interaction/wheel-scroll 抓到（HANDOVER §14.4）。
-    val scrollDelta = Offset(
-        event.deltaX.toFloat(),
-        event.deltaY.toFloat(),
-    )
+    val shiftPressed = event.isShiftPressed || inputState.modifiers.isShiftPressed
+    val horizontalWheel = event.deltaX != 0
+    val scrollDelta = when {
+        horizontalWheel -> Offset(event.deltaX.toFloat(), 0f)
+        shiftPressed -> Offset(event.deltaY.toFloat(), 0f)
+        else -> Offset(0f, event.deltaY.toFloat())
+    }
 
     sendPointerEvent(
         eventType = PointerEventType.Scroll,
