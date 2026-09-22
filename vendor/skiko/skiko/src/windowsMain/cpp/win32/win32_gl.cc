@@ -1,5 +1,5 @@
 /**
- * ComposeKN Windows OpenGL/WGL 桥（GPU 后端「阶段 1」）。
+ * ComposeKN Windows OpenGL/WGL 桥（GPU 后端）。
  *
  * 与上游 skiko 的 K/N GL 实现同构：
  *   linuxMain/cpp/wayland/wayland_egl_gl.cc       -> 本文件（EGL -> WGL）
@@ -12,6 +12,10 @@
  *   - Skia 的 GPU 上下文（`DirectContext.makeGL()`）在 **Kotlin 侧**创建
  *     （K/N 的 skia binding 已经提供，见 `org.jetbrains.skia.DirectContext.makeGL`）——
  *     所以本文件不需要包含任何 Skia 头，也不用改 native bridge 的编译配置。
+ *
+ * 多窗口（v0.5.23）：每个 HWND 一份独立的 HDC/HGLRC（不再用进程单例）。
+ * 单例时第二窗 create 是 no-op、swap 打到第一窗、destroy 拆掉唯一上下文 →
+ * 主窗字体花屏、副窗白板、关副窗后卡死。
  */
 #include "win32_bridge.h"
 
@@ -20,6 +24,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <unordered_map>
 
 // mingw 的 GL/gl.h 只到 GL 1.1：这两个常量（GL 3.0+）需要自己定义。
 // 值取自 khronos 的 glext.h（GL_FRAMEBUFFER_BINDING 与 GL_DRAW_FRAMEBUFFER_BINDING 同值）。
@@ -32,7 +37,7 @@
 
 namespace {
 
-/** 每个窗口一份 WGL 上下文（与上游「每窗口一个 device」一致；本项目是单窗口模型）。 */
+/** 每个窗口一份 WGL 上下文（对齐 Wayland：每窗一个 EGL context/surface）。 */
 struct ComposeKNGLContext {
     HDC dc = nullptr;
     HGLRC rc = nullptr;
@@ -40,10 +45,16 @@ struct ComposeKNGLContext {
     bool ownedDc = false;
 };
 
-ComposeKNGLContext* g_glContext = nullptr;
+std::unordered_map<ComposeKNWin32Window*, ComposeKNGLContext*> g_glByWindow;
+
+ComposeKNGLContext* glOf(ComposeKNWin32Window* window) {
+    if (window == nullptr) return nullptr;
+    auto it = g_glByWindow.find(window);
+    return it == g_glByWindow.end() ? nullptr : it->second;
+}
 
 /**
- * 本文件自己的日志入口：`composeknLog` 是 win32_window.cc 里的匿名 namespace 静态函数，
+ * 本文件自己的日志入口：`composeknLog` 是 win32_window.cc 里的匿名命名空间静态函数，
  * 跨文件不可见；这里转发到导出的 `composekn_win32_log`（它负责加时间戳 + 落盘 + flush）。
  */
 void glLog(const char* fmt, ...) {
@@ -56,7 +67,6 @@ void glLog(const char* fmt, ...) {
 }
 
 typedef BOOL(WINAPI* PFNWGLSWAPINTERVALEXTPROC)(int);
-typedef const char*(WINAPI* PFNWGLGETEXTENSIONSSTRINGEXTPROC)(HDC);
 
 void logGlInfo(const char* tag) {
     const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
@@ -69,11 +79,30 @@ void logGlInfo(const char* tag) {
                  vendor != nullptr ? vendor : "(null)");
 }
 
+void destroyGlContext(ComposeKNGLContext* gl) {
+    if (gl == nullptr) return;
+    if (wglGetCurrentContext() == gl->rc) {
+        wglMakeCurrent(nullptr, nullptr);
+    }
+    if (gl->rc != nullptr) {
+        wglDeleteContext(gl->rc);
+        gl->rc = nullptr;
+    }
+    if (gl->ownedDc && gl->hwnd != nullptr && gl->dc != nullptr) {
+        ReleaseDC(gl->hwnd, gl->dc);
+        gl->dc = nullptr;
+    }
+    delete gl;
+}
+
 }  // namespace
 
 extern "C" bool composekn_win32_gl_create(ComposeKNWin32Window* window) {
     if (window == nullptr) return false;
-    if (g_glContext != nullptr && g_glContext->rc != nullptr) return true;
+    if (glOf(window) != nullptr) {
+        // 幂等：同一窗口重复 create 直接成功（不复用别的窗的上下文）。
+        return true;
+    }
 
     HWND hwnd = static_cast<HWND>(composekn_win32_hwnd(window));
     if (hwnd == nullptr) {
@@ -126,7 +155,9 @@ extern "C" bool composekn_win32_gl_create(ComposeKNWin32Window* window) {
         return false;
     }
 
-    g_glContext = gl;
+    g_glByWindow[window] = gl;
+    glLog("gl: context created for hwnd=%p (windows=%zu)",
+          reinterpret_cast<void*>(hwnd), g_glByWindow.size());
     logGlInfo("created");
 
     // 没拿到 3.3+ 的话 Skia 的 Ganesh GL 初始化会失败（上层会自动回退软件路径），
@@ -145,10 +176,10 @@ extern "C" bool composekn_win32_gl_create(ComposeKNWin32Window* window) {
 }
 
 extern "C" bool composekn_win32_gl_make_current(ComposeKNWin32Window* window) {
-    (void)window;
-    if (g_glContext == nullptr || g_glContext->rc == nullptr) return false;
-    if (wglGetCurrentContext() == g_glContext->rc) return true;
-    return wglMakeCurrent(g_glContext->dc, g_glContext->rc) != FALSE;
+    ComposeKNGLContext* gl = glOf(window);
+    if (gl == nullptr || gl->rc == nullptr) return false;
+    if (wglGetCurrentContext() == gl->rc && wglGetCurrentDC() == gl->dc) return true;
+    return wglMakeCurrent(gl->dc, gl->rc) != FALSE;
 }
 
 extern "C" void composekn_win32_gl_viewport(int width, int height) {
@@ -164,7 +195,12 @@ extern "C" int composekn_win32_gl_get_draw_framebuffer_binding(void) {
 }
 
 extern "C" void composekn_win32_gl_set_swap_interval(int interval) {
-    if (g_glContext == nullptr || g_glContext->dc == nullptr) return;
+    // 调用方须先 gl_make_current(window)；用当前 DC（每窗独立上下文后不能再读全局单例）。
+    HDC dc = wglGetCurrentDC();
+    if (dc == nullptr) {
+        glLog("gl: set_swap_interval 失败（没有 current WGL 上下文）");
+        return;
+    }
     // WGL_EXT_swap_interval：1 = 跟垂直同步对齐（上游 EGL 路径也是这么干的）。
     auto swapInterval = reinterpret_cast<PFNWGLSWAPINTERVALEXTPROC>(
         wglGetProcAddress("wglSwapIntervalEXT"));
@@ -177,24 +213,19 @@ extern "C" void composekn_win32_gl_set_swap_interval(int interval) {
 }
 
 extern "C" void composekn_win32_gl_swap_buffers(ComposeKNWin32Window* window) {
-    (void)window;
-    if (g_glContext == nullptr || g_glContext->dc == nullptr) return;
-    SwapBuffers(g_glContext->dc);
+    ComposeKNGLContext* gl = glOf(window);
+    if (gl == nullptr || gl->dc == nullptr) return;
+    SwapBuffers(gl->dc);
 }
 
 extern "C" void composekn_win32_gl_destroy(ComposeKNWin32Window* window) {
-    (void)window;
-    if (g_glContext == nullptr) return;
-    if (wglGetCurrentContext() == g_glContext->rc) {
-        wglMakeCurrent(nullptr, nullptr);
-    }
-    if (g_glContext->rc != nullptr) {
-        wglDeleteContext(g_glContext->rc);
-    }
-    if (g_glContext->ownedDc && g_glContext->hwnd != nullptr && g_glContext->dc != nullptr) {
-        ReleaseDC(g_glContext->hwnd, g_glContext->dc);
-    }
-    glLog("gl: context destroyed");
-    delete g_glContext;
-    g_glContext = nullptr;
+    if (window == nullptr) return;
+    auto it = g_glByWindow.find(window);
+    if (it == g_glByWindow.end()) return;
+    ComposeKNGLContext* gl = it->second;
+    g_glByWindow.erase(it);
+    HWND hwnd = gl != nullptr ? gl->hwnd : nullptr;
+    destroyGlContext(gl);
+    glLog("gl: context destroyed for hwnd=%p (windows=%zu)",
+          reinterpret_cast<void*>(hwnd), g_glByWindow.size());
 }

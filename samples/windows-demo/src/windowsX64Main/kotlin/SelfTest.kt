@@ -3240,16 +3240,17 @@ private fun runConcurrentWindowTests(report: SelfTestReport) {
  * 若干帧再 `exitApplication()`，否则必红。
  */
 private fun runApplicationApiSelfTest(report: SelfTestReport) {
-    report.section("application{} 声明式入口保活")
+    report.section("application{} 声明式入口保活 + 双窗 GL")
     com.composekn.windows.registerComposeKnWindowsBackend()
 
     var frames = 0
+    var framesSecond = 0
     var reachedExit = false
     var exitApp: (() -> Unit)? = null
 
     val guard = WindowPhaseGuard()
     CoroutineScope(Dispatchers.Default).launch {
-        delay(20_000)
+        delay(30_000)
         if (!guard.finished) {
             guard.timedOut = true
             winlog("application-api: TIMEOUT — calling exitApplication")
@@ -3261,6 +3262,8 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
         application(exitProcessOnExit = false) {
             val exit = ::exitApplication
             exitApp = exit
+            var openSecond by mutableStateOf(true)
+
             Window(
                 onCloseRequest = exit,
                 state = rememberWindowState(width = 400.dp, height = 300.dp),
@@ -3268,17 +3271,37 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
                 undecorated = true,
             ) {
                 LaunchedEffect(Unit) {
-                    // 必须真的等到多帧：证明共享泵还在跑、Window 保活生效。
                     while (frames < 12) {
-                        withFrameNanos {
-                            frames++
-                        }
+                        withFrameNanos { frames++ }
+                    }
+                    // 多窗口 GL：副窗也必须能出帧（单例 WGL 时副窗白板、主窗花屏）
+                    var waited = 0
+                    while (framesSecond < 8 && waited < 180) {
+                        withFrameNanos { waited++ }
                     }
                     reachedExit = true
-                    winlog("application-api: got $frames frames — exitApplication")
+                    winlog(
+                        "application-api: mainFrames=$frames secondFrames=$framesSecond — exitApplication",
+                    )
                     exit()
                 }
                 Text("application-api selftest frames=$frames")
+            }
+
+            if (openSecond) {
+                Window(
+                    onCloseRequest = { openSecond = false },
+                    state = rememberWindowState(width = 320.dp, height = 240.dp),
+                    title = "Selftest-application-api-2",
+                    undecorated = true,
+                ) {
+                    LaunchedEffect(Unit) {
+                        while (true) {
+                            withFrameNanos { framesSecond++ }
+                        }
+                    }
+                    Text("second frames=$framesSecond")
+                }
             }
         }
     } catch (t: Throwable) {
@@ -3294,6 +3317,11 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
         "application-api/frames",
         frames >= 12,
         "frames=$frames (need >=12; 0 means join returned before first frame)",
+    )
+    report.check(
+        "application-api/second-frames",
+        framesSecond >= 8,
+        "secondFrames=$framesSecond (need >=8; 0 = 副窗没出帧 / WGL 单例)",
     )
     report.check("application-api/reached-exit", reachedExit)
     report.check(

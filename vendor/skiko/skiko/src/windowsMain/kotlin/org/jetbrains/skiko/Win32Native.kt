@@ -1199,10 +1199,14 @@ internal external fun composekn_win32_dpi_scale(window: COpaquePointer?): Float
 @SymbolName("composekn_win32_set_render_tick")
 private external fun composekn_win32_set_render_tick(callback: COpaquePointer?, user: COpaquePointer?)
 
-private var renderTickAction: (() -> Unit)? = null
+private val renderTickListeners = linkedSetOf<() -> Unit>()
 
 private val renderTickCallback = staticCFunction<COpaquePointer?, Unit> { _ ->
-    renderTickAction?.invoke()
+    // 拷贝快照：某窗 dispose 时会改 listeners
+    val snapshot = renderTickListeners.toList()
+    for (action in snapshot) {
+        action.invoke()
+    }
 }
 
 /**
@@ -1210,11 +1214,34 @@ private val renderTickCallback = staticCFunction<COpaquePointer?, Unit> { _ ->
  *
  * 拖拽缩放期间 Windows 的模态循环占住了消息泵，Kotlin 渲染循环跑不到，
  * 窗口只能显示被拉伸的旧帧；靠这个回调在 WM_SIZE 里同步渲染一帧，
- * 内容就能按新尺寸逐帧重组。传 null 注销。
+ * 内容就能按新尺寸逐帧重组。
+ *
+ * 多窗口：可同时挂多个 listener（每扇窗的 redrawer 各挂一份）；传 null 表示
+ * **摘掉全部**（兼容旧调用）。新代码请用 [addWindowsRenderTick] /
+ * [removeWindowsRenderTick]。
  */
 fun setWindowsRenderTick(action: (() -> Unit)?) {
-    renderTickAction = action
-    composekn_win32_set_render_tick(if (action == null) null else renderTickCallback, null)
+    renderTickListeners.clear()
+    if (action != null) renderTickListeners.add(action)
+    composekn_win32_set_render_tick(
+        if (renderTickListeners.isEmpty()) null else renderTickCallback,
+        null,
+    )
+}
+
+/** 多窗口：为某一重绘器登记缩放同步 tick（可并存）。 */
+fun addWindowsRenderTick(action: () -> Unit) {
+    renderTickListeners.add(action)
+    composekn_win32_set_render_tick(renderTickCallback, null)
+}
+
+/** 多窗口：摘掉某一重绘器的缩放同步 tick。 */
+fun removeWindowsRenderTick(action: () -> Unit) {
+    renderTickListeners.remove(action)
+    composekn_win32_set_render_tick(
+        if (renderTickListeners.isEmpty()) null else renderTickCallback,
+        null,
+    )
 }
 
 @SymbolName("composekn_win32_log")

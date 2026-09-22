@@ -2108,6 +2108,8 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
 
 extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
     if (window == nullptr) return;
+    // 防 Kotlin 漏调 gl_destroy：拆 HWND 前先丢掉本窗 WGL（多窗口下不能留悬空 DC）。
+    composekn_win32_gl_destroy(window);
     if (window->hwnd != nullptr && IsWindow(window->hwnd)) {
         // 先摘掉拖放目标再拆窗口：OLE 侧还握着一个指针（RevokeDragDrop 是唯一
         // 合法的注销点，必须在 DestroyWindow 之前）。

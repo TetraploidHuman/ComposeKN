@@ -177,6 +177,7 @@ void* composekn_win32_hwnd(ComposeKNWin32Window* window);
 // OpenGL / WGL（GPU 后端，对齐上游 linuxMain 的 EGL 版）
 //
 // C 侧只管平台上下文；Skia 的 GPU 上下文在 Kotlin 侧用 DirectContext.makeGL() 建。
+// **每窗口一份** HDC/HGLRC（v0.5.23+）；不要再假设进程单例。
 // ---------------------------------------------------------------------------
 
 /** 建 WGL 双缓冲上下文并 make current。失败返回 false（上层回退软件路径）。 */

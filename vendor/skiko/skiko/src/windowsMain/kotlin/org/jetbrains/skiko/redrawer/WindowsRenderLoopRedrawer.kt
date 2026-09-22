@@ -7,7 +7,8 @@ import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.currentNanoTime
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.initWindowsMainThread
-import org.jetbrains.skiko.setWindowsRenderTick
+import org.jetbrains.skiko.addWindowsRenderTick
+import org.jetbrains.skiko.removeWindowsRenderTick
 import org.jetbrains.skiko.win32Log
 import kotlin.concurrent.Volatile
 
@@ -61,16 +62,20 @@ internal abstract class WindowsRenderLoopRedrawer(
     private var profileDrawNanos = 0L
     private var profilePresentNanos = 0L
 
+    /** 本窗的缩放同步 tick（必须是稳定引用，才能 remove）。 */
+    private val resizeTick: () -> Unit = { renderImmediately() }
+
     init {
         initWindowsMainThread()
-        // 缩放期间（模态循环）也能逐帧重组：见 setWindowsRenderTick 注释
-        setWindowsRenderTick { renderImmediately() }
+        // 缩放期间（模态循环）也能逐帧重组：见 addWindowsRenderTick 注释。
+        // 多窗口必须 add/remove，不能 set(null) 把兄弟窗的 tick 一锅端。
+        addWindowsRenderTick(resizeTick)
     }
 
     override fun dispose() {
         if (disposed) return
         disposed = true
-        setWindowsRenderTick(null)
+        removeWindowsRenderTick(resizeTick)
         disposeBackend()
     }
 

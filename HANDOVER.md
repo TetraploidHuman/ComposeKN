@@ -3749,3 +3749,12 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
   `DisposableEffect` 装一次；
 * 另：`Window` 里 `LaunchedEffect { awaitCancellation() }` 保活 application Recomposer
   （独立 FrameRecomposer 时否则 `join()` 立刻返回）。
+
+#### 多窗口 GL 花屏 / 副窗白板（v0.5.23）
+
+根因：`win32_gl.cc` 用**进程单例** `g_glContext`。第二窗 `gl_create` 直接 return true、
+`make_current`/`SwapBuffers` 忽略 HWND、关任一窗 `gl_destroy` 删掉唯一 HGLRC。
+表现：主窗字体花屏（两份 DirectContext 抢同一 GL 纹理）、副窗白板、关副窗后卡死。
+
+修法：按 `ComposeKNWin32Window*` 映射每窗独立 HDC/HGLRC；缩放 tick 改为
+`addWindowsRenderTick` / `removeWindowsRenderTick` 多订阅。
