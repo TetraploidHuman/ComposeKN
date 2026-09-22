@@ -86,6 +86,10 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · 想看空闲行为：ComposeKN-Windows-Native.exe --no-animate（关掉每帧动画）
   · 想强制后端：set COMPOSEKN_RENDER_API=software（或 gl）——日志里会写明实际用了哪条
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
+  · 窗口 API：`windowPosition` / `setWindowPosition` / `windowSize` / `setWindowSize` /
+    `alwaysOnTop` / `setAlwaysOnTop` / `isFullscreen` / `setFullscreen` / `resizable` /
+    `centerOnScreen()` / `setTaskbarProgress(TaskbarProgressState.Normal, 0.5)`；画廊里
+    有「窗口 / Window」一节可以点着验（置顶/全屏/居中/大小/任务栏进度）。
   · 富文本剪贴板：`Clipboard.getClipEntry()` / `ClipEntry.withHtml/withRtf/withImage`
     支持 HTML（CF_HTML）、RTF、位图（CF_DIBV5 + 传统 CF_DIB）与纯文本回退；
     读图三级回退 CF_DIBV5 -> CF_DIB -> CF_BITMAP（截图工具给哪种都能读），
@@ -118,8 +122,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (197 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (194 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (207 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (204 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -143,6 +147,9 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            GetMessage -> TranslateMessage -> DispatchMessage -> 真实 wndproc 分支：
            悬停进出、按压/点击、竖向与横向滚轮、精确滚轮 zDelta=-40、真实点击聚焦文本框、
            真实按键输入字符都必须成立）、
+           **窗口 API**：位置/客户区尺寸（dp）、置顶（读 WS_EX_TOPMOST）、全屏
+           （铺满显示器且退出后原样还原）、不可缩放（WM_NCHITTEST 收口 + 最大化被忽略）、
+           工作区居中、任务栏进度（ITaskbarList3；没有任务栏时老实回 false）、
            **富文本剪贴板**：clipboard.setClip(ClipEntry.withHtml/withRtf/withImage)
            -> CF_HTML（标准偏移头，含非 ASCII 片段）/ 注册格式 Rich Text Format /
            CF_DIBV5 + 传统 CF_DIB，再读回来（含 2×2 四色逐像素校验与独立头解析）；
@@ -154,8 +161,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            派发给 Modifier.dragAndDropTarget（Enter/Over/Drop/Leave、负载、命中位置、
            effect 写回、shouldStartDragAndDrop 的筛选）、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
-           动画按刷新率节流）（79 条）
-  all    = 两者都跑（194 条断言）
+           动画按刷新率节流）（89 条）
+  all    = 两者都跑（204 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个

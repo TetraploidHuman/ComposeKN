@@ -3467,3 +3467,100 @@ clipboard: 读图片失败，当前可用格式 = [DIB, BITMAP, DIBV5]
 * logic **118** / window **79**（+7）（合计 **197**）、`all` **194** —— 全绿；
 * 外部阶段：`win32msg` **14** 条（+1）+ `input` 5 条 + `screenshot` 4 条全绿；
 * 打包单文件 exe（无 `icudtl.dat`）干净目录复测。
+
+### 17.36 窗口 API：位置 / 置顶 / 全屏 / 不可缩放 / 居中 / 任务栏进度（v0.5.18）
+
+用户最早点名的三项里的最后一项。之前宿主只有 `show/minimize/maximize/restore/setTitle/toggleMaximized`，
+位置、置顶、全屏、任务栏进度全都没有 —— 而这些是"应用看起来像个正常窗口程序"的基本件。
+
+#### 对齐的点（以及为什么不能直接用上游的类型）
+
+上游 Compose Desktop 的 `WindowState` / `WindowPlacement` / `WindowPosition` 提供
+`position`（屏幕坐标）、`size`、`isMaximized`、`isFullscreen`，`Window()` 参数里有
+`alwaysOnTop` / `resizable`。但那些类型是 **JVM/AWT 就地的**（内部裹着 `java.awt.Window`），
+原生宿主根本用不了 —— 所以这一版在 Win32 侧实现**同一套语义**，Kotlin 侧给同义访问器：
+
+| 上游 | 我们的（`WindowsComposeWindow`） | Win32 实现 |
+| --- | --- | --- |
+| `WindowState.position` | `windowPosition: IntOffset` / `setWindowPosition(x, y)` | `GetWindowRect` / `SetWindowPos`（dp） |
+| `WindowState.size` | `windowSize: IntSize` / `setWindowSize(w, h)` | 客户区尺寸（系统标题栏的窗口会用 `AdjustWindowRectEx` 扣掉非客户区） |
+| `WindowPosition.Aligned(Center)` | `centerOnScreen()` | `SPI_GETWORKAREA`（**工作区**而不是整块屏幕，否则会被任务栏顶偏） |
+| `WindowPlacement.isFullscreen` | `isFullscreen` / `setFullscreen(x)` / `toggleFullscreen()` | 存样式+`GetWindowPlacement`，收成 `WS_POPUP` 铺满 `MonitorFromWindow` 的 `rcMonitor`，退出时原样还原 |
+| `alwaysOnTop` 参数 | `alwaysOnTop` / `setAlwaysOnTop(x)` | `SetWindowPos(HWND_TOPMOST/HWND_NOTOPMOST)`；读的是 `WS_EX_TOPMOST`（不信自己的记账） |
+| `resizable` 参数 | `resizable`（var） | `WM_NCHITTEST` 在 `!resizable` 时不再返回边缘命中码；同时去掉 `WS_MAXIMIZEBOX`，`maximize()` 也被忽略 |
+
+另外补了 `maximize()` / `restore()` 两个显式动作（原来只有 `toggleMaximized()`）。
+
+**一个刻意的小设计**：`resizable = false` 走"命中测试收口"而不是改 `WS_THICKFRAME` ——
+后者一变，系统窗口管理器和我们的 CSD 布局都会跟着抖（边框厚度/客户区尺寸都会变），
+只在 `WM_NCHITTEST` 上不给边缘命中码更稳，用户可见效果一样：拖边框改不了大小。
+
+#### 任务栏进度（`ITaskbarList3`）
+
+**没有**自己糊一套：直接 `CoCreateInstance(CLSID_TaskbarList, IID_ITaskbarList3)` →
+`HrInit` → `SetProgressState` + `SetProgressValue`，`state` 用 Windows 自己的 `TBPFLAG`
+（`TaskbarProgressState.None/Indeterminate/Normal/Error/Paused`，数值原样透传）。
+
+关键是**不假装成功**：没有 shell/任务栏的环境（部分 Wine 配置、无 explorer 的会话）里
+`taskbarSupported == false`，`setTaskbarProgress()` 老实回 `false`。自检在两种环境下都成立：
+
+```kotlin
+if (supported) accepted && taskbarProgressState() == (Normal to 0.5) else !accepted
+```
+
+（实测 Wine 里 `ITaskbarList3` 是**可用**的 —— 日志 `taskbar: 就绪（ITaskbarList3）`，
+所以这条断言在 Wine 里走的是"支持"分支：值能回读。真机上请肉眼确认任务栏上真的出现进度条。）
+
+#### 自检（新增 10 条 window/winapi-*）
+
+| 断言 | 内容 |
+| --- | --- |
+| `winapi-defaults` | 默认：不置顶、可缩放、非全屏 |
+| `winapi-always-on-top` | `setAlwaysOnTop(true)` 之后读 `WS_EX_TOPMOST` 为真 |
+| `winapi-resizable-false-blocks-maximize` | 不可缩放时 `toggleMaximized()` 必须无效（语义对齐上游） |
+| `winapi-position` | `setWindowPosition(120, 90)` → 读回 (120, 90) |
+| `winapi-size` | `setWindowSize(700, 500)` → 客户区与 `logicalWidth/Height` 都是 700x500 |
+| `winapi-fullscreen-on` | 全屏后铺满显示器（Xvfb 1600x1000）、`isFullscreen=true` |
+| `winapi-fullscreen-off-restores` | 退出后尺寸/位置**原样**回到 700x500 @(120,90) |
+| `winapi-taskbar-progress` | 支持则值能回读；不支持则必须回 false（不假装成功） |
+| `winapi-center-on-screen` | 工作区居中：(450, 250) |
+| `winapi-restore-defaults` | 收尾恢复默认态，避免影响后面的性能阶段 |
+
+宿主日志（真机排查时对着看）：
+
+```
+window: alwaysOnTop=1 / resizable=0 / 位置 -> 120,90 dp / 客户区 -> 700x500 dp（物理 700x500）
+window: 进入全屏 -> 1600x1000 @0,0（显示器 1600,1000） / 退出全屏
+taskbar: 就绪（ITaskbarList3） / 或 taskbar: 不可用 hr=0x…
+```
+
+#### 画廊里可以点着验
+
+`Gallery.kt` 新增「窗口 / Window」一节：置顶 / 全屏 / 改成不可缩放 / 居中 / 移到 (120,90) /
+大小 700x500 / 大小 1100x760 / 进度 50% / 进度不确定 / 清除进度，外加一行状态文字。
+每个按钮都打一行 `windowapi: …` 日志。**这些只能靠眼睛验**：自动化能验风格位、尺寸、命中
+测试行为和"没有任务栏时老实回 false"，但"窗口是不是真的浮在别的窗口之上"、"任务栏上有没有
+进度条"只有真机看得出来。
+
+#### fail-before（变异：几何读取少填一半）
+
+把 `composekn_win32_window_frame()` 里的客户区尺寸改成恒 0（模拟"忘了实现几何读取"），
+重新链接后跑 `--only=window`：
+
+```
+SELFTEST FAIL : window/winapi-size — 客户区=0x0 logical=700x500（期望 700x500）
+SELFTEST FAIL : window/winapi-fullscreen-on — 全屏=true 客户区=0x0
+SELFTEST FAIL : window/winapi-fullscreen-off-restores — 客户区=0x0 位置=(120, 90)
+SELFTEST FAIL : window/winapi-center-on-screen — 居中后位置=(800, 500)（期望 (450, 250)）
+SELFTEST FAIL : window/winapi-restore-defaults — 客户区=0x0
+SELFTEST: RESULT FAIL (89 checks, 5 failures)
+```
+
+10 条里 5 条变红，恰好是**依赖客户区尺寸**的那 5 条；位置/置顶/不可缩放/任务栏那 5 条仍绿
+—— 说明这组断言各自盯着自己的那一部分，不是一起跟着抖。
+
+#### 验证
+
+* logic **118** / window **89**（+10）（合计 **207**）、`all` **204** —— 全绿；
+* 外部阶段：`win32msg` 14 条 + `input` 5 条 + `screenshot` 4 条全绿；
+* 打包单文件 exe（无 `icudtl.dat`）干净目录复测。

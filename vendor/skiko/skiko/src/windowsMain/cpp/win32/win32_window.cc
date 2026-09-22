@@ -16,6 +16,9 @@
 #include <oleidl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+// 任务栏进度（ITaskbarList3）。没有 shell/任务栏的环境（比如 Wine + Xvfb）里
+// CoCreateInstance 会失败 —— 那时老实报告"不支持"，不要假装成功。
+#include <shobjidl.h>
 // 上游的 SkLoadICU()（从 exe 同目录 mmap icudtl.dat）被 win32_icu.cc 里的同名版本
 // 覆盖；这里显式引用它，保证链接器把**我们那份**从归档里拉进来。
 #include "SkLoadICU.h"
@@ -201,6 +204,23 @@ struct ComposeKNWin32Window {
     bool undecorated = false;
     // 光标形状（0=箭头 1=手 2=文本I型 3=十字），由 Compose 的 PointerIcon 驱动。
     int cursorKind = 0;
+
+    // ---- 窗口 API（位置/置顶/全屏/可缩放/任务栏进度）----
+    //
+    // 这些状态都在宿主侧记账：读的时候优先看 Win32 的真状态（WS_EX_TOPMOST 等），
+    // 但像"是否在无边框全屏"这种 Win32 没有对应位的，就用这里的标志。
+    bool alwaysOnTop = false;
+    bool resizable = true;
+    bool fullscreen = false;
+    // 进全屏前的样式/位置，退出时原样还原（AWT 的 WindowPlacement 也是这么干的）。
+    LONG_PTR fullscreenSavedStyle = 0;
+    LONG_PTR fullscreenSavedExStyle = 0;
+    WINDOWPLACEMENT fullscreenSavedPlacement = {};
+    // ITaskbarList3：惰性创建（没有 shell 时保持 nullptr，只尝试一次）。
+    ITaskbarList3* taskbar = nullptr;
+    bool taskbarCreateAttempted = false;
+    int32_t taskbarProgressState = 0;   // TBPF_NOPROGRESS
+    double taskbarProgressValue = 0.0;
 
     // ---- OLE 拖放（接收侧）----
     //
@@ -943,6 +963,10 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             composeknLog("wndproc: WM_CREATE hwnd=%p", (void*)hwnd);
             break;
         case WM_NCHITTEST: {
+            // resizable=false 时不做边缘命中（返回 HTCLIENT/HTBORDER），于是拖动边框改
+            // 不了大小 —— 这就是"不可缩放"。注意这里**不**动 WS_THICKFRAME：那个样式
+            // 一变，系统窗口管理器/我们的 CSD 布局都会跟着抖；只在命中测试上收口更稳。
+            if (!window->resizable) break;
             if (window->undecorated && window->hwnd == hwnd) {
                 // Parent is our window; keep default edges for maximized/menus
                 if (IsZoomed(hwnd) || IsIconic(hwnd)) break;
@@ -2510,6 +2534,248 @@ extern "C" bool composekn_win32_is_minimized(ComposeKNWin32Window* window) {
 extern "C" void composekn_win32_request_close(ComposeKNWin32Window* window) {
     if (window == nullptr || window->hwnd == nullptr) return;
     PostMessageW(window->hwnd, WM_CLOSE, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 窗口 API：位置 / 置顶 / 全屏 / 可缩放 / 任务栏进度
+//
+// 对齐的点：上游 Compose Desktop 的 `WindowState` / `WindowPlacement` 提供
+// `position`（WindowPosition）、`size`、`isMaximized`、`isFullscreen`，`Window` 参数里
+// 有 `alwaysOnTop` / `resizable`。那些类型是 JVM/AWT 就地的（内部裹着 java.awt.Window），
+// 我们的原生宿主用不了，所以这里在 Win32 侧实现**同一套语义**，Kotlin 侧提供同名/同义的
+// 访问器（见 WindowsComposeWindow）。
+//
+// 约定：所有位置/尺寸对外都是**逻辑像素（dp）**，客户区尺寸 = Compose 场景尺寸。
+// ---------------------------------------------------------------------------
+
+extern "C" bool composekn_win32_is_always_on_top(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    return (GetWindowLongPtrW(window->hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
+extern "C" void composekn_win32_set_always_on_top(ComposeKNWin32Window* window, bool on_top) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    window->alwaysOnTop = on_top;
+    SetWindowPos(
+        window->hwnd, on_top ? HWND_TOPMOST : HWND_NOTOPMOST,
+        0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    );
+    composeknLog("window: alwaysOnTop=%d", on_top ? 1 : 0);
+}
+
+extern "C" bool composekn_win32_is_resizable(ComposeKNWin32Window* window) {
+    return window != nullptr && window->resizable;
+}
+
+extern "C" void composekn_win32_set_resizable(ComposeKNWin32Window* window, bool resizable) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    window->resizable = resizable;
+    // 最大化按钮也跟着走：不可缩放的窗口不该能被最大化（对齐上游 resizable=false 的语义）。
+    LONG_PTR style = GetWindowLongPtrW(window->hwnd, GWL_STYLE);
+    if (resizable) {
+        style |= WS_MAXIMIZEBOX;
+    } else {
+        style &= ~static_cast<LONG_PTR>(WS_MAXIMIZEBOX);
+    }
+    SetWindowLongPtrW(window->hwnd, GWL_STYLE, style);
+    composeknLog("window: resizable=%d", resizable ? 1 : 0);
+}
+
+extern "C" bool composekn_win32_is_fullscreen(ComposeKNWin32Window* window) {
+    return window != nullptr && window->fullscreen;
+}
+
+extern "C" bool composekn_win32_set_fullscreen(ComposeKNWin32Window* window, bool fullscreen) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    if (fullscreen == window->fullscreen) return true;
+    if (fullscreen) {
+        // 记下当前样式/位置，把窗口样式收成"没有非客户区"的 popup，再铺满窗口所在显示器。
+        window->fullscreenSavedStyle = GetWindowLongPtrW(window->hwnd, GWL_STYLE);
+        window->fullscreenSavedExStyle = GetWindowLongPtrW(window->hwnd, GWL_EXSTYLE);
+        window->fullscreenSavedPlacement = {};
+        window->fullscreenSavedPlacement.length = sizeof(WINDOWPLACEMENT);
+        GetWindowPlacement(window->hwnd, &window->fullscreenSavedPlacement);
+
+        MONITORINFO monitor = {};
+        monitor.cbSize = sizeof(monitor);
+        if (!GetMonitorInfoW(MonitorFromWindow(window->hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            composeknLog("window: 全屏失败（拿不到显示器信息）");
+            return false;
+        }
+        LONG_PTR style = window->fullscreenSavedStyle;
+        style &= ~static_cast<LONG_PTR>(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+        style |= WS_POPUP;
+        SetWindowLongPtrW(window->hwnd, GWL_STYLE, style);
+        SetWindowPos(
+            window->hwnd, HWND_TOP,
+            monitor.rcMonitor.left, monitor.rcMonitor.top,
+            monitor.rcMonitor.right - monitor.rcMonitor.left,
+            monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW
+        );
+        window->fullscreen = true;
+        composeknLog(
+            "window: 进入全屏 -> %ldx%ld @%ld,%ld（显示器 %ld,%ld）",
+            (long)(monitor.rcMonitor.right - monitor.rcMonitor.left),
+            (long)(monitor.rcMonitor.bottom - monitor.rcMonitor.top),
+            (long)monitor.rcMonitor.left, (long)monitor.rcMonitor.top,
+            (long)monitor.rcMonitor.right, (long)monitor.rcMonitor.bottom
+        );
+    } else {
+        SetWindowLongPtrW(window->hwnd, GWL_STYLE, window->fullscreenSavedStyle);
+        SetWindowLongPtrW(window->hwnd, GWL_EXSTYLE, window->fullscreenSavedExStyle);
+        if (window->fullscreenSavedPlacement.length == sizeof(WINDOWPLACEMENT)) {
+            SetWindowPlacement(window->hwnd, &window->fullscreenSavedPlacement);
+        }
+        SetWindowPos(
+            window->hwnd, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+        );
+        window->fullscreen = false;
+        composeknLog("window: 退出全屏");
+    }
+    return true;
+}
+
+/**
+ * 当前窗口几何：out[0..1] = 窗口左上角（屏幕坐标，dp）；out[2..3] = **客户区**大小（dp）。
+ *
+ * 为什么位置用"窗口左上角"而尺寸用"客户区"：和上游 `WindowState.position/size` 的用法一致
+ * （位置是窗口在屏幕上的位置，尺寸是内容区大小）。客户区尺寸就是 Compose 场景尺寸。
+ */
+extern "C" void composekn_win32_window_frame(ComposeKNWin32Window* window, int32_t* out) {
+    if (out == nullptr) return;
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    if (window == nullptr || window->hwnd == nullptr) return;
+    const double scale = dpiScaleOf(window);
+    RECT rect = {};
+    if (GetWindowRect(window->hwnd, &rect)) {
+        out[0] = static_cast<int32_t>(rect.left / scale >= 0 ? rect.left / scale + 0.5 : rect.left / scale - 0.5);
+        out[1] = static_cast<int32_t>(rect.top / scale >= 0 ? rect.top / scale + 0.5 : rect.top / scale - 0.5);
+    }
+    out[2] = static_cast<int32_t>(window->width / scale + 0.5);
+    out[3] = static_cast<int32_t>(window->height / scale + 0.5);
+}
+
+extern "C" void composekn_win32_set_window_position(ComposeKNWin32Window* window, int32_t x_dp, int32_t y_dp) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    const double scale = dpiScaleOf(window);
+    SetWindowPos(
+        window->hwnd, nullptr,
+        static_cast<int>(x_dp * scale + (x_dp >= 0 ? 0.5 : -0.5)),
+        static_cast<int>(y_dp * scale + (y_dp >= 0 ? 0.5 : -0.5)),
+        0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    );
+    composeknLog("window: 位置 -> %d,%d dp", x_dp, y_dp);
+}
+
+extern "C" void composekn_win32_set_client_size(ComposeKNWin32Window* window, int32_t w_dp, int32_t h_dp) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    if (w_dp < 1) w_dp = 1;
+    if (h_dp < 1) h_dp = 1;
+    const double scale = dpiScaleOf(window);
+    int width = static_cast<int>(w_dp * scale + 0.5);
+    int height = static_cast<int>(h_dp * scale + 0.5);
+    if (!window->undecorated) {
+        // 系统标题栏的窗口要把非客户区算进去，SetWindowPos 给的是**窗口**尺寸。
+        // 无边框（CSD）窗口的客户区 == 窗口矩形，所以不用调 —— 调了反而会多出一圈。
+        RECT rect = {0, 0, width, height};
+        const LONG_PTR style = GetWindowLongPtrW(window->hwnd, GWL_STYLE);
+        const LONG_PTR exStyle = GetWindowLongPtrW(window->hwnd, GWL_EXSTYLE);
+        if (AdjustWindowRectEx(&rect, static_cast<DWORD>(style), FALSE, static_cast<DWORD>(exStyle))) {
+            width = rect.right - rect.left;
+            height = rect.bottom - rect.top;
+        }
+    }
+    SetWindowPos(
+        window->hwnd, nullptr, 0, 0, width, height,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+    );
+    composeknLog("window: 客户区 -> %dx%d dp（物理 %dx%d）", w_dp, h_dp, width, height);
+}
+
+/** 任务栏进度能不能用（没有 shell/任务栏时为 false）。 */
+extern "C" bool composekn_win32_taskbar_supported(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    if (window->taskbar != nullptr) return true;
+    if (window->taskbarCreateAttempted) return false;
+    window->taskbarCreateAttempted = true;
+    ITaskbarList3* list = nullptr;
+    const HRESULT hr = CoCreateInstance(
+        CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_ITaskbarList3,
+        reinterpret_cast<void**>(&list)
+    );
+    if (FAILED(hr) || list == nullptr) {
+        composeknLog("taskbar: 不可用 hr=0x%08lX（Wine/无 shell 时正常）", (unsigned long)hr);
+        return false;
+    }
+    if (FAILED(list->HrInit())) {
+        composeknLog("taskbar: HrInit 失败");
+        list->Release();
+        return false;
+    }
+    window->taskbar = list;
+    composeknLog("taskbar: 就绪（ITaskbarList3）");
+    return true;
+}
+
+/**
+ * 设置任务栏进度。state 用 Windows 的 TBPFLAG 值（0=无 1=不确定 2=正常 4=错误 8=暂停）。
+ *
+ * 返回 false = 这台机器/这个环境没有任务栏（我们**不假装成功**）。
+ */
+extern "C" bool composekn_win32_set_taskbar_progress(
+    ComposeKNWin32Window* window, int32_t state, double completed) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    if (!composekn_win32_taskbar_supported(window)) return false;
+    if (completed < 0.0) completed = 0.0;
+    if (completed > 1.0) completed = 1.0;
+    window->taskbarProgressState = state;
+    window->taskbarProgressValue = completed;
+    window->taskbar->SetProgressState(window->hwnd, static_cast<TBPFLAG>(state));
+    if (state == TBPF_NORMAL || state == TBPF_ERROR || state == TBPF_PAUSED) {
+        window->taskbar->SetProgressValue(
+            window->hwnd,
+            static_cast<ULONGLONG>(completed * 1000.0 + 0.5),
+            1000
+        );
+    }
+    return true;
+}
+
+/**
+ * 主显示器**工作区**（排除任务栏的可用区域），dp：out = {x, y, w, h}。
+ *
+ * 给 `centerOnScreen()` 用（对齐上游 `WindowPosition.Aligned(Alignment.Center)` 的语义：
+ * 居中要按"可用区域"而不是整块屏幕，否则会被任务栏顶偏）。
+ * 拿不到显示器信息时返回全 0。
+ */
+extern "C" void composekn_win32_primary_work_area(ComposeKNWin32Window* window, int32_t* out) {
+    if (out == nullptr) return;
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    RECT work = {};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+        composeknLog("window: 拿不到工作区（SPI_GETWORKAREA 失败）");
+        return;
+    }
+    const double scale = dpiScaleOf(window);
+    out[0] = static_cast<int32_t>(work.left / scale >= 0 ? work.left / scale + 0.5 : work.left / scale - 0.5);
+    out[1] = static_cast<int32_t>(work.top / scale >= 0 ? work.top / scale + 0.5 : work.top / scale - 0.5);
+    out[2] = static_cast<int32_t>((work.right - work.left) / scale + 0.5);
+    out[3] = static_cast<int32_t>((work.bottom - work.top) / scale + 0.5);
+}
+
+/** 自检用：读回宿主记的进度状态（没有任务栏时也能验 API 的参数校验/映射）。 */
+extern "C" void composekn_win32_taskbar_progress_state(
+    ComposeKNWin32Window* window, int32_t* state, double* completed) {
+    if (state != nullptr) *state = window == nullptr ? 0 : window->taskbarProgressState;
+    if (completed != nullptr) *completed = window == nullptr ? 0.0 : window->taskbarProgressValue;
 }
 
 extern "C" void composekn_win32_set_title(ComposeKNWin32Window* window, const char* title) {

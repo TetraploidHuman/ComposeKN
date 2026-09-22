@@ -61,6 +61,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -78,12 +80,11 @@ import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.composekn.windows.MouseButton
+import com.composekn.windows.TaskbarProgressState
 import com.composekn.windows.TouchPhase
 import com.composekn.windows.WindowsComposeApplication
 import com.composekn.windows.WindowsComposeWindow
@@ -2983,7 +2984,106 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                     topDownPixels?.joinToString { "0x${it.toUInt().toString(16)}" },
             )
         }
+        // ---- 窗口 API（位置/置顶/全屏/可缩放/任务栏进度，HANDOVER §17.36）----
+        //
+        // 全部走**真实 Win32**：置顶读 WS_EX_TOPMOST、位置尺寸读 GetWindowRect/客户区、
+        // 全屏真的换样式+铺满显示器、不可缩放看 WM_NCHITTEST 的行为、任务栏进度真的去
+        // CoCreateInstance(ITaskbarList3)。
         if (frame == 146) {
+            report.check(
+                "window/winapi-defaults",
+                !app.window.alwaysOnTop && app.window.resizable && !app.window.isFullscreen,
+                "默认：置顶=${app.window.alwaysOnTop} 可缩放=${app.window.resizable} " +
+                    "全屏=${app.window.isFullscreen}",
+            )
+            app.window.setAlwaysOnTop(true)
+            app.window.resizable = false
+            // 不可缩放时最大化必须被忽略（对齐上游 resizable=false 的语义）
+            app.window.toggleMaximized()
+        }
+        if (frame == 148) {
+            report.check(
+                "window/winapi-always-on-top",
+                app.window.alwaysOnTop,
+                "setAlwaysOnTop(true) 之后 alwaysOnTop=${app.window.alwaysOnTop}",
+            )
+            report.check(
+                "window/winapi-resizable-false-blocks-maximize",
+                !app.window.resizable && !app.window.isMaximized,
+                "可缩放=${app.window.resizable} 已最大化=${app.window.isMaximized}（期望 false/false）",
+            )
+            app.window.resizable = true
+            app.window.setWindowPosition(120, 90)
+            app.window.setWindowSize(700, 500)
+        }
+        if (frame == 150) {
+            report.check(
+                "window/winapi-position",
+                app.window.windowPosition == IntOffset(120, 90),
+                "位置=${app.window.windowPosition}（期望 (120, 90)）",
+            )
+            report.check(
+                "window/winapi-size",
+                app.window.windowSize == IntSize(700, 500) &&
+                    app.window.logicalWidth == 700 && app.window.logicalHeight == 500,
+                "客户区=${app.window.windowSize} logical=${app.window.logicalWidth}x" +
+                    "${app.window.logicalHeight}（期望 700x500）",
+            )
+            app.window.setFullscreen(true)
+        }
+        if (frame == 152) {
+            report.check(
+                "window/winapi-fullscreen-on",
+                app.window.isFullscreen && app.window.windowSize == IntSize(1600, 1000),
+                "全屏=${app.window.isFullscreen} 客户区=${app.window.windowSize}" +
+                    "（Xvfb 屏幕 1600x1000）",
+            )
+            app.window.setFullscreen(false)
+        }
+        if (frame == 154) {
+            report.check(
+                "window/winapi-fullscreen-off-restores",
+                !app.window.isFullscreen &&
+                    app.window.windowSize == IntSize(700, 500) &&
+                    app.window.windowPosition == IntOffset(120, 90),
+                "退出全屏后：全屏=${app.window.isFullscreen} 客户区=${app.window.windowSize} " +
+                    "位置=${app.window.windowPosition}（期望回到 700x500 @(120,90)）",
+            )
+            // 任务栏进度：没有任务栏的环境必须**老实说不支持**，不许假装成功。
+            val supported = app.window.taskbarSupported
+            val accepted = app.window.setTaskbarProgress(TaskbarProgressState.Normal, 0.5)
+            report.check(
+                "window/winapi-taskbar-progress",
+                if (supported) {
+                    accepted && app.window.taskbarProgressState() ==
+                        TaskbarProgressState.Normal to 0.5
+                } else {
+                    !accepted
+                },
+                "任务栏可用=$supported 接受=$accepted 回读=${app.window.taskbarProgressState()}" +
+                    "（不支持时必须回 false —— 不假装成功）",
+            )
+            app.window.setTaskbarProgress(TaskbarProgressState.None, 0.0)
+            app.window.centerOnScreen()
+        }
+        if (frame == 156) {
+            report.check(
+                "window/winapi-center-on-screen",
+                // Xvfb 工作区 1600x1000、窗口 700x500 -> 居中应落在 ((1600-700)/2, (1000-500)/2)
+                app.window.windowPosition == IntOffset(450, 250),
+                "居中后位置=${app.window.windowPosition}（期望 (450, 250)）",
+            )
+            app.window.setAlwaysOnTop(false)
+            app.window.setWindowSize(900, 600)
+        }
+        if (frame == 158) {
+            report.check(
+                "window/winapi-restore-defaults",
+                !app.window.alwaysOnTop && app.window.resizable &&
+                    app.window.windowSize == IntSize(900, 600),
+                "收尾：置顶=${app.window.alwaysOnTop} 可缩放=${app.window.resizable} " +
+                    "客户区=${app.window.windowSize}",
+            )
             // 交互检查做完 -> 交棒给性能测量（后台协程当节拍器），
             // 并且**停止**自己请求帧：这样界面真正静止下来。
             driveFrames = false

@@ -141,6 +141,49 @@ internal external fun composekn_win32_width(window: COpaquePointer?): Int
 @SymbolName("composekn_win32_height")
 internal external fun composekn_win32_height(window: COpaquePointer?): Int
 
+@SymbolName("composekn_win32_is_always_on_top")
+internal external fun composekn_win32_is_always_on_top(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_set_always_on_top")
+internal external fun composekn_win32_set_always_on_top(window: COpaquePointer?, onTop: Boolean)
+
+@SymbolName("composekn_win32_is_resizable")
+internal external fun composekn_win32_is_resizable(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_set_resizable")
+internal external fun composekn_win32_set_resizable(window: COpaquePointer?, resizable: Boolean)
+
+@SymbolName("composekn_win32_is_fullscreen")
+internal external fun composekn_win32_is_fullscreen(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_set_fullscreen")
+internal external fun composekn_win32_set_fullscreen(window: COpaquePointer?, fullscreen: Boolean): Boolean
+
+@SymbolName("composekn_win32_window_frame")
+internal external fun composekn_win32_window_frame(window: COpaquePointer?, out: CPointer<IntVar>)
+
+@SymbolName("composekn_win32_set_window_position")
+internal external fun composekn_win32_set_window_position(window: COpaquePointer?, xDp: Int, yDp: Int)
+
+@SymbolName("composekn_win32_set_client_size")
+internal external fun composekn_win32_set_client_size(window: COpaquePointer?, widthDp: Int, heightDp: Int)
+
+@SymbolName("composekn_win32_primary_work_area")
+internal external fun composekn_win32_primary_work_area(window: COpaquePointer?, out: CPointer<IntVar>)
+
+@SymbolName("composekn_win32_taskbar_supported")
+internal external fun composekn_win32_taskbar_supported(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_set_taskbar_progress")
+internal external fun composekn_win32_set_taskbar_progress(
+    window: COpaquePointer?, state: Int, completed: Double,
+): Boolean
+
+@SymbolName("composekn_win32_taskbar_progress_state")
+internal external fun composekn_win32_taskbar_progress_state(
+    window: COpaquePointer?, state: CPointer<IntVar>, completed: CPointer<DoubleVar>,
+)
+
 @SymbolName("composekn_win32_show")
 internal external fun composekn_win32_show(window: COpaquePointer?, cmd: Int)
 
@@ -536,6 +579,68 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
     fun requestClose() = composekn_win32_request_close(native)
     fun setTitle(title: String) = title.useCString { composekn_win32_set_title(native, it) }
+
+    // ---- 窗口 API（位置/置顶/全屏/可缩放/任务栏进度）----
+
+    /** 是否置顶（读 Win32 的 `WS_EX_TOPMOST`，不信我们自己的记账）。 */
+    val isAlwaysOnTop: Boolean get() = composekn_win32_is_always_on_top(native)
+
+    /** 置顶/取消置顶（`SetWindowPos` 的 `HWND_TOPMOST`/`HWND_NOTOPMOST`）。 */
+    fun setAlwaysOnTop(onTop: Boolean) = composekn_win32_set_always_on_top(native, onTop)
+
+    /** 能不能拖边框改大小（false 时 `WM_NCHITTEST` 不再返回边缘命中码）。 */
+    val resizable: Boolean get() = composekn_win32_is_resizable(native)
+    fun setResizable(resizable: Boolean) = composekn_win32_set_resizable(native, resizable)
+
+    /** 是否在无边框全屏（铺满窗口所在显示器）。 */
+    val isFullscreen: Boolean get() = composekn_win32_is_fullscreen(native)
+
+    /** 进出全屏。返回 false = 拿不到显示器信息之类的失败（不会抛）。 */
+    fun setFullscreen(fullscreen: Boolean): Boolean =
+        composekn_win32_set_fullscreen(native, fullscreen)
+
+    /**
+     * 当前几何：[0..1] 窗口左上角（屏幕坐标，dp），[2..3] 客户区大小（dp）。
+     * 拿不到窗口时返回全 0。
+     */
+    fun windowFrame(): IntArray = memScoped {
+        val out = allocArray<IntVar>(4)
+        composekn_win32_window_frame(native, out)
+        intArrayOf(out[0], out[1], out[2], out[3])
+    }
+
+    /** 把窗口左上角移到屏幕坐标 (xDp, yDp)。 */
+    fun setWindowPosition(xDp: Int, yDp: Int) =
+        composekn_win32_set_window_position(native, xDp, yDp)
+
+    /** 把**客户区**设成 widthDp x heightDp。 */
+    fun setClientSize(widthDp: Int, heightDp: Int) =
+        composekn_win32_set_client_size(native, widthDp, heightDp)
+
+    /** 主显示器工作区（排除任务栏），dp：`[x, y, w, h]`；拿不到时全 0。 */
+    fun primaryMonitorWorkAreaDp(): IntArray? = memScoped {
+        val out = allocArray<IntVar>(4)
+        composekn_win32_primary_work_area(native, out)
+        if (out[2] <= 0 || out[3] <= 0) null else intArrayOf(out[0], out[1], out[2], out[3])
+    }
+
+    /** 任务栏进度能不能用（Wine/无 shell 时为 false）。 */
+    val taskbarSupported: Boolean get() = composekn_win32_taskbar_supported(native)
+
+    /**
+     * 设任务栏进度。`state` 用 Windows 的 TBPFLAG 值（0=无 1=不确定 2=正常 4=错误 8=暂停），
+     * `completed` 0..1。返回 false = 这个环境没有任务栏（**不假装成功**）。
+     */
+    fun setTaskbarProgress(state: Int, completed: Double): Boolean =
+        composekn_win32_set_taskbar_progress(native, state, completed)
+
+    /** 自检用：读回宿主记的进度状态（`[state, completed]`）。 */
+    fun taskbarProgressState(): Pair<Int, Double> = memScoped {
+        val state = alloc<IntVar>()
+        val completed = alloc<DoubleVar>()
+        composekn_win32_taskbar_progress_state(native, state.ptr, completed.ptr)
+        state.value to completed.value
+    }
 
     /**
      * Begin a native move drag from a WM_NCLBUTTONDOWN/HTCAPTION synthetic event.

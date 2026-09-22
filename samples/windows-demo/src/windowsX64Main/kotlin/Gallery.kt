@@ -78,6 +78,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.composekn.windows.TaskbarProgressState
 import com.composekn.windows.WindowsComposeWindow
 import kotlin.concurrent.Volatile
 import androidx.compose.foundation.lazy.LazyListState
@@ -255,7 +256,7 @@ fun ComponentGallery(
 
             LazyColumn(state = outerState, modifier = Modifier.fillMaxSize()) {
                 item { DiagnosticsHud(probe, window) }
-                gallerySections(probe, animate, innerState)
+                gallerySections(probe, animate, innerState, window)
                 item { Spacer(Modifier.height(24.dp)) }
             }
         }
@@ -296,6 +297,7 @@ private fun LazyListScope.gallerySections(
     probe: GalleryProbe,
     animate: Boolean,
     innerState: LazyListState,
+    window: WindowsComposeWindow,
 ) {
     section("按钮 / Buttons") {
         Row(
@@ -449,6 +451,10 @@ private fun LazyListScope.gallerySections(
 
     section("剪贴板 / Clipboard") {
         ClipboardPasteBox()
+    }
+
+    section("窗口 / Window") {
+        WindowApiBox(window)
     }
 
     section("弹层 / Popup") {
@@ -692,6 +698,106 @@ private fun LazyListScope.gallerySections(
  * 所以「悬停/点击试试」这个盒子**必须**也把点击做成可见反馈，否则真机触摸用户
  * 得到的就是「点了没反应」（用户实测反馈，HANDOVER §17.28）。鼠标悬停照旧变色。
  */
+/**
+ * 窗口 API 的手动验证区：置顶 / 全屏 / 不可缩放 / 位置 / 大小 / 居中 / 任务栏进度。
+ *
+ * 这些东西**只能靠眼睛验**：自动化里能验风格位、尺寸、命中测试行为和"没有任务栏时
+ * 老实回 false"，但"窗口是不是真的浮在别的窗口之上"、"任务栏上有没有进度条"只有真机
+ * 看得出来。所以每个按钮都配一行状态文字，并且走的是和自检**同一套** API。
+ */
+@Composable
+private fun WindowApiBox(window: WindowsComposeWindow) {
+    var alwaysOnTop by remember { mutableStateOf(window.alwaysOnTop) }
+    var fullscreen by remember { mutableStateOf(window.isFullscreen) }
+    var resizable by remember { mutableStateOf(window.resizable) }
+    var status by remember {
+        mutableStateOf(
+            "窗口 API：置顶/全屏/不可缩放/位置/大小/居中/任务栏进度 —— " +
+                "任务栏可用=${window.taskbarSupported}",
+        )
+    }
+
+    Card(modifier = Modifier.width(520.dp)) {
+        Column(Modifier.padding(12.dp)) {
+            Text("窗口 API", style = MaterialTheme.typography.titleSmall)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.padding(top = 8.dp),
+            ) {
+                OutlinedButton(onClick = {
+                    alwaysOnTop = !alwaysOnTop
+                    window.setAlwaysOnTop(alwaysOnTop)
+                    status = "置顶 = $alwaysOnTop"
+                    winlog("windowapi: 置顶 -> $alwaysOnTop")
+                }) { Text(if (alwaysOnTop) "取消置顶" else "置顶") }
+
+                OutlinedButton(onClick = {
+                    val target = !fullscreen
+                    val ok = window.setFullscreen(target)
+                    fullscreen = window.isFullscreen
+                    status = if (ok) "全屏 = $fullscreen" else "全屏失败"
+                    winlog("windowapi: 全屏 -> $fullscreen（返回 $ok）")
+                }) { Text(if (fullscreen) "退出全屏" else "全屏") }
+
+                OutlinedButton(onClick = {
+                    resizable = !resizable
+                    window.resizable = resizable
+                    status = "可缩放 = $resizable（关掉后拖边框和最大化都无效）"
+                    winlog("windowapi: 可缩放 -> $resizable")
+                }) { Text(if (resizable) "改成不可缩放" else "改成可缩放") }
+
+                OutlinedButton(onClick = {
+                    window.centerOnScreen()
+                    status = "居中 -> 位置=${window.windowPosition} 客户区=${window.windowSize}"
+                    winlog("windowapi: 居中 -> ${window.windowPosition}")
+                }) { Text("居中") }
+
+                OutlinedButton(onClick = {
+                    window.setWindowPosition(120, 90)
+                    status = "位置 -> ${window.windowPosition}（期望 (120, 90)）"
+                    winlog("windowapi: 位置 -> ${window.windowPosition}")
+                }) { Text("移到 (120, 90)") }
+
+                OutlinedButton(onClick = {
+                    window.setWindowSize(700, 500)
+                    status = "客户区 -> ${window.windowSize}（期望 700x500）"
+                    winlog("windowapi: 客户区 -> ${window.windowSize}")
+                }) { Text("大小 700x500") }
+
+                OutlinedButton(onClick = {
+                    window.setWindowSize(1100, 760)
+                    status = "客户区 -> ${window.windowSize}（恢复默认）"
+                    winlog("windowapi: 客户区 -> ${window.windowSize}")
+                }) { Text("大小 1100x760") }
+
+                OutlinedButton(onClick = {
+                    val ok = window.setTaskbarProgress(TaskbarProgressState.Normal, 0.5)
+                    status = if (ok) "任务栏进度 50%" else "这台机器没有任务栏（接口老实回了 false）"
+                    winlog("windowapi: 任务栏进度 50% -> $ok")
+                }) { Text("进度 50%") }
+
+                OutlinedButton(onClick = {
+                    val ok = window.setTaskbarProgress(TaskbarProgressState.Indeterminate)
+                    status = if (ok) "任务栏进度：不确定" else "这台机器没有任务栏"
+                    winlog("windowapi: 任务栏不确定 -> $ok")
+                }) { Text("进度 不确定") }
+
+                OutlinedButton(onClick = {
+                    window.setTaskbarProgress(TaskbarProgressState.None)
+                    status = "任务栏进度已清除"
+                    winlog("windowapi: 任务栏进度清除")
+                }) { Text("清除进度") }
+            }
+            Text(
+                status,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+    }
+}
+
 /**
  * 「从剪贴板粘贴」盒子：**点一下**就把剪贴板内容读出来显示。
  *

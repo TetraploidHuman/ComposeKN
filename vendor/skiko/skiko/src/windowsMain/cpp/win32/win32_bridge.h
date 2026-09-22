@@ -349,6 +349,48 @@ bool composekn_win32_post_test_key(
     int32_t is_repeat
 );
 
+// ---------------------------------------------------------------------------
+// 窗口 API：位置 / 置顶 / 全屏 / 可缩放 / 任务栏进度
+//
+// 对齐上游 Compose Desktop 的 WindowState / WindowPlacement 语义（那些类型是 JVM/AWT
+// 就地的，原生宿主用不了，所以这里在 Win32 侧实现同一套语义，Kotlin 侧给同义访问器）。
+// 位置/尺寸对外一律是**逻辑像素（dp）**；客户区尺寸 = Compose 场景尺寸。
+// ---------------------------------------------------------------------------
+
+bool composekn_win32_is_always_on_top(ComposeKNWin32Window* window);
+void composekn_win32_set_always_on_top(ComposeKNWin32Window* window, bool on_top);
+
+bool composekn_win32_is_resizable(ComposeKNWin32Window* window);
+void composekn_win32_set_resizable(ComposeKNWin32Window* window, bool resizable);
+
+bool composekn_win32_is_fullscreen(ComposeKNWin32Window* window);
+bool composekn_win32_set_fullscreen(ComposeKNWin32Window* window, bool fullscreen);
+
+/**
+ * 当前几何：`out[0..1]` = 窗口左上角（屏幕坐标，dp）；`out[2..3]` = 客户区大小（dp）。
+ */
+void composekn_win32_window_frame(ComposeKNWin32Window* window, int32_t* out);
+
+/** 把窗口左上角移到屏幕坐标 (x_dp, y_dp)。 */
+void composekn_win32_set_window_position(ComposeKNWin32Window* window, int32_t x_dp, int32_t y_dp);
+
+/** 把**客户区**设成 w_dp x h_dp（系统标题栏的窗口会自动把非客户区算进去）。 */
+void composekn_win32_set_client_size(ComposeKNWin32Window* window, int32_t w_dp, int32_t h_dp);
+
+/** 主显示器工作区（排除任务栏），dp：`out = {x, y, w, h}`。拿不到时全 0。 */
+void composekn_win32_primary_work_area(ComposeKNWin32Window* window, int32_t* out);
+
+/** 任务栏进度能不能用（Wine/无 shell 时为 false —— 我们**不假装成功**）。 */
+bool composekn_win32_taskbar_supported(ComposeKNWin32Window* window);
+
+/** state 用 Windows 的 TBPFLAG（0=无 1=不确定 2=正常 4=错误 8=暂停）；completed 0..1。 */
+bool composekn_win32_set_taskbar_progress(
+    ComposeKNWin32Window* window, int32_t state, double completed);
+
+/** 自检用：读回宿主记的进度状态。 */
+void composekn_win32_taskbar_progress_state(
+    ComposeKNWin32Window* window, int32_t* state, double* completed);
+
 /** ShowWindow wrapper: cmd 3=SW_MAXIMIZE 6=SW_MINIMIZE 9=SW_RESTORE 5=SW_SHOW */
 void composekn_win32_show(ComposeKNWin32Window* window, int cmd);
 bool composekn_win32_is_maximized(ComposeKNWin32Window* window);

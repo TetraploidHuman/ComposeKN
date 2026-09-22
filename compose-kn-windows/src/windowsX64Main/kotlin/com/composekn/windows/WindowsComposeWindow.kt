@@ -4,6 +4,8 @@ import org.jetbrains.skia.Canvas
 import org.jetbrains.skiko.SkiaLayer
 import org.jetbrains.skiko.SkikoRenderDelegate
 import org.jetbrains.skiko.Win32Event
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import org.jetbrains.skiko.ClipboardImage
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.flushMainUIDispatcher
@@ -388,17 +390,143 @@ class WindowsComposeWindow(
     }
 
     /**
-     * Maximize or restore the window.
+     * Maximize the window（不可缩放时忽略，对齐上游 `resizable = false` 的语义）。
+     */
+    fun maximize() {
+        if (!resizable) return
+        win32Window?.maximize()
+        isMaximized = true
+    }
+
+    /**
+     * Restore the window from maximized/minimized.
+     */
+    fun restore() {
+        win32Window?.restore()
+        isMaximized = false
+        isMinimized = false
+    }
+
+    /**
+     * Maximize or restore the window（不可缩放时忽略）。
      */
     fun toggleMaximized() {
         val win = win32Window ?: return
         if (win.isMaximized) {
-            win.restore()
-            isMaximized = false
+            restore()
         } else {
-            win.maximize()
-            isMaximized = true
+            maximize()
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // 窗口 API（位置 / 置顶 / 全屏 / 可缩放 / 任务栏进度）
+    //
+    // 这些语义与上游 Compose Desktop 的 `WindowState` / `WindowPlacement` / `Window`
+    // 参数一一对应（`position` / `size` / `isFullscreen` / `alwaysOnTop` / `resizable`）。
+    // 上游那些类型是 JVM/AWT 就地的（内部裹着 java.awt.Window），原生宿主用不了，
+    // 所以这里给同义访问器；位置/尺寸一律是**逻辑像素（dp）**，尺寸指**客户区**。
+    // ---------------------------------------------------------------------
+
+    /** 是否置顶（读 Win32 的真状态，不是我们的记账）。 */
+    val alwaysOnTop: Boolean get() = win32Window?.isAlwaysOnTop ?: false
+
+    /** 置顶 / 取消置顶。 */
+    fun setAlwaysOnTop(onTop: Boolean) {
+        win32Window?.setAlwaysOnTop(onTop)
+    }
+
+    /**
+     * 能否拖边框改大小。
+     *
+     * `false` 时：`WM_NCHITTEST` 不再返回边缘命中码（拖边框无效），并且 [maximize] /
+     * [toggleMaximized] 会被忽略 —— 与上游 `resizable = false` 的语义一致。
+     */
+    var resizable: Boolean = true
+        set(value) {
+            field = value
+            win32Window?.setResizable(value)
+        }
+
+    /** 是否在无边框全屏（铺满窗口所在显示器）。 */
+    val isFullscreen: Boolean get() = win32Window?.isFullscreen ?: false
+
+    /**
+     * 进 / 出全屏。进全屏会铺满窗口所在显示器并去掉非客户区；退出时还原原来的样式与位置。
+     *
+     * @return false = 失败（比如拿不到显示器信息）。
+     */
+    fun setFullscreen(fullscreen: Boolean): Boolean =
+        win32Window?.setFullscreen(fullscreen) ?: false
+
+    /** 切换全屏，返回切换后的状态。 */
+    fun toggleFullscreen(): Boolean {
+        val target = !isFullscreen
+        return setFullscreen(target) && isFullscreen == target
+    }
+
+    /**
+     * 窗口左上角在屏幕上的位置（dp）。
+     *
+     * 拿不到窗口时返回 `IntOffset.Zero`；最大化/全屏时给的是系统当前的窗口矩形。
+     */
+    val windowPosition: IntOffset
+        get() {
+            val frame = win32Window?.windowFrame() ?: return IntOffset.Zero
+            return IntOffset(frame[0], frame[1])
+        }
+
+    /** 把窗口左上角移到屏幕坐标 (x, y)（dp）。 */
+    fun setWindowPosition(x: Int, y: Int) {
+        win32Window?.setWindowPosition(x, y)
+    }
+
+    /**
+     * 当前**客户区**大小（dp）—— 就是 Compose 场景尺寸（[logicalWidth] / [logicalHeight]）。
+     */
+    val windowSize: IntSize
+        get() {
+            val frame = win32Window?.windowFrame() ?: return IntSize(width, height)
+            return IntSize(frame[2], frame[3])
+        }
+
+    /** 把客户区设成 width x height（dp）；系统标题栏的窗口会自动把非客户区算进去。 */
+    fun setWindowSize(width: Int, height: Int) {
+        win32Window?.setClientSize(width, height)
+    }
+
+    /**
+     * 把窗口移到主显示器工作区中间（尺寸不变）—— 上游 `WindowPosition.Aligned(Alignment.Center)`
+     * 的等价物。拿不到显示器信息时什么都不做。
+     */
+    fun centerOnScreen() {
+        val win = win32Window ?: return
+        val screen = win.primaryMonitorWorkAreaDp() ?: return
+        val size = windowSize
+        val x = screen[0] + (screen[2] - size.width) / 2
+        val y = screen[1] + (screen[3] - size.height) / 2
+        win.setWindowPosition(x, y)
+    }
+
+    /** 任务栏进度能不能用（Wine / 没有 shell 时为 false）。 */
+    val taskbarSupported: Boolean get() = win32Window?.taskbarSupported ?: false
+
+    /**
+     * 任务栏进度（Windows 任务栏上的绿色/红色/黄色进度条）。
+     *
+     * @param state 见 [TaskbarProgressState]；[TaskbarProgressState.None] 会清掉进度。
+     * @param completed 0.0..1.0（会被夹到范围内）。
+     * @return false = 这个环境没有任务栏（**不假装成功**）。
+     */
+    fun setTaskbarProgress(
+        state: TaskbarProgressState,
+        completed: Double = 0.0,
+    ): Boolean = win32Window?.setTaskbarProgress(state.win32Value, completed) ?: false
+
+    /** 自检用：读回宿主记的进度状态。 */
+    fun taskbarProgressState(): Pair<TaskbarProgressState, Double> {
+        val (state, completed) = win32Window?.taskbarProgressState() ?: (0 to 0.0)
+        return TaskbarProgressState.fromWin32(state) to completed
     }
 
     /**
