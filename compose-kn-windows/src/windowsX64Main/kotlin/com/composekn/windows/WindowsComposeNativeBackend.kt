@@ -4,11 +4,13 @@ package com.composekn.windows
 
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.isSpecified
 import androidx.compose.ui.window.ComposeNativeWindowBackend
 import androidx.compose.ui.window.ComposeNativeWindowBackendRegistry
 import androidx.compose.ui.window.ComposeNativeWindowCreateParams
 import androidx.compose.ui.window.ComposeNativeWindowHandle
+import androidx.compose.ui.window.WindowGeometrySnapshot
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.WindowPosition
 import org.jetbrains.skiko.initWindowsMainThread
@@ -91,6 +93,7 @@ class WindowsNativeWindowHandle(
 
     private var disposed = false
     private var pendingContent: (@Composable () -> Unit)? = null
+    private var geometryListener: ((WindowGeometrySnapshot) -> Unit)? = null
 
     override fun asPlatformWindow(): Any? = app.window
 
@@ -151,9 +154,41 @@ class WindowsNativeWindowHandle(
         app.setContent(withChrome = app.window.undecorated, content = content)
     }
 
+    override fun setGeometryListener(listener: ((WindowGeometrySnapshot) -> Unit)?) {
+        geometryListener = listener
+        app.window.onGeometryHint = if (listener != null) {
+            { notifyGeometryFromNative() }
+        } else {
+            null
+        }
+    }
+
+    private fun notifyGeometryFromNative() {
+        if (disposed) return
+        val listener = geometryListener ?: return
+        val w = app.window
+        val size = w.windowSize
+        val pos = w.windowPosition
+        val placement = when {
+            w.isFullscreen -> WindowPlacement.Fullscreen
+            w.isMaximized -> WindowPlacement.Maximized
+            else -> WindowPlacement.Floating
+        }
+        listener(
+            WindowGeometrySnapshot(
+                size = DpSize(size.width.dp, size.height.dp),
+                position = WindowPosition.Absolute(pos.x.dp, pos.y.dp),
+                placement = placement,
+                isMinimized = w.isMinimized,
+            ),
+        )
+    }
+
     override fun dispose() {
         if (disposed) return
         disposed = true
+        geometryListener = null
+        app.window.onGeometryHint = null
         app.detachFromSharedHost()
     }
 }

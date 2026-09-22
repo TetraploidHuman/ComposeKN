@@ -35,6 +35,10 @@ import kotlinx.coroutines.awaitCancellation
  * 不是 application [Recomposer] 的子 composition。因此必须在这里挂一个
  * [LaunchedEffect] 保活 application 层，否则 `recomposer.close(); join()` 会立刻返回、
  * 共享泵退出、进程闪退（v0.5.21 真机复现）。
+ *
+ * [WindowState] 与原生几何双向同步（对齐 Desktop SwingWindow 的 appliedState）：
+ * - composition → native：仅当 state 与已应用值不同时才 apply（避免拖动回写后再次把窗拽回去）
+ * - native → composition：geometry listener 写回 state，并更新 appliedState
  */
 @Composable
 fun Window(
@@ -72,10 +76,38 @@ fun Window(
 
     val latestContent = rememberUpdatedState(content)
     val latestOnClose = rememberUpdatedState(onCloseRequest)
+    val currentState = rememberUpdatedState(state)
+
+    // 已应用到原生窗的状态；避免 state↔native 互相打架（用户拖动改大小时）
+    val appliedState = remember {
+        object {
+            var size = state.size
+            var position = state.position
+            var placement = state.placement
+            var isMinimized = state.isMinimized
+        }
+    }
 
     // 保活 application Recomposer：本窗在 composition 里的整段寿命。
     LaunchedEffect(handle) {
         awaitCancellation()
+    }
+
+    DisposableEffect(handle) {
+        handle.setGeometryListener { snap ->
+            val s = currentState.value
+            s.size = snap.size
+            s.position = snap.position
+            s.placement = snap.placement
+            s.isMinimized = snap.isMinimized
+            appliedState.size = snap.size
+            appliedState.position = snap.position
+            appliedState.placement = snap.placement
+            appliedState.isMinimized = snap.isMinimized
+        }
+        onDispose {
+            handle.setGeometryListener(null)
+        }
     }
 
     // 属性同步（不要每帧 setContent —— 那会重置场景）
@@ -84,14 +116,28 @@ fun Window(
         handle.setResizable(resizable)
         handle.setAlwaysOnTop(alwaysOnTop)
         handle.setOnCloseRequest { latestOnClose.value() }
-        handle.applyPlacement(state.placement, state.isMinimized)
-        if (state.size.width.isSpecified && state.size.height.isSpecified) {
-            handle.applySize(state.size)
+
+        if (state.placement != appliedState.placement ||
+            state.isMinimized != appliedState.isMinimized
+        ) {
+            handle.applyPlacement(state.placement, state.isMinimized)
+            appliedState.placement = state.placement
+            appliedState.isMinimized = state.isMinimized
         }
-        when (val pos = state.position) {
-            is WindowPosition.Absolute -> handle.applyPosition(pos)
-            is WindowPosition.Aligned -> handle.applyPosition(pos)
-            WindowPosition.PlatformDefault -> Unit
+        if (state.size != appliedState.size &&
+            state.size.width.isSpecified &&
+            state.size.height.isSpecified
+        ) {
+            handle.applySize(state.size)
+            appliedState.size = state.size
+        }
+        if (state.position != appliedState.position) {
+            when (val pos = state.position) {
+                is WindowPosition.Absolute -> handle.applyPosition(pos)
+                is WindowPosition.Aligned -> handle.applyPosition(pos)
+                WindowPosition.PlatformDefault -> Unit
+            }
+            appliedState.position = state.position
         }
     }
 

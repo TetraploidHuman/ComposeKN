@@ -126,6 +126,12 @@ class WindowsComposeWindow(
      */
     var onCloseRequest: (() -> Unit)? = null
 
+    /**
+     * 原生几何/放置变化提示（Move/Resize、最大化/最小化）。
+     * 由 [WindowsNativeWindowHandle] 挂上，把变化写回声明式 [androidx.compose.ui.window.WindowState]。
+     */
+    internal var onGeometryHint: (() -> Unit)? = null
+
     /** 是否已挂到 [WindowsApplicationHost]（共享泵）；与独占 [run] 互斥。 */
     var isHostAttached: Boolean = false
         private set
@@ -201,8 +207,16 @@ class WindowsComposeWindow(
      */
     internal fun tickRenderForHost(nowNanos: Long): HostRenderTick {
         val win = win32Window ?: return HostRenderTick.Idle
-        isMaximized = win.isMaximized
-        isMinimized = win.isMinimized
+        val nextMax = win.isMaximized
+        val nextMin = win.isMinimized
+        if (nextMax != isMaximized || nextMin != isMinimized) {
+            isMaximized = nextMax
+            isMinimized = nextMin
+            onGeometryHint?.invoke()
+        } else {
+            isMaximized = nextMax
+            isMinimized = nextMin
+        }
         if (!layer.hasRenderRequest()) return HostRenderTick.Idle
         if (win.isMinimized) return HostRenderTick.Minimized
         if (nowNanos < hostNextFrameNanos) {

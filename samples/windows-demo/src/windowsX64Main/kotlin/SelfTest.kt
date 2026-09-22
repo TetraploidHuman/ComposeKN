@@ -81,6 +81,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.window.Window
@@ -94,6 +95,7 @@ import com.composekn.windows.WindowsComposeApplication
 import com.composekn.windows.WindowsComposeWindow
 import com.composekn.windows.WindowsEvent
 import com.composekn.windows.WindowsInputState
+import com.composekn.windows.WindowsNativeWindowHandle
 import com.composekn.windows.charToCodePoint
 import com.composekn.windows.createKeyEvent
 import com.composekn.windows.duplicateVkEntries
@@ -3233,19 +3235,24 @@ private fun runConcurrentWindowTests(report: SelfTestReport) {
 }
 
 /**
- * 声明式 `application { Window }` 保活回归（HANDOVER §17.38 / v0.5.22）。
+ * 声明式 `application { Window }` 保活 + 双窗 GL + WindowState 双向同步（HANDOVER §17.38+）。
  *
  * 原先 Window 内容在独立 FrameRecomposer 上，application 层没有活动协程，
  * `recomposer.join()` 立刻返回 → 共享泵退出 → 画廊闪退。本用例要求至少出满
  * 若干帧再 `exitApplication()`，否则必红。
+ *
+ * 另验：native→state（setWindowSize 后 WindowState 跟上）与 state→native
+ * （改 WindowState.size 后客户区跟上），避免拖动回写后 SideEffect 再把窗拽回去。
  */
 private fun runApplicationApiSelfTest(report: SelfTestReport) {
-    report.section("application{} 声明式入口保活 + 双窗 GL")
+    report.section("application{} 声明式入口保活 + 双窗 GL + WindowState 同步")
     com.composekn.windows.registerComposeKnWindowsBackend()
 
     var frames = 0
     var framesSecond = 0
     var reachedExit = false
+    var nativeToStateOk = false
+    var stateToNativeOk = false
     var exitApp: (() -> Unit)? = null
 
     val guard = WindowPhaseGuard()
@@ -3263,10 +3270,11 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
             val exit = ::exitApplication
             exitApp = exit
             var openSecond by mutableStateOf(true)
+            val mainState = rememberWindowState(width = 400.dp, height = 300.dp)
 
             Window(
                 onCloseRequest = exit,
-                state = rememberWindowState(width = 400.dp, height = 300.dp),
+                state = mainState,
                 title = "Selftest-application-api",
                 undecorated = true,
             ) {
@@ -3279,6 +3287,42 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
                     while (framesSecond < 8 && waited < 180) {
                         withFrameNanos { waited++ }
                     }
+
+                    val win = (window as? WindowsNativeWindowHandle)?.composeWindow
+                    if (win != null) {
+                        // native → WindowState
+                        win.setWindowSize(520, 380)
+                        waited = 0
+                        while (
+                            (mainState.size.width.value < 519f ||
+                                mainState.size.height.value < 379f) &&
+                            waited < 90
+                        ) {
+                            withFrameNanos { waited++ }
+                        }
+                        nativeToStateOk =
+                            mainState.size.width.value >= 519f &&
+                                mainState.size.height.value >= 379f
+                        winlog(
+                            "application-api: native→state size=${mainState.size} ok=$nativeToStateOk",
+                        )
+
+                        // WindowState → native（依赖 appliedState 条件 SideEffect）
+                        mainState.size = DpSize(480.dp, 360.dp)
+                        waited = 0
+                        while (
+                            (win.windowSize.width != 480 || win.windowSize.height != 360) &&
+                            waited < 90
+                        ) {
+                            withFrameNanos { waited++ }
+                        }
+                        stateToNativeOk =
+                            win.windowSize.width == 480 && win.windowSize.height == 360
+                        winlog(
+                            "application-api: state→native size=${win.windowSize} ok=$stateToNativeOk",
+                        )
+                    }
+
                     reachedExit = true
                     winlog(
                         "application-api: mainFrames=$frames secondFrames=$framesSecond — exitApplication",
@@ -3322,6 +3366,16 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
         "application-api/second-frames",
         framesSecond >= 8,
         "secondFrames=$framesSecond (need >=8; 0 = 副窗没出帧 / WGL 单例)",
+    )
+    report.check(
+        "application-api/native-to-state",
+        nativeToStateOk,
+        "WindowState 未跟上 setWindowSize(520,380)",
+    )
+    report.check(
+        "application-api/state-to-native",
+        stateToNativeOk,
+        "客户区未跟上 WindowState.size=480x360",
     )
     report.check("application-api/reached-exit", reachedExit)
     report.check(

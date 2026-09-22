@@ -422,6 +422,7 @@ class WindowsComposeApplication(
                 winlog("event: resize ${event.width}x${event.height}")
                 scene.density = effectiveDensity()
                 window.layer.needRender()
+                window.onGeometryHint?.invoke()
             }
             is WindowsEvent.CloseEvent -> {
                 // DO_NOTHING_ON_CLOSE：系统关窗只到这里。
@@ -438,7 +439,7 @@ class WindowsComposeApplication(
                 window.layer.renderImmediately()
             }
             is WindowsEvent.MoveEvent -> {
-                // Move event handled
+                window.onGeometryHint?.invoke()
             }
         }
     }

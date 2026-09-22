@@ -1,11 +1,3 @@
-/*
- * Copyright 2026 The ComposeKN Authors
- *
- * Compose Desktop 对齐的原生窗口后端登记点。
- * linuxX64Main 与 mingwX64 共用本源码集：真正的 Win32/Wayland 实现由
- * compose-kn-windows / compose-kn-linux 在启动时注册，避免 ui → host 循环依赖。
- */
-
 package androidx.compose.ui.window
 
 import androidx.compose.runtime.Composable
@@ -30,8 +22,26 @@ interface ComposeNativeWindowHandle {
     fun applyPosition(position: WindowPosition)
     fun setOnCloseRequest(callback: () -> Unit)
     fun setContent(content: @Composable () -> Unit)
+
+    /**
+     * 原生几何变化回调（用户拖动改大小/位置、最大化/最小化等）。
+     * 用于把变化写回 [WindowState]（对齐 Desktop SwingWindow 的 componentListener）。
+     * 传 null 注销。
+     */
+    fun setGeometryListener(listener: ((WindowGeometrySnapshot) -> Unit)?)
+
     fun dispose()
 }
+
+/**
+ * 原生窗当前几何（逻辑像素 / dp），供 [ComposeNativeWindowHandle.setGeometryListener] 使用。
+ */
+data class WindowGeometrySnapshot(
+    val size: DpSize,
+    val position: WindowPosition.Absolute,
+    val placement: WindowPlacement,
+    val isMinimized: Boolean,
+)
 
 /**
  * 创建参数（逻辑像素 / dp，对齐 Desktop WindowState）。

@@ -3763,3 +3763,17 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
 
 `CreateWindowEx(CW_USEDEFAULT)` 后立刻 `ShowWindow`，再 `centerOnScreen()` → 用户看到
 左上角闪现再跳到中央。改为创建时隐藏，先 applySize + 定位，再 `show()`。
+
+#### WindowState 双向同步（v0.5.25）
+
+此前声明式 `Window(state=…)` 只做 composition→native（SideEffect 每轮无条件 apply），
+用户拖动改大小后状态不会回写，下一次 recomposition 还会把窗拽回旧 size。
+
+对齐 Desktop SwingWindow 的 `appliedState`：
+
+* `ComposeNativeWindowHandle.setGeometryListener` + `WindowGeometrySnapshot`
+* Win32：`Move`/`Resize` 与最大化/最小化变化时 `onGeometryHint` → 写回 `WindowState`，
+  并更新 `appliedState`
+* SideEffect 仅当 `state != appliedState` 时才 `applySize` / `applyPosition` /
+  `applyPlacement`
+* 自检 `application-api/native-to-state` + `application-api/state-to-native`

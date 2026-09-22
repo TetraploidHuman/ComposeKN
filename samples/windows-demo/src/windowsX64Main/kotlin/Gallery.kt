@@ -1140,7 +1140,7 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.20：剪贴板 withFiles / 拖放发出 / application{Window}",
+                    "v0.5.25：剪贴板 withFiles / 拖放发出 / application{Window} + WindowState 双向同步",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {
