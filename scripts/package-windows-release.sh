@@ -94,15 +94,20 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
     支持 HTML（CF_HTML）、RTF、位图（CF_DIBV5 + 传统 CF_DIB）与纯文本回退；
     读图三级回退 CF_DIBV5 -> CF_DIB -> CF_BITMAP（截图工具给哪种都能读），
     兼容 24/8bpp 调色板 DIB（含 biClrUsed=0 这种撒谎的头）；
-    `ClipEntry.getFiles()` 读 CF_HDROP（资源管理器里 Ctrl+C 的文件列表，写还没做）；
+    `ClipEntry.withFiles(paths)` 写 CF_HDROP（资源管理器里 Ctrl+V 可贴出文件列表）；
+    `ClipEntry.getFiles()` 读 CF_HDROP（资源管理器里 Ctrl+C 的文件列表）；
     `ClipEntry.getHtml()/getRtf()/getImage()/getPlainText()` 读回来。
     一次写入会把条目里所有格式放进同一个剪贴板事务（分开写会互相擦掉）。
     ⚠ Linux/Wayland 侧目前仍是纯文本（多 MIME 那条协议还没接）。
-  · 拖放（接收侧）：从资源管理器拖文件、或从别的应用拖文本到窗口上，
+  · 多窗口：Desktop 对齐的 `application { Window(...) }`；第二扇窗关窗只清自己的
+    `open` 状态，不会把整线程 `PostQuitMessage` 掉（共享消息泵）。
+  · 拖放（接收 + 发出）：
+    接收 — 从资源管理器拖文件、或从别的应用拖文本到窗口上，
     `Modifier.dragAndDropTarget` 会收到 onStarted/onEntered/onMoved/onDrop/onEnded。
     走的是真正的 OLE `IDropTarget`（和 AWT 同一条路），负载格式 CF_HDROP / CF_UNICODETEXT。
     读负载：`event.files`（路径列表）/ `event.text`（文本）/ `event.positionInWindow`。
-    诊断日志：`drag: ENTER|OVER|DROP|LEAVE pos=x,y files=N textLen=M`。
+    发出 — `Modifier.dragAndDropSource` 从窗口拖文本到外部（OLE `IDropSource` + `DoDragDrop`）。
+    诊断日志：`drag: ENTER|OVER|DROP|LEAVE …` / `drag-source: …`。
   · 触摸板 / 精确滚轮：Win32 的 WM_MOUSEWHEEL `zDelta` **不保证**是 120 的倍数
     （触控板常送 40/80 这种值），宿主按上游 Compose Desktop 的模型换算成**浮点**的
     「格」（zDelta / 120），不再被整数除法截断成 0 —— 想确认自己设备的触控板送了什么，
@@ -156,12 +161,14 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            -> CF_HTML（标准偏移头，含非 ASCII 片段）/ 注册格式 Rich Text Format /
            CF_DIBV5 + 传统 CF_DIB，再读回来（含 2×2 四色逐像素校验与独立头解析）；
            读图三级回退 CF_DIBV5 -> CF_DIB -> CF_BITMAP，8bpp 调色板（含 biClrUsed=0
-           撒谎的头）与 24bpp 自上而下解码；CF_HDROP 文件列表；
+           撒谎的头）与 24bpp 自上而下解码；CF_HDROP 文件列表（读 + `ClipEntry.withFiles` 写）；
            读图失败时的「当前可用格式」诊断、
-           **OLE 拖放（接收侧）**：真的 IDropTarget（OleInitialize + RegisterDragDrop）
+           **OLE 拖放（接收 + 发出）**：真的 IDropTarget（OleInitialize + RegisterDragDrop）
            解析 CF_HDROP / CF_UNICODETEXT，按上游 ComposeSceneDragAndDropNode 的顺序
-           派发给 Modifier.dragAndDropTarget（Enter/Over/Drop/Leave、负载、命中位置、
-           effect 写回、shouldStartDragAndDrop 的筛选）、
+           派发给 Modifier.dragAndDropTarget；发出侧 IDropSource + DoDragDrop
+           （Enter/Over/Drop/Leave、负载、命中位置、effect 写回、shouldStartDragAndDrop
+           的筛选）、
+           **多窗口**：A+B 同挂共享泵，关 A 后 B 仍继续出帧、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
            动画按刷新率节流）（96 条）
   all    = 两者都跑（211 条断言）

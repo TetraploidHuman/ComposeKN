@@ -58,7 +58,17 @@ else
     # B. 从源码构建模式（需要 nix-shell 提供的 mingw 交叉工具链）
     # ------------------------------------------------------------------
     WORK="${SKIA_MINGW_WORK:?请设置 SKIA_MINGW_WORK（或改用 SKIA_MINGW_PREBUILT）}"
-    SKIA_OUT="$WORK/skia/out/mingw"
+    # Windows 宿主默认走 GL/WGL（DirectContext.makeGL）；必须链 Ganesh+GL 的 Skia。
+    # 优先 out/mingw-gl（build-skia-mingw-gl.sh），可用 SKIA_OUT_DIR 覆盖。
+    if [ -n "${SKIA_OUT_DIR:-}" ]; then
+        SKIA_OUT="$SKIA_OUT_DIR"
+    elif [ -f "$WORK/skia/out/mingw-gl/libskia.a" ]; then
+        SKIA_OUT="$WORK/skia/out/mingw-gl"
+    else
+        SKIA_OUT="$WORK/skia/out/mingw"
+    fi
+    [ -f "$SKIA_OUT/libskia.a" ] || die "找不到 $SKIA_OUT/libskia.a"
+    info "源码模式 Skia：$SKIA_OUT"
     SHIM_DIR="$WORK/shim"
     PATCHED_DIR="$SHIM_DIR/patched-libs"
     MINGW_W64_LIB="$(dirname "$(x86_64-w64-mingw32-g++ -print-file-name=libmsvcrt.a)")"
