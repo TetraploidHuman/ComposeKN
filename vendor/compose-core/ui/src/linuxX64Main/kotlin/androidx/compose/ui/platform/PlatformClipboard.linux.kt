@@ -104,6 +104,7 @@ private fun platformSetClipEntry(clipEntry: ClipEntry?) {
         html = clipEntry.html,
         rtf = clipEntry.rtf,
         image = clipEntry.image?.toClipboardImage(),
+        files = clipEntry.files.takeIf { it.isNotEmpty() },
     )
 }
 
@@ -154,8 +155,7 @@ actual class ClipEntry internal constructor() {
      *
      * 空列表 = 这次剪贴板里没有文件。
      *
-     * ⚠ 目前只支持**读**：把文件列表**写**进剪贴板（`CF_HDROP` + 首选拖放效果那套
-     * shell 语义）还没做，所以没有对应的 `withFiles` 工厂。
+     * 写入用 [withFiles]。
      */
     @ExperimentalComposeUiApi
     fun getFiles(): List<String> = files
@@ -204,6 +204,17 @@ actual class ClipEntry internal constructor() {
         @ExperimentalComposeUiApi
         fun withImage(image: ImageBitmap, plainText: String? = null): ClipEntry = ClipEntry().apply {
             this.image = image
+            this.plainText = plainText
+        }
+
+        /**
+         * 文件路径列表（Windows：`CF_HDROP` + Preferred DropEffect=COPY）。
+         *
+         * [plainText] 可选：不认 HDROP 的程序可退回纯文本（例如路径用换行拼起来）。
+         */
+        @ExperimentalComposeUiApi
+        fun withFiles(files: List<String>, plainText: String? = null): ClipEntry = ClipEntry().apply {
+            this.files = files
             this.plainText = plainText
         }
     }

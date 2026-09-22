@@ -118,29 +118,141 @@ class WindowsComposeWindow(
         }
 
     /**
-     * Run the window with event handling.
+     * 系统关窗回调（对齐 Desktop DO_NOTHING_ON_CLOSE）。
+     *
+     * WM_CLOSE 只推 [WindowsEvent.CloseEvent]，**不** DestroyWindow。
+     * - 声明式 [androidx.compose.ui.window.Window]：设为用户的 onCloseRequest
+     * - 命令式独占 [run]：默认销毁本窗口以退出循环
+     */
+    var onCloseRequest: (() -> Unit)? = null
+
+    /** 是否已挂到 [WindowsApplicationHost]（共享泵）；与独占 [run] 互斥。 */
+    var isHostAttached: Boolean = false
+        private set
+
+    private var hostEventHandler: ((WindowsEvent) -> Unit)? = null
+    private var hostNextFrameNanos: Long = 0L
+    private var hostFrames: Int = 0
+
+    /**
+     * 创建 HWND、attach SkiaLayer，并注册到共享宿主。**不**进入阻塞循环。
+     *
+     * 之后由 [WindowsApplicationHost.runSharedPump] 调用
+     * [drainEventsForHost] / [tickRenderForHost]。
+     */
+    fun attachToHost(onEvent: (WindowsEvent) -> Unit) {
+        check(!isHostAttached) { "already attached to WindowsApplicationHost" }
+        check(win32Window == null) { "window already created (exclusive run?)" }
+        initWindowsMainThread()
+        win32Log("attachToHost: create Win32 window ${width}x$height")
+        val win = createAndAttachLayer()
+        hostEventHandler = onEvent
+        isHostAttached = true
+        hostNextFrameNanos = 0L
+        hostFrames = 0
+        // 共享泵：wake 走 Host（可打到任一存活 HWND），不要抢全局 wake handler。
+        layer.setRenderRequestHandler { WindowsApplicationHost.wake() }
+        WindowsApplicationHost.register(this)
+        layer.renderImmediately()
+        layer.needRender()
+        win32Log(
+            "attachToHost: ready frameInterval=${frameIntervalNanos(win) / 1_000_000}ms " +
+                "refresh=${win.refreshHz}Hz"
+        )
+    }
+
+    /**
+     * 从本窗口事件队列取出并翻译，交给宿主会话。
+     *
+     * Close：只调 [onCloseRequest]（及 onEvent），**不**销毁 —— 销毁在离开 composition /
+     * [detachFromHost] 时发生。
+     */
+    fun drainEventsForHost() {
+        val win = win32Window ?: return
+        val handler = hostEventHandler ?: return
+        translateAndDispatch(win) { event ->
+            when (event) {
+                is WindowsEvent.FocusEvent -> {
+                    WindowsApplicationHost.noteFocus(this, event.hasFocus)
+                    handler(event)
+                }
+                is WindowsEvent.CloseEvent -> {
+                    // DO_NOTHING：系统关窗 → 回调；真正 destroy 由上层决定
+                    onCloseRequest?.invoke()
+                    handler(event)
+                }
+                else -> handler(event)
+            }
+        }
+    }
+
+    /**
+     * 共享泵的一帧渲染 tick（按需 + 帧节流 + 最小化跳过）。
+     */
+    internal fun tickRenderForHost(nowNanos: Long): HostRenderTick {
+        val win = win32Window ?: return HostRenderTick.Idle
+        isMaximized = win.isMaximized
+        isMinimized = win.isMinimized
+        if (!layer.hasRenderRequest()) return HostRenderTick.Idle
+        if (win.isMinimized) return HostRenderTick.Minimized
+        if (nowNanos < hostNextFrameNanos) {
+            return HostRenderTick.Wait(hostNextFrameNanos)
+        }
+        if (!layer.renderIfRequested()) {
+            return HostRenderTick.Wait(hostNextFrameNanos)
+        }
+        val after = currentNanoTime()
+        val interval = frameIntervalNanos(win)
+        hostNextFrameNanos = maxOf(hostNextFrameNanos + interval, after)
+        hostFrames++
+        frameCount = hostFrames
+        frameHook?.invoke(hostFrames)
+        return HostRenderTick.Rendered(
+            nextFrameNanos = hostNextFrameNanos,
+            stillDirty = layer.hasRenderRequest(),
+        )
+    }
+
+    /** 供 Host 调用的内部 API。 */
+    internal fun wakeNative() {
+        win32Window?.wake()
+    }
+
+    internal fun waitNative(timeoutMillis: Int): Boolean =
+        win32Window?.waitMessage(timeoutMillis) ?: false
+
+    /**
+     * 从共享宿主摘掉并销毁 HWND（离开 composition / 会话收尾时调用）。
+     */
+    fun detachFromHost() {
+        if (!isHostAttached && win32Window == null) return
+        win32Log("detachFromHost: frames=$hostFrames")
+        WindowsApplicationHost.unregister(this)
+        isHostAttached = false
+        hostEventHandler = null
+        layer.setRenderRequestHandler(null)
+        layer.detach()
+        win32Window?.close()
+        win32Window = null
+    }
+
+    /**
+     * 独占消息循环（单窗口自检 / 遗留路径）。
+     *
+     * 多窗口请用 [attachToHost] + [WindowsApplicationHost.runSharedPump]。
+     * 系统关窗默认销毁本窗口（若未另设 [onCloseRequest]）。
      */
     fun run(onEvent: (WindowsEvent) -> Unit) {
-        win32Log("run: enter")
+        win32Log("run: enter (exclusive pump)")
+        check(!isHostAttached) { "use shared host or exclusive run, not both" }
         initWindowsMainThread()
-        win32Log("run: create Win32 window ${width}x$height")
-        val win = Win32Window(title, width, height, undecorated)
-        win32Window = win
-        println("WindowsComposeWindow: created window '$title' (${win.width}x${win.height})")
-        win32Log("run: window created ok ${win.width}x${win.height}")
-        if (pointerIconKind != 0) win.setCursor(pointerIconKind)
+        val win = createAndAttachLayer()
 
-        check(layer.renderDelegate != null) {
-            "SkiaLayer.renderDelegate must be set before WindowsComposeWindow.run()"
+        // 命令式默认：关窗 = 销毁，以便本循环退出（自检 requestClose 依赖这条）。
+        if (onCloseRequest == null) {
+            onCloseRequest = { destroy() }
         }
-        win32Log("run: attachTo layer")
-        layer.attachTo(win)
-        win32Log("run: layer attached; entering message loop")
 
-        // 渲染请求（Compose 失效 / 动画帧 / 显式 needRender）与跨线程 UI 任务
-        // 都可能发生在循环正阻塞等消息的时候，必须能把消息泵叫醒：
-        //   - 不接渲染请求  -> 动画停摆（每次循环都在睡觉，没人叫它）
-        //   - 不接 UI 任务  -> 后台线程干完活要等到下一条输入消息才上屏
         layer.setRenderRequestHandler { win.wake() }
         setMainUIDispatcherWakeUpHandler { win.wake() }
 
@@ -176,10 +288,22 @@ class WindowsComposeWindow(
             while (running) {
                 running = win.pump()
                 flushMainUIDispatcher()
-                translateAndDispatch(win, onEvent)
+                translateAndDispatch(win) { event ->
+                    when (event) {
+                        is WindowsEvent.CloseEvent -> {
+                            onCloseRequest?.invoke()
+                            onEvent(event)
+                        }
+                        is WindowsEvent.FocusEvent -> {
+                            WindowsApplicationHost.noteFocus(this, event.hasFocus)
+                            onEvent(event)
+                        }
+                        else -> onEvent(event)
+                    }
+                }
                 // 事件处理可能在 UI 队列里排了新任务（输入 -> 状态变更 -> 重组）
                 flushMainUIDispatcher()
-                if (!running) break
+                if (!running || win32Window == null) break
 
                 if (!layer.hasRenderRequest()) {
                     // 内容没变：不重绘。真正睡着等消息/唤醒 —— 静止的窗口在这里
@@ -223,10 +347,31 @@ class WindowsComposeWindow(
             setMainUIDispatcherWakeUpHandler(null)
             // IME 光标回调也一样：它是注册在 C 侧的**全局**回调，窗口拆掉之后不能再被调用
             // （真机上 WM_IME_REQUEST 可能在销毁过程中还剩一条）。
-            setWindowsImeCaretProvider(null)
+            // 多窗口共享时由 Host 接管；独占路径仍在此清空。
+            if (!WindowsApplicationHost.isRegistered(this) &&
+                WindowsApplicationHost.liveWindowCount == 0
+            ) {
+                setWindowsImeCaretProvider(null)
+            }
             layer.detach()
-            win.close()
+            win32Window?.close()
+            win32Window = null
         }
+    }
+
+    /** 创建 Win32 窗口并 attach SkiaLayer（[run] / [attachToHost] 共用）。 */
+    private fun createAndAttachLayer(): Win32Window {
+        win32Log("create: Win32 window ${width}x$height undecorated=$undecorated")
+        val win = Win32Window(title, width, height, undecorated)
+        win32Window = win
+        println("WindowsComposeWindow: created window '$title' (${win.width}x${win.height})")
+        win32Log("create: window ok ${win.width}x${win.height}")
+        if (pointerIconKind != 0) win.setCursor(pointerIconKind)
+        check(layer.renderDelegate != null) {
+            "SkiaLayer.renderDelegate must be set before attach/run"
+        }
+        layer.attachTo(win)
+        return win
     }
 
     private fun translateAndDispatch(win: Win32Window, onEvent: (WindowsEvent) -> Unit) {
@@ -651,6 +796,13 @@ class WindowsComposeWindow(
         win32Window?.testSimulateDrag(phase, x, y, kind) ?: false
 
     /**
+     * 发起 OLE 拖放（模态）。自检 / Gallery 可直接调；Compose `dragAndDropSource`
+     * 走同一条 C 桥。
+     */
+    fun doDragDrop(files: List<String>?, text: String?): Int =
+        win32Window?.doDragDrop(files, text) ?: -1
+
+    /**
      * 自检用：把一条**真实的 Win32 鼠标消息** PostMessage 到窗口自己的消息队列。
      *
      * 与 [WindowsComposeApplication.dispatchEvent] 的区别是根本性的：后者把
@@ -681,8 +833,15 @@ class WindowsComposeWindow(
 
     /**
      * Destroy the window and cleanup resources.
+     *
+     * 若已挂共享宿主，走 [detachFromHost]（unregister + detach + close）；
+     * 独占 [run] 路径只关 HWND，由 finally 做 layer detach。
      */
     fun destroy() {
+        if (isHostAttached) {
+            detachFromHost()
+            return
+        }
         win32Window?.close()
         win32Window = null
     }

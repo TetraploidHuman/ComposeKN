@@ -67,7 +67,9 @@ actual open class SkiaLayer {
             is String -> Win32Window(container)
             else -> error("container must be Win32Window or window title String")
         }
-        org.jetbrains.skiko.compositionWindowRegistry.add(win32Window!!)
+        compositionWindowRegistry.add(win32Window!!)
+        // 新 attach 的窗口视为最近活跃（剪贴板 / IME 全局回调优先找它）。
+        lastActiveCompositionWindow = win32Window
         redrawer = createRedrawer(win32Window!!).apply {
             syncBounds()
             needRender()
@@ -75,6 +77,15 @@ actual open class SkiaLayer {
     }
 
     actual fun detach() {
+        // 多窗口：detach 时必须把自己从剪贴板注册表摘掉，否则关窗后 firstOrNull
+        // 仍指向已销毁的 HWND（见 compositionWindowRegistry）。
+        win32Window?.let { attached ->
+            compositionWindowRegistry.remove(attached)
+            if (lastActiveCompositionWindow === attached) {
+                lastActiveCompositionWindow =
+                    compositionWindowRegistry.lastOrNull() as? Win32Window
+            }
+        }
         redrawer?.dispose()
         redrawer = null
         win32Window = null

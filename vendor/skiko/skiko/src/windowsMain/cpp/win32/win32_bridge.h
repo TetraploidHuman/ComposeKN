@@ -103,12 +103,18 @@ ComposeKNWin32Window* composekn_win32_create(
     const char* title, int width_dp, int height_dp, int undecorated);
 void composekn_win32_destroy(ComposeKNWin32Window* window);
 
-/** Pump pending Win32 messages. Returns false when the app should quit. */
+/** Pump pending Win32 messages. Returns false when this window was destroyed (quit). */
 bool composekn_win32_pump(ComposeKNWin32Window* window);
 
 /**
+ * 线程级 PeekMessage 循环（不绑定某个 HWND 的 quit/close 标志）。
+ * 多窗口共享泵用这条；收到 WM_QUIT 返回 false。
+ */
+bool composekn_win32_pump_thread(void);
+
+/**
  * Block until the window's message queue is non-empty, or timeout_ms elapses
- * (< 0 = wait forever). Returns false when the app should quit.
+ * (< 0 = wait forever). Returns false when this window was destroyed (quit).
  *
  * 渲染循环用它替代「PeekMessage 忙等」：没有渲染任务时线程真正睡着（CPU ≈ 0），
  * 消息一到立刻醒来，所以输入延迟不受影响。
@@ -305,6 +311,23 @@ int32_t composekn_win32_drag_pop_text(
 bool composekn_win32_test_simulate_drag(
     ComposeKNWin32Window* window, int32_t phase, int32_t x, int32_t y, int32_t kind);
 
+/**
+ * 发起 OLE 拖放（模态）。utf8_files / utf8_text 用 '\n' 分隔路径 / 纯文本。
+ * allowed_effects：DROPEFFECT_COPY=1 等。返回最终 effect；失败 -1；取消 0。
+ */
+int32_t composekn_win32_do_drag_drop(
+    ComposeKNWin32Window* window,
+    const char* utf8_files,
+    const char* utf8_text,
+    int32_t allowed_effects);
+
+/**
+ * 自检：SourceDataObject 的 QueryGetData/GetData。
+ * 返回位掩码 bit0=CF_HDROP bit1=CF_UNICODETEXT；负值 = 失败。
+ */
+int32_t composekn_win32_test_source_data_formats(
+    const char* utf8_files, const char* utf8_text);
+
 // ---------------------------------------------------------------------------
 // 自检用：真实 Win32 消息注入（PostMessage -> 主循环 -> 真实 wndproc 分支）
 //
@@ -433,7 +456,9 @@ void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window, const char
  * SetClipboardData"的模型 —— 分几次调用会把前一次的内容擦掉）。
  *
  * 传 nullptr / 0 表示"这个格式不要放"。text 会转成 CF_UNICODETEXT，html 会包上标准
- * CF_HTML 头，rtf 走注册格式 "Rich Text Format"，image 走 CF_DIBV5。
+ * CF_HTML 头，rtf 走注册格式 "Rich Text Format"，image 走 CF_DIBV5，
+ * utf8_files（'\n' 分隔的 UTF-8 路径）走 CF_HDROP，并附带
+ * CFSTR_PREFERREDDROPEFFECT=DROPEFFECT_COPY（资源管理器「粘贴」需要）。
  *
  * 这是 `Clipboard.setClipEntry()` 的平台层实现：应用给一个条目，里面有哪些格式就写哪些
  * （Word/Chrome 都是这么放的 —— 老程序拿文本、支持 HTML 的拿 HTML）。
@@ -445,7 +470,8 @@ void composekn_win32_clipboard_set_rich(
     const char* utf8_rtf,
     int32_t image_width,
     int32_t image_height,
-    const uint8_t* bgra);
+    const uint8_t* bgra,
+    const char* utf8_files);
 
 /**
  * CF_HTML 里的**片段**（`<!--StartFragment-->` 与 `<!--EndFragment-->` 之间的那段 HTML），

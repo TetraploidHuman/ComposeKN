@@ -122,6 +122,12 @@ constexpr int kEdgeMarginBase = 6; // logical px, scaled by DPI
 
 }  // end anonymous namespace
 
+/**
+ * 本线程 OleInitialize 成功调用次数（含 S_FALSE）。
+ * 每建一个拖放窗口 +1，销毁时 -1；到 0 才 OleUninitialize —— 关一个窗不能把兄弟窗的 OLE 拆掉。
+ */
+static LONG g_oleInitCount = 0;
+
 struct ComposeKNWin32Window {
     HWND hwnd = nullptr;
     int width = 0;
@@ -1915,11 +1921,15 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             break;
         }
         case WM_CLOSE: {
+            // 对齐 Compose Desktop / AWT 的 DO_NOTHING_ON_CLOSE：
+            // 只把 CLOSE 事件推给 Kotlin（onCloseRequest），**不** DestroyWindow、
+            // **不**把本窗口标成「该退了」。真正销毁发生在离开 composition /
+            // 宿主主动 destroy 时。旧的 closeRequested 路径会让消息泵直接退出，
+            // 多窗口下关一个窗就会把共享泵带走。
             if (window) {
                 ComposeKNWin32Event e{};
                 e.type = COMPOSEKN_WIN32_EVENT_CLOSE;
                 pushEvent(window, e);
-                window->closeRequested = true;
             }
             return 0;
         }
@@ -2111,7 +2121,15 @@ extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
         window->dropTarget = nullptr;
     }
     if (window->oleInitialized) {
-        OleUninitialize();
+        // 线程级 OLE 引用计数：关一个窗口不能把兄弟窗口的 IDropTarget 拆掉。
+        const LONG left = InterlockedDecrement(&g_oleInitCount);
+        if (left == 0) {
+            OleUninitialize();
+        } else if (left < 0) {
+            // 防御：计数被弄坏时不继续往下减，避免对称性崩掉。
+            InterlockedExchange(&g_oleInitCount, 0);
+            composeknLog("drag: OLE 引用计数异常（destroy 时 < 0），已钳到 0");
+        }
         window->oleInitialized = false;
     }
     delete window;
@@ -2135,12 +2153,25 @@ extern "C" bool composekn_win32_pump(ComposeKNWin32Window* window) {
         DispatchMessageW(&msg);
         if (window->quit) return false;
     }
-    return !window->closeRequested;
+    // WM_CLOSE 不再置 closeRequested（DO_NOTHING_ON_CLOSE）；只看 quit（WM_DESTROY）。
+    return !window->quit;
+}
+
+extern "C" bool composekn_win32_pump_thread(void) {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            return false;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return true;
 }
 
 extern "C" bool composekn_win32_wait_message(ComposeKNWin32Window* window, int32_t timeout_ms) {
     if (window == nullptr) return false;
-    if (window->quit || window->closeRequested) return false;
+    if (window->quit) return false;
     // MWMO_INPUTAVAILABLE：队列里**已经**有消息（只是还没被 Peek 取走）时立刻返回，
     // 否则会白等一整个 timeout —— 那样输入就会带着最多一个帧周期的额外延迟。
     const DWORD timeout = (timeout_ms < 0) ? INFINITE : static_cast<DWORD>(timeout_ms);
@@ -2151,7 +2182,7 @@ extern "C" bool composekn_win32_wait_message(ComposeKNWin32Window* window, int32
                      (unsigned long)GetLastError());
         return false;
     }
-    return !window->quit && !window->closeRequested;
+    return !window->quit;
 }
 
 extern "C" void composekn_win32_wake(ComposeKNWin32Window* window) {
@@ -2927,6 +2958,69 @@ static HGLOBAL utf8ToUnicodeTextGlobal(const char* text) {
     return global;
 }
 
+/**
+ * `'\n'` 分隔的 UTF-8 路径 -> CF_HDROP 用的 HGLOBAL（DROPFILES + 宽字符双 NUL 列表）。
+ *
+ * 剪贴板写、拖放发出、自检共用。失败回 nullptr。
+ */
+static HGLOBAL buildHDropGlobal(const char* utf8_paths) {
+    if (utf8_paths == nullptr) return nullptr;
+    std::vector<std::wstring> widePaths;
+    {
+        std::string current;
+        for (const char* p = utf8_paths; ; ++p) {
+            if (*p == '\n' || *p == '\0') {
+                if (!current.empty()) {
+                    const int wlen = MultiByteToWideChar(CP_UTF8, 0, current.c_str(), -1, nullptr, 0);
+                    if (wlen > 1) {
+                        std::vector<wchar_t> wide(static_cast<size_t>(wlen), L'\0');
+                        MultiByteToWideChar(CP_UTF8, 0, current.c_str(), -1, wide.data(), wlen);
+                        widePaths.emplace_back(wide.data());
+                    }
+                    current.clear();
+                }
+                if (*p == '\0') break;
+            } else {
+                current.push_back(*p);
+            }
+        }
+    }
+    if (widePaths.empty()) return nullptr;
+    size_t chars = 1;
+    for (const auto& path : widePaths) chars += path.size() + 1;
+    const SIZE_T bytes = sizeof(DROPFILES) + chars * sizeof(wchar_t);
+    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+    if (global == nullptr) return nullptr;
+    DROPFILES* df = static_cast<DROPFILES*>(GlobalLock(global));
+    if (df == nullptr) {
+        GlobalFree(global);
+        return nullptr;
+    }
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    wchar_t* cursor = reinterpret_cast<wchar_t*>(reinterpret_cast<char*>(df) + sizeof(DROPFILES));
+    for (const auto& path : widePaths) {
+        std::memcpy(cursor, path.c_str(), (path.size() + 1) * sizeof(wchar_t));
+        cursor += path.size() + 1;
+    }
+    GlobalUnlock(global);
+    return global;
+}
+
+/** Explorer「粘贴」文件时认的 Preferred DropEffect（MVP = COPY）。 */
+static HGLOBAL buildPreferredDropEffectGlobal(DWORD effect) {
+    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DWORD));
+    if (global == nullptr) return nullptr;
+    DWORD* value = static_cast<DWORD*>(GlobalLock(global));
+    if (value == nullptr) {
+        GlobalFree(global);
+        return nullptr;
+    }
+    *value = effect;
+    GlobalUnlock(global);
+    return global;
+}
+
 
 
 // ---------------------------------------------------------------------------
@@ -3346,6 +3440,9 @@ static void composeknInstallDropTarget(ComposeKNWin32Window* window) {
         composeknLog("drag: OleInitialize 失败 hr=0x%08lX（拖放不可用）", (unsigned long)oleHr);
         return;
     }
+    // S_OK / S_FALSE 都要配对 OleUninitialize（MSDN）；用进程/线程级计数，
+    // 避免「第二个窗口 OleInitialize 返回 S_FALSE，第一个窗口销毁时就把 OLE 卸了」。
+    InterlockedIncrement(&g_oleInitCount);
     window->oleInitialized = true;
     window->dropTarget = new ComposeKNDropTarget(window);
     const HRESULT regHr = RegisterDragDrop(window->hwnd, window->dropTarget);
@@ -3353,12 +3450,195 @@ static void composeknInstallDropTarget(ComposeKNWin32Window* window) {
         composeknLog("drag: RegisterDragDrop 失败 hr=0x%08lX（拖放不可用）", (unsigned long)regHr);
         window->dropTarget->Release();
         window->dropTarget = nullptr;
+        // Register 失败仍算一次成功的 OleInitialize，destroy 时会配对减掉。
         return;
     }
     composeknLog("drag: RegisterDragDrop ok（文件/文本拖放已接收）");
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// OLE 拖放发出侧（文件作用域类 + extern "C"；不进匿名 namespace，以便 C 导出能看见）
+// ---------------------------------------------------------------------------
+
+class ComposeKNSourceDataObject final : public IDataObject {
+public:
+    ComposeKNSourceDataObject(const char* utf8_files, const char* utf8_text)
+        : files_(utf8_files != nullptr ? utf8_files : ""),
+          text_(utf8_text != nullptr ? utf8_text : "") {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) {
+            *ppv = static_cast<IDataObject*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&refCount_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG count = InterlockedDecrement(&refCount_);
+        if (count == 0) delete this;
+        return static_cast<ULONG>(count);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* fmt, STGMEDIUM* medium) override {
+        if (fmt == nullptr || medium == nullptr) return E_INVALIDARG;
+        HGLOBAL global = nullptr;
+        if (fmt->cfFormat == CF_HDROP && !files_.empty()) {
+            global = buildHDropGlobal(files_.c_str());
+        } else if (fmt->cfFormat == CF_UNICODETEXT && !text_.empty()) {
+            global = utf8ToUnicodeTextGlobal(text_.c_str());
+        } else {
+            return DV_E_FORMATETC;
+        }
+        if (global == nullptr) return E_OUTOFMEMORY;
+        medium->tymed = TYMED_HGLOBAL;
+        medium->hGlobal = global;
+        medium->pUnkForRelease = nullptr;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* fmt) override {
+        if (fmt == nullptr) return E_INVALIDARG;
+        if (fmt->cfFormat == CF_HDROP && !files_.empty()) return S_OK;
+        if (fmt->cfFormat == CF_UNICODETEXT && !text_.empty()) return S_OK;
+        return DV_E_FORMATETC;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
+        if (out != nullptr) out->ptd = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD, IEnumFORMATETC** out) override {
+        if (out != nullptr) *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override {
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA** out) override {
+        if (out != nullptr) *out = nullptr;
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+
+private:
+    ~ComposeKNSourceDataObject() = default;
+    LONG refCount_ = 1;
+    std::string files_;
+    std::string text_;
+};
+
+class ComposeKNDropSource final : public IDropSource {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropSource) {
+            *ppv = static_cast<IDropSource*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&refCount_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG count = InterlockedDecrement(&refCount_);
+        if (count == 0) delete this;
+        return static_cast<ULONG>(count);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override {
+        if (escapePressed) return DRAGDROP_S_CANCEL;
+        if ((keyState & MK_LBUTTON) == 0) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override {
+        return DRAGDROP_S_USEDEFAULTCURSORS;
+    }
+
+private:
+    ~ComposeKNDropSource() = default;
+    LONG refCount_ = 1;
+};
+
+extern "C" int32_t composekn_win32_do_drag_drop(
+    ComposeKNWin32Window* window,
+    const char* utf8_files,
+    const char* utf8_text,
+    int32_t allowed_effects
+) {
+    (void)window;
+    const bool hasFiles = utf8_files != nullptr && utf8_files[0] != '\0';
+    const bool hasText = utf8_text != nullptr && utf8_text[0] != '\0';
+    if (!hasFiles && !hasText) return -1;
+    ComposeKNSourceDataObject* data = new ComposeKNSourceDataObject(
+        hasFiles ? utf8_files : nullptr,
+        hasText ? utf8_text : nullptr
+    );
+    ComposeKNDropSource* source = new ComposeKNDropSource();
+    DWORD effect = DROPEFFECT_NONE;
+    const DWORD allowed = allowed_effects != 0
+        ? static_cast<DWORD>(allowed_effects)
+        : DROPEFFECT_COPY;
+    const HRESULT hr = DoDragDrop(data, source, allowed, &effect);
+    source->Release();
+    data->Release();
+    if (hr == DRAGDROP_S_CANCEL) {
+        composeknLog("drag: DoDragDrop 取消");
+        return 0;
+    }
+    if (FAILED(hr) && hr != DRAGDROP_S_DROP) {
+        composeknLog("drag: DoDragDrop 失败 hr=0x%08lX", (unsigned long)hr);
+        return -1;
+    }
+    composeknLog("drag: DoDragDrop 完成 effect=%lu", (unsigned long)effect);
+    return static_cast<int32_t>(effect);
+}
+
+extern "C" int32_t composekn_win32_test_source_data_formats(
+    const char* utf8_files, const char* utf8_text
+) {
+    ComposeKNSourceDataObject* data = new ComposeKNSourceDataObject(utf8_files, utf8_text);
+    FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    int32_t mask = 0;
+    if (data->QueryGetData(&fmt) == S_OK) mask |= 1;
+    fmt.cfFormat = CF_UNICODETEXT;
+    if (data->QueryGetData(&fmt) == S_OK) mask |= 2;
+    if ((mask & 1) != 0) {
+        STGMEDIUM medium = {};
+        fmt.cfFormat = CF_HDROP;
+        if (data->GetData(&fmt, &medium) == S_OK) {
+            if (medium.hGlobal == nullptr) mask = -1;
+            ReleaseStgMedium(&medium);
+        } else {
+            mask = -2;
+        }
+    }
+    if (mask >= 0 && (mask & 2) != 0) {
+        STGMEDIUM medium = {};
+        fmt.cfFormat = CF_UNICODETEXT;
+        if (data->GetData(&fmt, &medium) == S_OK) {
+            if (medium.hGlobal == nullptr) mask = -3;
+            ReleaseStgMedium(&medium);
+        } else {
+            mask = -4;
+        }
+    }
+    data->Release();
+    return mask;
+}
 
 extern "C" int32_t composekn_win32_last_drop_effect(ComposeKNWin32Window* window) {
     return window == nullptr ? 0 : static_cast<int32_t>(window->lastDropEffect);
@@ -3927,7 +4207,7 @@ extern "C" int32_t composekn_win32_clipboard_get_html(
 }
 
 extern "C" void composekn_win32_clipboard_set_html(ComposeKNWin32Window* window, const char* utf8_html) {
-    composekn_win32_clipboard_set_rich(window, nullptr, utf8_html, nullptr, 0, 0, nullptr);
+    composekn_win32_clipboard_set_rich(window, nullptr, utf8_html, nullptr, 0, 0, nullptr, nullptr);
 }
 
 extern "C" int32_t composekn_win32_clipboard_get_rtf(
@@ -3954,7 +4234,7 @@ extern "C" int32_t composekn_win32_clipboard_get_rtf(
 }
 
 extern "C" void composekn_win32_clipboard_set_rtf(ComposeKNWin32Window* window, const char* utf8_rtf) {
-    composekn_win32_clipboard_set_rich(window, nullptr, nullptr, utf8_rtf, 0, 0, nullptr);
+    composekn_win32_clipboard_set_rich(window, nullptr, nullptr, utf8_rtf, 0, 0, nullptr, nullptr);
 }
 
 extern "C" int32_t composekn_win32_clipboard_get_image(
@@ -4017,7 +4297,7 @@ extern "C" int32_t composekn_win32_clipboard_get_image(
 
 extern "C" void composekn_win32_clipboard_set_image(
     ComposeKNWin32Window* window, int32_t width, int32_t height, const uint8_t* bgra) {
-    composekn_win32_clipboard_set_rich(window, nullptr, nullptr, nullptr, width, height, bgra);
+    composekn_win32_clipboard_set_rich(window, nullptr, nullptr, nullptr, width, height, bgra, nullptr);
 }
 
 extern "C" int32_t composekn_win32_clipboard_get_raw_hex(
@@ -4039,13 +4319,15 @@ extern "C" void composekn_win32_clipboard_set_rich(
     const char* utf8_rtf,
     int32_t image_width,
     int32_t image_height,
-    const uint8_t* bgra) {
+    const uint8_t* bgra,
+    const char* utf8_files) {
     (void)window;
     const bool hasText = utf8_text != nullptr;
     const bool hasHtml = utf8_html != nullptr;
     const bool hasRtf = utf8_rtf != nullptr;
     const bool hasImage = bgra != nullptr && image_width > 0 && image_height > 0;
-    if (!hasText && !hasHtml && !hasRtf && !hasImage) return;
+    const bool hasFiles = utf8_files != nullptr && utf8_files[0] != '\0';
+    if (!hasText && !hasHtml && !hasRtf && !hasImage && !hasFiles) return;
 
     // 先把所有 HGLOBAL 准备好：OpenClipboard 之后再分配会失败（剪贴板被占用），
     // 而且一旦 EmptyClipboard，任何一步失败都会留下"空剪贴板"。
@@ -4071,6 +4353,12 @@ extern "C" void composekn_win32_clipboard_set_rich(
         imageGlobal = bytesToGlobal(buildDibV5(image_width, image_height, bgra));
         imageLegacyGlobal = bytesToGlobal(buildDibLegacy(image_width, image_height, bgra));
     }
+    HGLOBAL filesGlobal = hasFiles ? buildHDropGlobal(utf8_files) : nullptr;
+    HGLOBAL dropEffectGlobal = hasFiles ? buildPreferredDropEffectGlobal(DROPEFFECT_COPY) : nullptr;
+    UINT dropEffectFormat = 0;
+    if (hasFiles) {
+        dropEffectFormat = RegisterClipboardFormat(CFSTR_PREFERREDDROPEFFECT);
+    }
 
     if (!OpenClipboard(nullptr)) {
         if (textGlobal) GlobalFree(textGlobal);
@@ -4078,6 +4366,8 @@ extern "C" void composekn_win32_clipboard_set_rich(
         if (rtfGlobal) GlobalFree(rtfGlobal);
         if (imageGlobal) GlobalFree(imageGlobal);
         if (imageLegacyGlobal) GlobalFree(imageLegacyGlobal);
+        if (filesGlobal) GlobalFree(filesGlobal);
+        if (dropEffectGlobal) GlobalFree(dropEffectGlobal);
         composeknLog("clipboard: OpenClipboard 失败，富文本写入放弃");
         return;
     }
@@ -4108,15 +4398,26 @@ extern "C" void composekn_win32_clipboard_set_rich(
     } else if (imageLegacyGlobal != nullptr) {
         GlobalFree(imageLegacyGlobal);
     }
+    if (filesGlobal != nullptr && SetClipboardData(CF_HDROP, filesGlobal) != nullptr) {
+        ++written;
+    } else if (filesGlobal != nullptr) {
+        GlobalFree(filesGlobal);
+    }
+    if (dropEffectGlobal != nullptr && dropEffectFormat != 0 &&
+        SetClipboardData(dropEffectFormat, dropEffectGlobal) != nullptr) {
+        ++written;
+    } else if (dropEffectGlobal != nullptr) {
+        GlobalFree(dropEffectGlobal);
+    }
     CloseClipboard();
     composeknLog(
-        "clipboard: 写入 %d 个格式（文本=%d HTML=%zu 字节 RTF=%d 位图=%d）",
-        written, hasText ? 1 : 0, htmlBlob.size(), hasRtf ? 1 : 0, hasImage ? 1 : 0
+        "clipboard: 写入 %d 个格式（文本=%d HTML=%zu 字节 RTF=%d 位图=%d 文件=%d）",
+        written, hasText ? 1 : 0, htmlBlob.size(), hasRtf ? 1 : 0, hasImage ? 1 : 0, hasFiles ? 1 : 0
     );
 }
 
 extern "C" void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window, const char* text) {
-    composekn_win32_clipboard_set_rich(window, text, nullptr, nullptr, 0, 0, nullptr);
+    composekn_win32_clipboard_set_rich(window, text, nullptr, nullptr, 0, 0, nullptr, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -4192,58 +4493,11 @@ extern "C" int32_t composekn_win32_test_decode_dib(
 
 extern "C" bool composekn_win32_clipboard_test_set_files(
     ComposeKNWin32Window* window, const char* utf8_paths) {
-    (void)window;
-    if (utf8_paths == nullptr) return false;
-    // '\n' 分隔的 UTF-8 路径 -> DROPFILES + 宽字符双 NUL 结尾列表
-    std::vector<std::wstring> widePaths;
-    {
-        std::string current;
-        for (const char* p = utf8_paths; ; ++p) {
-            if (*p == '\n' || *p == '\0') {
-                if (!current.empty()) {
-                    const int wlen = MultiByteToWideChar(CP_UTF8, 0, current.c_str(), -1, nullptr, 0);
-                    if (wlen > 1) {
-                        std::vector<wchar_t> wide(static_cast<size_t>(wlen), L'\0');
-                        MultiByteToWideChar(CP_UTF8, 0, current.c_str(), -1, wide.data(), wlen);
-                        widePaths.emplace_back(wide.data());
-                    }
-                    current.clear();
-                }
-                if (*p == '\0') break;
-            } else {
-                current.push_back(*p);
-            }
-        }
-    }
-    if (widePaths.empty()) return false;
-    size_t chars = 1;   // 结尾的双 NUL 里第一个
-    for (const auto& path : widePaths) chars += path.size() + 1;
-    const SIZE_T bytes = sizeof(DROPFILES) + chars * sizeof(wchar_t);
-    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
-    if (global == nullptr) return false;
-    DROPFILES* df = static_cast<DROPFILES*>(GlobalLock(global));
-    if (df == nullptr) {
-        GlobalFree(global);
-        return false;
-    }
-    df->pFiles = sizeof(DROPFILES);
-    df->fWide = TRUE;
-    wchar_t* cursor = reinterpret_cast<wchar_t*>(reinterpret_cast<char*>(df) + sizeof(DROPFILES));
-    for (const auto& path : widePaths) {
-        std::memcpy(cursor, path.c_str(), (path.size() + 1) * sizeof(wchar_t));
-        cursor += path.size() + 1;
-    }
-    GlobalUnlock(global);
-    if (!OpenClipboard(nullptr)) {
-        GlobalFree(global);
-        return false;
-    }
-    EmptyClipboard();
-    const bool ok = SetClipboardData(CF_HDROP, global) != nullptr;
-    if (!ok) GlobalFree(global);
-    CloseClipboard();
-    composeknLog("clipboard(test): 放入 CF_HDROP（%zu 条路径）", widePaths.size());
-    return ok;
+    // 生产路径走 set_rich（含 Preferred DropEffect）；自检助手只是薄包装。
+    if (utf8_paths == nullptr || utf8_paths[0] == '\0') return false;
+    composekn_win32_clipboard_set_rich(
+        window, nullptr, nullptr, nullptr, 0, 0, nullptr, utf8_paths);
+    return true;
 }
 
 /** 自检用：放一张只有 CF_BITMAP 的图（模拟"截图工具只给裸 HBITMAP"）。 */

@@ -9,12 +9,14 @@ import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
 import androidx.compose.ui.platform.DefaultArchitectureComponentsOwner
 import androidx.compose.ui.platform.PlatformContext
 import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.platform.PlatformDragAndDropManager
 import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.platform.WindowInfo
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import org.jetbrains.skiko.Win32Window
 
 /**
  * 宿主窗口的 [WindowInfo]。
@@ -55,6 +57,18 @@ internal class WindowsPlatformContext(
     private val windowsTextInputService: WindowsTextInputService,
 ) : PlatformContext by PlatformContext.Empty() {
     private val windowInfoImpl = WindowsWindowInfo()
+
+    /**
+     * 提供当前 [Win32Window]，供拖放发出侧调 `DoDragDrop`。
+     * 由 [WindowsComposeApplication] 在窗口可用时接上。
+     */
+    var dragWindowProvider: (() -> Win32Window?)? = null
+
+    private val dragAndDropManagerImpl =
+        WindowsDragAndDropManager { dragWindowProvider?.invoke() }
+
+    override val dragAndDropManager: PlatformDragAndDropManager
+        get() = dragAndDropManagerImpl
 
     override val windowInfo: WindowInfo get() = windowInfoImpl
 

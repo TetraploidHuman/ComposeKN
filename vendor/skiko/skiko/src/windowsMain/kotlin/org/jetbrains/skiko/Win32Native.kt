@@ -28,6 +28,10 @@ internal external fun composekn_win32_destroy(window: COpaquePointer?)
 @SymbolName("composekn_win32_pump")
 internal external fun composekn_win32_pump(window: COpaquePointer?): Boolean
 
+/** 线程级 PeekMessage（多窗口共享泵）；收到 WM_QUIT 返回 false。 */
+@SymbolName("composekn_win32_pump_thread")
+internal external fun composekn_win32_pump_thread(): Boolean
+
 @SymbolName("composekn_win32_pop_event_flat")
 internal external fun composekn_win32_pop_event_flat(
     window: COpaquePointer?,
@@ -299,6 +303,7 @@ internal external fun composekn_win32_clipboard_set_rich(
     imageWidth: Int,
     imageHeight: Int,
     bgra: CPointer<UByteVar>?,
+    utf8Files: CPointer<ByteVar>?,
 )
 
 @SymbolName("composekn_win32_clipboard_get_rtf")
@@ -350,6 +355,20 @@ internal external fun composekn_win32_test_simulate_drag(
     y: Int,
     kind: Int,
 ): Boolean
+
+@SymbolName("composekn_win32_do_drag_drop")
+internal external fun composekn_win32_do_drag_drop(
+    window: COpaquePointer?,
+    utf8Files: CPointer<ByteVar>?,
+    utf8Text: CPointer<ByteVar>?,
+    allowedEffects: Int,
+): Int
+
+@SymbolName("composekn_win32_test_source_data_formats")
+internal external fun composekn_win32_test_source_data_formats(
+    utf8Files: CPointer<ByteVar>?,
+    utf8Text: CPointer<ByteVar>?,
+): Int
 
 @SymbolName("composekn_win32_post_test_key")
 internal external fun composekn_win32_post_test_key(
@@ -418,6 +437,14 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
     /** 从渲染回调/其它线程唤醒 [waitMessage] 的阻塞。 */
     fun wake(): Unit = composekn_win32_wake(native)
+
+    companion object {
+        /**
+         * 线程级消息泵（不绑定单个 HWND 的 quit）。多窗口共享循环用这条。
+         * @return false = 收到 WM_QUIT
+         */
+        fun pumpThread(): Boolean = composekn_win32_pump_thread()
+    }
 
     /**
      * 主显示器刷新率（Hz）。虚拟机/远程桌面上 Win32 常返回 0 或 1，
@@ -749,6 +776,20 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     fun testSimulateDrag(phase: Int, x: Int, y: Int, kind: Int): Boolean =
         composekn_win32_test_simulate_drag(native, phase, x, y, kind)
 
+    /**
+     * 发起 OLE 拖放（模态，对齐 AWT `TransferHandler.exportAsDrag`）。
+     *
+     * @return 最终 effect（COPY=1 / NONE=0）；失败 -1。
+     */
+    fun doDragDrop(files: List<String>?, text: String?, allowedEffects: Int = Win32Message.DROPEFFECT_COPY): Int {
+        val filesJoined = files?.takeIf { it.isNotEmpty() }?.joinToString("\n")
+        return useCStringOrNull(filesJoined) { filesPtr ->
+            useCStringOrNull(text) { textPtr ->
+                composekn_win32_do_drag_drop(native, filesPtr, textPtr, allowedEffects)
+            }
+        }
+    }
+
     // ---- 剪贴板：文件列表（CF_HDROP）----
 
     /**
@@ -850,28 +891,35 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      *
      * 必须是"一次"：Windows 的 `EmptyClipboard` + 多次 `SetClipboardData` 才是一个
      * 事务，分几次调用会把前一次的内容擦掉。
+     *
+     * [files] 非空时写入 CF_HDROP（`\n` 分隔路径），并附带 Preferred DropEffect=COPY。
      */
     fun clipboardSetRich(
         text: String?,
         html: String?,
         rtf: String?,
         image: ClipboardImage?,
+        files: List<String>? = null,
     ) {
         val imagePixels = image?.pixels
+        val filesJoined = files?.takeIf { it.isNotEmpty() }?.joinToString("\n")
         useCStringOrNull(text) { textPtr ->
             useCStringOrNull(html) { htmlPtr ->
                 useCStringOrNull(rtf) { rtfPtr ->
-                    if (imagePixels == null) {
-                        composekn_win32_clipboard_set_rich(
-                            native, textPtr, htmlPtr, rtfPtr, 0, 0, null,
-                        )
-                    } else {
-                        imagePixels.usePinned { pinned ->
+                    useCStringOrNull(filesJoined) { filesPtr ->
+                        if (imagePixels == null) {
                             composekn_win32_clipboard_set_rich(
-                                native, textPtr, htmlPtr, rtfPtr,
-                                image!!.width, image.height,
-                                pinned.addressOf(0).reinterpret<UByteVar>(),
+                                native, textPtr, htmlPtr, rtfPtr, 0, 0, null, filesPtr,
                             )
+                        } else {
+                            imagePixels.usePinned { pinned ->
+                                composekn_win32_clipboard_set_rich(
+                                    native, textPtr, htmlPtr, rtfPtr,
+                                    image!!.width, image.height,
+                                    pinned.addressOf(0).reinterpret<UByteVar>(),
+                                    filesPtr,
+                                )
+                            }
                         }
                     }
                 }
@@ -912,6 +960,16 @@ private const val CLIPBOARD_PROBE_SIZE = 64 * 1024
 /** `value == null` 时传 null 指针给 C；否则临时 NUL 结尾并把指针交出去。 */
 private inline fun <R> useCStringOrNull(value: String?, block: (CPointer<ByteVar>?) -> R): R =
     if (value == null) block(null) else value.useCString(block)
+
+/** 自检：SourceDataObject 的格式位掩码（bit0=HDROP bit1=TEXT）；负值 = GetData 失败。 */
+fun win32TestSourceDataFormats(files: List<String>?, text: String?): Int {
+    val filesJoined = files?.takeIf { it.isNotEmpty() }?.joinToString("\n")
+    return useCStringOrNull(filesJoined) { filesPtr ->
+        useCStringOrNull(text) { textPtr ->
+            composekn_win32_test_source_data_formats(filesPtr, textPtr)
+        }
+    }
+}
 
 /**
  * Win32 的命中测试码（`WM_NCHITTEST` 的返回值）。

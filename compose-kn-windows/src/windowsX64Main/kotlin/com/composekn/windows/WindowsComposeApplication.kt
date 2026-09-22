@@ -102,6 +102,7 @@ class WindowsComposeApplication(
         //   launch 出来的协程从 channel 取 delta）—— 这是自检
         //   `interaction/wheel-scroll` 抓到的真实 bug。
         initWindowsMainThread()
+        ensureWindowsComposeBackendRegistered()
     }
 
     // =====================================================================
@@ -232,33 +233,20 @@ class WindowsComposeApplication(
 
     /**
      * Run the application with the given Compose content.
+     *
+     * 仍走单窗口独占消息泵（自检依赖 frameHook + requestClose）。
+     * 多窗口请用 `androidx.compose.ui.window.application { Window(...) }`。
      */
     fun run(content: @Composable () -> Unit) {
+        ensureWindowsComposeBackendRegistered()
         setContent(withChrome = undecorated, content = content)
 
         // Compose 的光标请求（clickable -> Hand 等）转成 Win32 光标。
         platformContext.cursorSink = { kind -> window.pointerIconKind = kind }
+        // 拖放发出侧：DoDragDrop 需要当前 HWND。
+        platformContext.dragWindowProvider = { window.nativeWindow }
 
-        // IME：把文本框光标位置告诉 C 侧（WM_IME_REQUEST/IMR_QUERYCHARPOSITION 会
-        // **同步**问它，用来摆候选窗）。没有文本会话时返回 null，C 侧按 (0,0) 处理。
-        setWindowsImeCaretProvider { charIndex ->
-            textInputService.caretRectForCompositionChar(charIndex)?.let { rect ->
-                intArrayOf(
-                    rect.left.toInt(),
-                    rect.top.toInt(),
-                    rect.width.toInt(),
-                    rect.height.toInt(),
-                )
-            }
-        }
-        // IME 的文档馈送 / 重新转换：输入法通过 WM_IME_REQUEST 问「文档 + 组字范围」
-        // 时会**同步**回调这里（上下文候选排序、重转换都要它）。
-        setWindowsImeTextProvider { textInputService.imeDocument() }
-        // 「重新转换」确认时：把输入法发来的范围映射回文档偏移 —— 映射不了就返回 null，
-        // C 侧会拒绝这次重转换（宁可"不生效"，也不要重复文本）。
-        setWindowsImeReconvertProvider { text, targetOffset, targetLen ->
-            textInputService.mapReconvertRange(text, targetOffset, targetLen)
-        }
+        installExclusiveImeProviders()
         // 文本会话结束 -> 取消 IME 组字（否则候选窗会赖在屏幕上）。
         textInputService.onSessionEnded = { window.imeCancelComposition() }
         win32Log("app: scene + content ready, starting window loop")
@@ -271,6 +259,69 @@ class WindowsComposeApplication(
         win32Log("app: window loop finished normally")
 
         close()
+    }
+
+    /**
+     * 装内容并挂到 [WindowsApplicationHost]（不阻塞）。
+     * 供声明式 Window / 多窗口自检使用；之后由共享泵驱动。
+     */
+    fun attachToSharedHost(
+        withChrome: Boolean = undecorated,
+        onCloseRequest: (() -> Unit)? = null,
+        content: @Composable () -> Unit,
+    ) {
+        ensureWindowsComposeBackendRegistered()
+        setContent(withChrome = withChrome, content = content)
+        platformContext.cursorSink = { kind -> window.pointerIconKind = kind }
+        platformContext.dragWindowProvider = { window.nativeWindow }
+        textInputService.onSessionEnded = { window.imeCancelComposition() }
+        if (onCloseRequest != null) {
+            window.onCloseRequest = onCloseRequest
+        }
+        window.attachToHost(onEvent = ::handleEvent)
+        WindowsApplicationHost.installImeProviders(
+            window = window,
+            caret = { charIndex ->
+                textInputService.caretRectForCompositionChar(charIndex)?.let { rect ->
+                    intArrayOf(
+                        rect.left.toInt(),
+                        rect.top.toInt(),
+                        rect.width.toInt(),
+                        rect.height.toInt(),
+                    )
+                }
+            },
+            text = { textInputService.imeDocument() },
+            reconvert = { text, targetOffset, targetLen ->
+                textInputService.mapReconvertRange(text, targetOffset, targetLen)
+            },
+        )
+        win32Log("app: attached to shared host")
+    }
+
+    /** 从共享宿主摘掉并释放场景（声明式 Window 离开 composition 时）。 */
+    fun detachFromSharedHost() {
+        WindowsApplicationHost.installImeProviders(window, null, null, null)
+        window.detachFromHost()
+        close()
+    }
+
+    /** 独占泵路径：直接挂全局 IME（单窗，无 Host 路由）。 */
+    private fun installExclusiveImeProviders() {
+        setWindowsImeCaretProvider { charIndex ->
+            textInputService.caretRectForCompositionChar(charIndex)?.let { rect ->
+                intArrayOf(
+                    rect.left.toInt(),
+                    rect.top.toInt(),
+                    rect.width.toInt(),
+                    rect.height.toInt(),
+                )
+            }
+        }
+        setWindowsImeTextProvider { textInputService.imeDocument() }
+        setWindowsImeReconvertProvider { text, targetOffset, targetLen ->
+            textInputService.mapReconvertRange(text, targetOffset, targetLen)
+        }
     }
 
     /**
@@ -348,10 +399,15 @@ class WindowsComposeApplication(
                 window.layer.needRender()
             }
             is WindowsEvent.CloseEvent -> {
-                // Window close handled by message loop
+                // DO_NOTHING_ON_CLOSE：系统关窗只到这里。
+                // - 共享宿主 / 声明式 Window：onCloseRequest 已在 drainEventsForHost 调过，不销毁
+                // - 命令式独占 run：销毁 HWND，让 win.pump() 因 quit 退出
+                if (!window.isHostAttached) {
+                    window.destroy()
+                }
             }
             is WindowsEvent.FocusEvent -> {
-                // Focus change handled
+                WindowsApplicationHost.noteFocus(window, event.hasFocus)
             }
             is WindowsEvent.PaintEvent -> {
                 window.layer.renderImmediately()

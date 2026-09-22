@@ -3650,3 +3650,67 @@ where: 0=左中 1=右中 2=上中 3=下中 4=客户区中心），不是我们�
 * logic **118** / window **96**（+7）（合计 **214**）、`all` **211** —— 全绿；
 * 外部阶段：`win32msg` 14 条 + `input` 5 条 + `screenshot` 4 条全绿；
 * 打包单文件 exe（无 `icudtl.dat`）干净目录复测。
+
+### 17.38 多窗口：`application { Window(...) }` + 共享泵；剪贴板写文件；拖放发出（M1–M3）
+
+本轮三件事一起收口（v0.5.20+）：
+
+1. **剪贴板写文件**（`ClipEntry.withFiles` / `CF_HDROP` + Preferred DropEffect=COPY）
+2. **拖放发出侧**（`IDropSource` + `DoDragDrop` + `Modifier.dragAndDropSource`）
+3. **多窗口 Desktop API**（`application { Window(...) }` + 共享泵）
+
+#### 剪贴板写文件（M1）
+
+* `composekn_win32_clipboard_set_rich(..., utf8_files)` 同一事务写 CF_HDROP；
+* `ClipEntry.withFiles(paths, plainText?)`；自检 `window/clipboard-files-*` 走生产 API。
+
+#### 拖放发出（M2）
+
+* `ComposeKNSourceDataObject` + `ComposeKNDropSource` + `composekn_win32_do_drag_drop`；
+* `DragAndDropTransferData(files, text)`；`WindowsDragAndDropManager` 挂在
+  `WindowsPlatformContext`；自检 `window/drag-source-formats-*`。
+
+#### 宿主多窗口（M3）
+
+对齐 Compose Desktop 的声明式多窗口入口，并补上关掉一扇窗不能拆掉兄弟窗的宿主层。
+
+* **`WindowsApplicationHost`**：进程级一条 `PeekMessage` 循环（`composekn_win32_pump_thread`）服务所有
+  `WindowsComposeWindow`；`attachToHost` / `drainEventsForHost` / `tickRenderForHost` 把原先独占
+  `run()` 拆开。
+* **OLE 引用计数**（已在 C++）：`g_oleInitCount`，关一窗只减一，计数到 0 才 `OleUninitialize`。
+* **剪贴板**：`SkiaLayer.detach` 从 `compositionWindowRegistry` 摘掉自己；焦点走
+  `noteLastActiveCompositionWindow`。
+* **IME / wake**：全局回调按 `focusedSession` → `lastActiveSession` 路由（见 Host 文件头注释）。
+* **关窗语义**：`WM_CLOSE` = DO_NOTHING（只推 CloseEvent / `onCloseRequest`）；真正销毁在
+  `detachFromHost` / 离开 composition。命令式独占 `run()` 仍把 Close 默认映射成 `destroy()`（自检
+  `requestClose` 依赖这条）。
+
+#### Desktop API（linuxX64Main，overlay ↔ vendor 同步）
+
+* `androidx.compose.ui.window.application` / `awaitApplication` / `ApplicationScope`
+* `Window` / `WindowState` / `rememberWindowState` / `WindowPosition` / `WindowPlacement` /
+  `WindowScope`
+* 通过 **`ComposeNativeWindowBackendRegistry`** 解耦：`compose-kn-windows` 登记
+  `WindowsComposeNativeBackend`（`registerComposeKnWindowsBackend()`），避免 ui → host 循环依赖。
+
+#### Demo / 自检
+
+* 交互 demo 改走 `application { Window(onCloseRequest=::exitApplication) { ... } }`；画廊新增
+  「打开第二扇窗」+ 拖出文件/文本 + 复制文件路径到剪贴板。
+* 自检窗口阶段仍用独占 `WindowsComposeApplication.run`（保持既有断言绿）；另加
+  **`window-multi`**：A+B 挂共享泵，关 A 后断言 B 继续出帧。
+
+#### 怎么跑
+
+```bash
+nix-shell ./shell.nix --run ./vendor/skiko/skia-mingw/build-windows-native-demo.sh
+# 或 scripts/test-windows-native.sh
+COMPOSEKN_SELFTEST=window   # / all / logic
+```
+
+#### 已知缺口
+
+* Wayland / linux 尚未登记 `ComposeNativeWindowBackend`（调用 `application{}` 会明确报错）。
+* 无 Tray / MenuBar / DialogWindow；`WindowPosition.Aligned` 目前只做居中。
+* 声明式路径下 state→原生窗的双向同步（拖动改 size 写回 WindowState）仍是单向为主。
+* 拖出自定义装饰图 / MOVE 语义未做。

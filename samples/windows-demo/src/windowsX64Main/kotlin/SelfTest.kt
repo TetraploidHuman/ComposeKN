@@ -86,6 +86,7 @@ import androidx.compose.ui.window.PopupProperties
 import com.composekn.windows.MouseButton
 import com.composekn.windows.TaskbarProgressState
 import com.composekn.windows.TouchPhase
+import com.composekn.windows.WindowsApplicationHost
 import com.composekn.windows.WindowsComposeApplication
 import com.composekn.windows.WindowsComposeWindow
 import com.composekn.windows.WindowsEvent
@@ -96,6 +97,7 @@ import com.composekn.windows.duplicateVkEntries
 import com.composekn.windows.internal.GET_WHEEL_DELTA_WPARAM
 import com.composekn.windows.internal.GET_X_LPARAM
 import com.composekn.windows.internal.Win32Modifier
+import com.composekn.windows.internal.winlog
 import com.composekn.windows.test.FrameSnapshot
 import com.composekn.windows.test.OffscreenDriver
 import com.composekn.windows.test.TestColors
@@ -103,6 +105,7 @@ import com.composekn.windows.test.renderOffscreen
 import com.composekn.windows.test.snapshotSolidColor
 import com.composekn.windows.vkPairCount
 import com.composekn.windows.windowsVirtualKeyToComposeKey
+import org.jetbrains.skiko.initWindowsMainThread
 import kotlin.concurrent.Volatile
 import kotlin.math.abs
 import kotlin.time.TimeSource
@@ -2776,6 +2779,25 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                 "exits=${probe.dragTextProbe.exits} ends=${probe.dragTextProbe.ends} " +
                     "effect=${app.window.lastDropEffect}",
             )
+            // 发出侧 IDataObject：QueryGetData / GetData（不跑模态 DoDragDrop）。
+            val both = org.jetbrains.skiko.win32TestSourceDataFormats(DROP_TEST_FILES, DROP_TEST_TEXT)
+            val filesOnly = org.jetbrains.skiko.win32TestSourceDataFormats(DROP_TEST_FILES, null)
+            val textOnly = org.jetbrains.skiko.win32TestSourceDataFormats(null, DROP_TEST_TEXT)
+            report.check(
+                "window/drag-source-formats-both",
+                both == 3,
+                "files+text 位掩码=$both（期望 bit0|bit1=3）",
+            )
+            report.check(
+                "window/drag-source-formats-files",
+                filesOnly == 1,
+                "仅 files 位掩码=$filesOnly（期望 1）",
+            )
+            report.check(
+                "window/drag-source-formats-text",
+                textOnly == 2,
+                "仅 text 位掩码=$textOnly（期望 2）",
+            )
         }
 
         // ---- 富文本剪贴板（HANDOVER §17.34）----
@@ -2884,8 +2906,8 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
         }
         // ---- 剪贴板：文件列表（CF_HDROP）与图片的其它来源（CF_BITMAP / 8bpp 调色板）----
         if (frame == 136) {
-            // 资源管理器里 Ctrl+C 一个文件，剪贴板上是 CF_HDROP（路径列表），没有位图。
-            app.window.clipboardTestSetFiles(DROP_TEST_FILES)
+            // 生产 API：ClipEntry.withFiles -> setClip（不再只靠 test_set_files）。
+            probe.clipboardManager?.setClip(ClipEntry.withFiles(DROP_TEST_FILES))
         }
         if (frame == 138) {
             val entry = probe.clipboardManager?.getClip()
@@ -2900,6 +2922,23 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                 "window/clipboard-image-missing-on-file-drop",
                 entry?.getImage() == null,
                 "只有 CF_HDROP 时 getImage()=${entry?.getImage()}（期望 null）",
+            )
+            // files + plainText 同事务：下两帧断言。
+            probe.clipboardManager?.setClip(
+                ClipEntry.withFiles(DROP_TEST_FILES, plainText = "files-fallback"),
+            )
+        }
+        if (frame == 139) {
+            val entry = probe.clipboardManager?.getClip()
+            report.check(
+                "window/clipboard-files-with-plaintext",
+                entry?.getFiles() == DROP_TEST_FILES && entry?.getPlainText() == "files-fallback",
+                "files=${entry?.getFiles()} text=${entry?.getPlainText()}",
+            )
+            report.check(
+                "window/clipboard-files-no-html",
+                entry?.getHtml() == null && entry?.getImage() == null,
+                "files 写入不应带 HTML/图片 html=${entry?.getHtml()} image=${entry?.getImage()}",
             )
             // 有的截图工具只放裸 HBITMAP：走 CF_BITMAP 回退（GDI 转一遍）。
             app.window.clipboardTestSetBitmap(clipboardTestClipboardImage())
@@ -3105,6 +3144,88 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
     assertWindowPerfReport(report, perf, guard, perfContractChecks)
 
     runDecoratedWindowResizeTests(report)
+    runConcurrentWindowTests(report)
+}
+
+/**
+ * 多窗口并发：A+B 同挂共享泵，关 A 后 B 仍继续出帧（HANDOVER §17.38）。
+ *
+ * 不走声明式 application{}（避免和既有独占自检搅在一起），直接
+ * [WindowsComposeApplication.attachToSharedHost] + [WindowsApplicationHost.runSharedPump]。
+ */
+private fun runConcurrentWindowTests(report: SelfTestReport) {
+    report.section("window-multi 并发 A+B")
+    com.composekn.windows.registerComposeKnWindowsBackend()
+    initWindowsMainThread()
+
+    val appA = WindowsComposeApplication(
+        title = "Selftest-A", width = 400, height = 300, undecorated = true,
+    )
+    val appB = WindowsComposeApplication(
+        title = "Selftest-B", width = 400, height = 300, undecorated = true,
+    )
+
+    var framesBAtCloseA = 0
+    var framesBFinal = 0
+    var closedA = false
+    var done = false
+
+    appA.attachToSharedHost(withChrome = false) {
+        Text("A")
+    }
+    appB.attachToSharedHost(withChrome = false) {
+        Text("B")
+    }
+
+    appB.window.frameHook = { frame ->
+        if (!closedA && frame >= 8) {
+            framesBAtCloseA = frame
+            closedA = true
+            winlog("multi: closing A at B.frame=$frame host=${WindowsApplicationHost.liveWindowCount}")
+            appA.detachFromSharedHost()
+        }
+        if (closedA && frame >= framesBAtCloseA + 8) {
+            framesBFinal = frame
+            done = true
+            winlog("multi: B still framing final=$frame — detaching B")
+            appB.detachFromSharedHost()
+        }
+        appB.window.layer.needRender()
+        if (!closedA) appA.window.layer.needRender()
+    }
+
+    val guard = WindowPhaseGuard()
+    CoroutineScope(Dispatchers.Default).launch {
+        delay(15_000)
+        if (!guard.finished) {
+            guard.timedOut = true
+            done = true
+            if (WindowsApplicationHost.isRegistered(appA.window)) appA.detachFromSharedHost()
+            if (WindowsApplicationHost.isRegistered(appB.window)) appB.detachFromSharedHost()
+        }
+    }
+
+    WindowsApplicationHost.runSharedPump {
+        !done && WindowsApplicationHost.liveWindowCount > 0
+    }
+    guard.finished = true
+
+    report.check(
+        "window-multi/both-attached",
+        framesBAtCloseA > 0,
+        "B frames when closing A=$framesBAtCloseA",
+    )
+    report.check(
+        "window-multi/b-survives-a",
+        framesBFinal > framesBAtCloseA,
+        "B frames after A gone: $framesBAtCloseA -> $framesBFinal",
+    )
+    report.check(
+        "window-multi/host-empty",
+        WindowsApplicationHost.liveWindowCount == 0,
+        "host count=${WindowsApplicationHost.liveWindowCount}",
+    )
+    report.check("window-multi/no-timeout", !guard.timedOut)
 }
 
 /**

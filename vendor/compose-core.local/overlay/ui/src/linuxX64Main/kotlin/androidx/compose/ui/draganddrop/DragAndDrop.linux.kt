@@ -16,17 +16,28 @@
 
 package androidx.compose.ui.draganddrop
 
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.geometry.Offset
 
 /**
  * 拖放传输的数据（**发起侧**：应用自己往外拖）。
  *
- * ComposeKN 原生后端目前只实现了**接收侧**（Windows 上是 OLE 的 IDropTarget，
- * 见 HANDOVER §17.33），所以这里先保留结构：`Modifier.dragAndDropSource` 走
- * `DragAndDropManager.requestDragAndDropTransfer`（平台默认实现会抛
- * UnsupportedOperationException / 或者根本不要求应用发起），不影响接收侧。
+ * Windows 上映射为 OLE `IDataObject`：`files` → CF_HDROP，`text` → CF_UNICODETEXT。
+ * 至少要有一个非空字段，否则 [WindowsDragAndDropManager] 不会启动 `DoDragDrop`。
  */
-actual class DragAndDropTransferData internal constructor()
+actual class DragAndDropTransferData @ExperimentalComposeUiApi constructor(
+    /** 文件路径列表（Windows：CF_HDROP）。 */
+    @property:ExperimentalComposeUiApi
+    val files: List<String> = emptyList(),
+    /** 纯文本（Windows：CF_UNICODETEXT）。 */
+    @property:ExperimentalComposeUiApi
+    val text: String? = null,
+    /**
+     * 拖放结束回调：`true` = 目标接受（effect ≠ NONE），`false` = 取消/拒绝。
+     */
+    @property:ExperimentalComposeUiApi
+    val onTransferCompleted: ((success: Boolean) -> Unit)? = null,
+)
 
 /**
  * 一次拖放会话里由**平台**送进来的事件（接收侧）。

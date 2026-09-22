@@ -35,14 +35,41 @@ object WaylandClipboard {
     /**
      * **一次事务**写多个格式 —— 必须是一次：Windows 上分几次调用会把前面的擦掉
      * （`EmptyClipboard` 是事务的开始）。
+     *
+     * [files] 非空时写入 CF_HDROP（资源管理器可粘贴的路径列表）。
      */
-    fun setRich(text: String?, html: String?, rtf: String?, image: ClipboardImage?) {
-        findWindow()?.clipboardSetRich(text, html, rtf, image)
+    fun setRich(
+        text: String?,
+        html: String?,
+        rtf: String?,
+        image: ClipboardImage?,
+        files: List<String>? = null,
+    ) {
+        findWindow()?.clipboardSetRich(text, html, rtf, image, files)
     }
 
+    /**
+     * 多窗口时优先用最近焦点/活跃窗口（[lastActiveCompositionWindow]），
+     * 否则退回注册表里最后一个仍存活的入口。
+     */
     private fun findWindow(): Win32Window? =
-        (compositionWindowRegistry.firstOrNull() as? Win32Window)
+        lastActiveCompositionWindow
+            ?: (compositionWindowRegistry.lastOrNull() as? Win32Window)
 }
 
-// The Windows renderer records the most recent attached window here.
+// The Windows renderer records attached windows here（attach 加、detach 删）。
 internal val compositionWindowRegistry = mutableListOf<Any>()
+
+/**
+ * 最近一次获得焦点（或最新 attach）的窗口。
+ * 剪贴板 / 全局 IME 回调在多窗口下按它路由，避免总打到 firstOrNull。
+ */
+internal var lastActiveCompositionWindow: Win32Window? = null
+
+/**
+ * 宿主在 FocusEvent 时调用：把剪贴板/IME 的「最近活跃窗」指到 [window]。
+ * （[lastActiveCompositionWindow] 本身是 internal，跨模块不能写。）
+ */
+fun noteLastActiveCompositionWindow(window: Win32Window?) {
+    lastActiveCompositionWindow = window
+}

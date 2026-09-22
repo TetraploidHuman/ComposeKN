@@ -208,8 +208,18 @@ object WaylandClipboard {
     fun getHtml(): String? = null
     fun getRtf(): String? = null
     fun getImage(): ClipboardImage? = null
-    fun setRich(text: String?, html: String?, rtf: String?, image: ClipboardImage?) {
+    fun setRich(
+        text: String?,
+        html: String?,
+        rtf: String?,
+        image: ClipboardImage?,
+        files: List<String>? = null,
+    ) {
+        // files / html / rtf / image：Wayland 多 MIME 尚未接，见上。
         if (text != null) setText(text)
+        else if (!files.isNullOrEmpty()) {
+            // 暂无 text/uri-list；至少别让调用方以为写入了。
+        }
     }
 }
 

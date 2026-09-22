@@ -10,6 +10,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
+import androidx.compose.foundation.draganddrop.dragAndDropSource
+import androidx.compose.foundation.draganddrop.dragAndDropTarget
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.clickable
@@ -65,6 +67,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draganddrop.DragAndDropEvent
+import androidx.compose.ui.draganddrop.DragAndDropTarget
+import androidx.compose.ui.draganddrop.DragAndDropTransferData
+import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
@@ -208,6 +214,8 @@ fun ComponentGallery(
      * 所以 `--no-animate` 时把它换成确定态（`progress = { 0.5f }`），做到真正静止。
      */
     animate: Boolean = true,
+    /** 打开第二扇窗（application { if (open2) Window(...) }）。 */
+    onOpenSecondWindow: (() -> Unit)? = null,
 ) {
     probe.galleryComposes++
     MaterialTheme(
@@ -256,7 +264,7 @@ fun ComponentGallery(
 
             LazyColumn(state = outerState, modifier = Modifier.fillMaxSize()) {
                 item { DiagnosticsHud(probe, window) }
-                gallerySections(probe, animate, innerState, window)
+                gallerySections(probe, animate, innerState, window, onOpenSecondWindow)
                 item { Spacer(Modifier.height(24.dp)) }
             }
         }
@@ -298,6 +306,7 @@ private fun LazyListScope.gallerySections(
     animate: Boolean,
     innerState: LazyListState,
     window: WindowsComposeWindow,
+    onOpenSecondWindow: (() -> Unit)?,
 ) {
     section("按钮 / Buttons") {
         Row(
@@ -330,6 +339,19 @@ private fun LazyListScope.gallerySections(
                     )
                 }
             }
+        }
+    }
+
+    if (onOpenSecondWindow != null) {
+        section("多窗口 / Multi-window") {
+            Button(onClick = onOpenSecondWindow) {
+                Text("打开第二扇窗")
+            }
+            Text(
+                "Desktop 对齐：application { if (open2) Window(onCloseRequest={ open2=false }) }。" +
+                    "关第二扇只拆那一扇；关主窗 exitApplication 退整应用。",
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 
@@ -451,6 +473,12 @@ private fun LazyListScope.gallerySections(
 
     section("剪贴板 / Clipboard") {
         ClipboardPasteBox()
+        Spacer(Modifier.height(8.dp))
+        ClipboardCopyFilesButton()
+    }
+
+    section("拖放 / Drag & Drop") {
+        DragAndDropDemoBox()
     }
 
     section("窗口 / Window") {
@@ -886,6 +914,143 @@ private fun ClipboardPasteBox() {
     }
 }
 
+/** 把测试路径写进剪贴板（CF_HDROP），真机可粘到资源管理器。 */
+@Composable
+private fun ClipboardCopyFilesButton() {
+    val clipboard = LocalClipboardManager.current
+    val paths = remember {
+        listOf(
+            """C:\composekn\gallery-copy-1.txt""",
+            """C:\composekn\gallery-copy-2.txt""",
+        )
+    }
+    var status by remember { mutableStateOf("点按钮 → ClipEntry.withFiles → 资源管理器里 Ctrl+V") }
+    Column {
+        OutlinedButton(
+            onClick = {
+                clipboard.setClip(ClipEntry.withFiles(paths, plainText = paths.joinToString("\n")))
+                status = "已写入 ${paths.size} 条路径（CF_HDROP + Preferred DropEffect=COPY）"
+                winlog("clipboard: withFiles -> ${paths.size} 条路径")
+            },
+        ) {
+            Text("复制测试文件路径到剪贴板")
+        }
+        Text(status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+    }
+}
+
+/**
+ * 拖放演示：发出（DoDragDrop）+ 接收（IDropTarget）。
+ *
+ * 可把左边方块拖到资源管理器，或把资源管理器文件拖进右边落点。
+ */
+@Composable
+private fun DragAndDropDemoBox() {
+    val paths = remember {
+        listOf(
+            """C:\composekn\gallery-drag-1.txt""",
+            """C:\composekn\gallery-drag-2.txt""",
+        )
+    }
+    var dropStatus by remember { mutableStateOf("把文件/文本拖到右边虚线框") }
+    var hovering by remember { mutableStateOf(false) }
+
+    val dropTarget = remember {
+        object : DragAndDropTarget {
+            override fun onStarted(event: DragAndDropEvent) {
+                hovering = true
+            }
+            override fun onEntered(event: DragAndDropEvent) {
+                hovering = true
+            }
+            override fun onExited(event: DragAndDropEvent) {
+                hovering = false
+            }
+            override fun onEnded(event: DragAndDropEvent) {
+                hovering = false
+            }
+            override fun onDrop(event: DragAndDropEvent): Boolean {
+                hovering = false
+                dropStatus = when {
+                    event.files.isNotEmpty() ->
+                        "收到文件 ${event.files.size} 个：${event.files.first()}"
+                    !event.text.isNullOrEmpty() ->
+                        "收到文本：${event.text!!.take(48)}"
+                    else -> "放下了，但没有文件/文本"
+                }
+                winlog("drag: Gallery drop -> $dropStatus")
+                return true
+            }
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("发出（按住拖走）", style = MaterialTheme.typography.titleSmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(
+                modifier = Modifier
+                    .size(160.dp, 72.dp)
+                    .background(MaterialTheme.colorScheme.primaryContainer)
+                    .dragAndDropSource { _ ->
+                        DragAndDropTransferData(
+                            files = paths,
+                            onTransferCompleted = { ok ->
+                                winlog("drag: Source 文件拖放结束 success=$ok")
+                            },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("拖出文件", style = MaterialTheme.typography.labelLarge)
+            }
+            Box(
+                modifier = Modifier
+                    .size(160.dp, 72.dp)
+                    .background(MaterialTheme.colorScheme.secondaryContainer)
+                    .dragAndDropSource { _ ->
+                        DragAndDropTransferData(
+                            text = "ComposeKN Gallery 拖出的文本",
+                            onTransferCompleted = { ok ->
+                                winlog("drag: Source 文本拖放结束 success=$ok")
+                            },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("拖出文本", style = MaterialTheme.typography.labelLarge)
+            }
+        }
+
+        Text("接收（从资源管理器拖进来）", style = MaterialTheme.typography.titleSmall)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(88.dp)
+                .background(
+                    if (hovering) MaterialTheme.colorScheme.tertiaryContainer
+                    else Color(0xFFE8E8E8),
+                )
+                .dragAndDropTarget(
+                    shouldStartDragAndDrop = { event ->
+                        event.files.isNotEmpty() || event.text != null
+                    },
+                    target = dropTarget,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                if (hovering) "松开即可放下" else dropStatus,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(12.dp),
+            )
+        }
+        Text(
+            "发出走 DoDragDrop；接收走 IDropTarget（与自检同一条 OLE 链）。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+}
+
 @Composable
 private fun HoverBox(probe: GalleryProbe) {
     val interactionSource = remember { MutableInteractionSource() }
@@ -953,6 +1118,35 @@ private fun LazyListScope.section(title: String, content: @Composable () -> Unit
             content()
             Spacer(Modifier.height(10.dp))
             HorizontalDivider()
+        }
+    }
+}
+
+/**
+ * 第二扇窗内容（验证多窗口共享泵：关主窗走 exitApplication，关本窗只清 open2）。
+ */
+@Composable
+fun SecondWindowContent(onClose: () -> Unit) {
+    MaterialTheme {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("第二扇窗", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "此窗与主窗共享同一条 PeekMessage 循环（WindowsApplicationHost）。" +
+                        "关闭本窗不应拆掉主窗；关主窗才 exitApplication。",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "v0.5.20：剪贴板 withFiles / 拖放发出 / application{Window}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Button(onClick = onClose) {
+                    Text("关闭本窗")
+                }
+            }
         }
     }
 }
