@@ -3758,3 +3758,8 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
 
 修法：按 `ComposeKNWin32Window*` 映射每窗独立 HDC/HGLRC；缩放 tick 改为
 `addWindowsRenderTick` / `removeWindowsRenderTick` 多订阅。
+
+#### 第二窗「角落闪一下再瞬移」（v0.5.24）
+
+`CreateWindowEx(CW_USEDEFAULT)` 后立刻 `ShowWindow`，再 `centerOnScreen()` → 用户看到
+左上角闪现再跳到中央。改为创建时隐藏，先 applySize + 定位，再 `show()`。

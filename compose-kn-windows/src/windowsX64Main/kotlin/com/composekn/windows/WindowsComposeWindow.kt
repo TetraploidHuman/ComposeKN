@@ -139,8 +139,10 @@ class WindowsComposeWindow(
      *
      * 之后由 [WindowsApplicationHost.runSharedPump] 调用
      * [drainEventsForHost] / [tickRenderForHost]。
+     *
+     * @param show 是否立刻显示。声明式 Window 应先设位置/尺寸再 [show]，避免瞬移。
      */
-    fun attachToHost(onEvent: (WindowsEvent) -> Unit) {
+    fun attachToHost(onEvent: (WindowsEvent) -> Unit, show: Boolean = true) {
         check(!isHostAttached) { "already attached to WindowsApplicationHost" }
         check(win32Window == null) { "window already created (exclusive run?)" }
         initWindowsMainThread()
@@ -155,10 +157,18 @@ class WindowsComposeWindow(
         WindowsApplicationHost.register(this)
         layer.renderImmediately()
         layer.needRender()
+        if (show) {
+            win.show()
+        }
         win32Log(
             "attachToHost: ready frameInterval=${frameIntervalNanos(win) / 1_000_000}ms " +
-                "refresh=${win.refreshHz}Hz"
+                "refresh=${win.refreshHz}Hz show=$show"
         )
+    }
+
+    /** 显示窗口（创建时默认隐藏，见 [attachToHost]）。 */
+    fun show() {
+        win32Window?.show()
     }
 
     /**
@@ -247,6 +257,7 @@ class WindowsComposeWindow(
         check(!isHostAttached) { "use shared host or exclusive run, not both" }
         initWindowsMainThread()
         val win = createAndAttachLayer()
+        win.show()
 
         // 命令式默认：关窗 = 销毁，以便本循环退出（自检 requestClose 依赖这条）。
         if (onCloseRequest == null) {

@@ -49,23 +49,25 @@ private object WindowsComposeNativeBackend : ComposeNativeWindowBackend {
         handle.setAlwaysOnTop(params.alwaysOnTop)
         handle.setOnCloseRequest(params.onCloseRequest)
         handle.applyPlacement(params.placement, params.isMinimized)
-        // 先挂宿主（不装空 composition）；真正 content 由 Window DisposableEffect setContent
+        // 先挂宿主但**不显示**；定好位置/尺寸再 show，避免「角落闪一下再瞬移居中」。
         app.attachToSharedHost(
             withChrome = params.undecorated,
             onCloseRequest = params.onCloseRequest,
+            show = false,
             content = null,
         )
+        // 先尺寸后位置：centerOnScreen 依赖当前客户区尺寸
+        if (params.size.width.isSpecified && params.size.height.isSpecified) {
+            handle.applySize(params.size)
+        }
         when (val pos = params.position) {
             is WindowPosition.Absolute -> handle.applyPosition(pos)
             is WindowPosition.Aligned -> handle.applyPosition(pos)
             WindowPosition.PlatformDefault -> {
-                // 默认居中，避免叠在 (0,0)
                 app.window.centerOnScreen()
             }
         }
-        if (params.size.width.isSpecified && params.size.height.isSpecified) {
-            handle.applySize(params.size)
-        }
+        app.window.show()
         return handle
     }
 

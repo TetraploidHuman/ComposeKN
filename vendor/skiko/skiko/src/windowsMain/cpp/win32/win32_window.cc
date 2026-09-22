@@ -2080,7 +2080,9 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
     // 2 倍缩放又抹掉（真机日志：dp=1100x760 -> px=2200x1520，紧接着又"校正"回 1100x760）。
     // 多显示器/不同缩放的场景交给 WM_DPICHANGED（窗口被拖到别的屏时系统会通知）。
     window->dpi = queryWindowDpi(window->hwnd);
-    ShowWindow(window->hwnd, SW_SHOWNORMAL);
+    // 不在这里 ShowWindow：声明式多窗口会先设位置/尺寸再显示，否则会出现
+    // 「先在屏幕角落闪一下再瞬移到居中」的跳动（CW_USEDEFAULT → centerOnScreen）。
+    // 调用方在 apply 完几何后调 composekn_win32_show(..., SW_SHOW)。
     UpdateWindow(window->hwnd);
     maybeStartTestResize(window);
 

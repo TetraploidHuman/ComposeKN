@@ -274,10 +274,12 @@ class WindowsComposeApplication(
      * @param content null 时只挂宿主、不装 Compose 内容（声明式 Window 的
      *   createWindow 用：真正内容由随后的 [setContent] / DisposableEffect 装上，
      *   避免空 `{}` 先 enableSavedStateHandles 再装真内容时二次崩溃）。
+     * @param show 是否立刻显示。声明式路径应先设位置再 [WindowsComposeWindow.show]。
      */
     fun attachToSharedHost(
         withChrome: Boolean = undecorated,
         onCloseRequest: (() -> Unit)? = null,
+        show: Boolean = true,
         content: (@Composable () -> Unit)? = null,
     ) {
         ensureWindowsComposeBackendRegistered()
@@ -301,7 +303,7 @@ class WindowsComposeApplication(
         if (onCloseRequest != null) {
             window.onCloseRequest = onCloseRequest
         }
-        window.attachToHost(onEvent = ::handleEvent)
+        window.attachToHost(onEvent = ::handleEvent, show = show)
         WindowsApplicationHost.installImeProviders(
             window = window,
             caret = { charIndex ->
@@ -319,7 +321,7 @@ class WindowsComposeApplication(
                 textInputService.mapReconvertRange(text, targetOffset, targetLen)
             },
         )
-        win32Log("app: attached to shared host")
+        win32Log("app: attached to shared host show=$show")
     }
 
     /** 从共享宿主摘掉并释放场景（声明式 Window 离开 composition 时）。 */
