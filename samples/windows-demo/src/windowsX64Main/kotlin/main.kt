@@ -61,22 +61,6 @@ fun main(args: Array<String>) {
         var openSecond by remember { mutableStateOf(false) }
         val mainState = rememberWindowState(size = DpSize(1100.dp, 760.dp))
 
-        if (animate) {
-            // 每帧 +1：既驱动 HUD 上的帧计数，也让界面持续重组（等价于动画场景的压力）。
-            LaunchedEffect(Unit) {
-                while (true) {
-                    withFrameNanos {
-                        probe.frames++
-                        probe.animTicks++
-                    }
-                }
-            }
-        } else {
-            LaunchedEffect(Unit) {
-                probe.frames = 0
-            }
-        }
-
         val cores = win32ProcessorCount
 
         Window(
@@ -84,6 +68,23 @@ fun main(args: Array<String>) {
             state = mainState,
             title = "ComposeKN Windows Demo",
         ) {
+            // 动画必须在 Window 内容里：application 层只有 YieldFrameClock（无 vsync），
+            // 放外面会空转烧 CPU；这里走场景自己的 FrameRecomposer。
+            if (animate) {
+                LaunchedEffect(Unit) {
+                    while (true) {
+                        withFrameNanos {
+                            probe.frames++
+                            probe.animTicks++
+                        }
+                    }
+                }
+            } else {
+                LaunchedEffect(Unit) {
+                    probe.frames = 0
+                }
+            }
+
             val win = (window as? WindowsNativeWindowHandle)?.composeWindow
                 ?: window.asPlatformWindow() as? WindowsComposeWindow
             if (win != null) {

@@ -88,10 +88,14 @@ suspend fun awaitApplication(
         }
     }
 
+    // 对齐 Desktop：application 层必须有 MonotonicFrameClock，否则
+    // runRecomposeAndApplyChanges 一上来就抛 IllegalStateException。
+    // YieldFrameClock 无显示器同步，动画请放在 Window 内容里（那里有真实帧钟）。
+    val appContext = SkikoDispatchers.Main + YieldFrameClock
     val mainJob = Job()
-    val scope = CoroutineScope(SkikoDispatchers.Main + mainJob)
+    val scope = CoroutineScope(appContext + mainJob)
     val globalSnapshotRegistration = GlobalSnapshotManager.register(SkikoDispatchers.Main)
-    val recomposer = Recomposer(SkikoDispatchers.Main)
+    val recomposer = Recomposer(appContext)
 
     scope.launch {
         recomposer.runRecomposeAndApplyChanges()
@@ -175,7 +179,6 @@ private class ApplicationApplier : Applier<Any> {
  * 无显示器同步的帧钟：yield 让出，便于共享泵 flush 其它任务。
  * 动画应放在 Window 内容里（那里有真实 vsync 节流）。
  */
-@Suppress("unused")
 private object YieldFrameClock : MonotonicFrameClock {
     override suspend fun <R> withFrameNanos(onFrame: (frameTimeNanos: Long) -> R): R {
         yield()

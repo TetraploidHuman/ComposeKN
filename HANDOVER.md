@@ -3714,3 +3714,14 @@ COMPOSEKN_SELFTEST=window   # / all / logic
 * 无 Tray / MenuBar / DialogWindow；`WindowPosition.Aligned` 目前只做居中。
 * 声明式路径下 state→原生窗的双向同步（拖动改 size 写回 WindowState）仍是单向为主。
 * 拖出自定义装饰图 / MOVE 语义未做。
+
+#### 启动崩溃修复（v0.5.21）
+
+v0.5.20 的 `awaitApplication` 定义了 `YieldFrameClock` 却没挂进
+`Recomposer` / `CoroutineScope`（`@Suppress("unused")` 就是漏接线的痕迹），
+一进画廊就：
+
+`IllegalStateException: A MonotonicFrameClock is not available in this CoroutineContext`
+
+对齐 Desktop：`Recomposer(SkikoDispatchers.Main + YieldFrameClock)`。
+画廊「每帧 +1」动画也从 application 层挪进 `Window { }`（真实 FrameRecomposer）。
