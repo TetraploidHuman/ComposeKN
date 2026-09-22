@@ -213,6 +213,13 @@ sealed class WindowsEvent {
      * Paint event.
      */
     object PaintEvent : WindowsEvent()
+
+    /**
+     * 原生菜单栏命令（WM_COMMAND，菜单项 id = [commandId]）。
+     */
+    data class MenuCommandEvent(
+        val commandId: Int,
+    ) : WindowsEvent()
 }
 
 /**

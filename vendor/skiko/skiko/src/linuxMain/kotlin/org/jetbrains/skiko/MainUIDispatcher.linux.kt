@@ -30,6 +30,12 @@ private object LinuxMainDispatcher : MainCoroutineDispatcher(), Delay {
     @Volatile
     private var flushing = false
 
+    /**
+     * 「有人往队列里放了活」时调用（只在跨线程投递时触发，见 [enqueue]）。
+     * [LinuxApplicationHost] 接到 eventfd wake，避免空闲 usleep 拖住 Main 任务。
+     */
+    var wakeUpHandler: (() -> Unit)? = null
+
     override val immediate: MainCoroutineDispatcher
         get() = this
 
@@ -68,8 +74,10 @@ private object LinuxMainDispatcher : MainCoroutineDispatcher(), Delay {
     private fun enqueue(block: Runnable) {
         while (true) {
             val old = pending.value
-            if (pending.compareAndSet(old, old + block)) return
+            if (pending.compareAndSet(old, old + block)) break
         }
+        // 跨线程投递：共享泵可能正睡在 poll(eventfd)/usleep 上，必须叫醒。
+        wakeUpHandler?.invoke()
     }
 
     fun flush() {
@@ -91,4 +99,13 @@ private object LinuxMainDispatcher : MainCoroutineDispatcher(), Delay {
 /** Drain UI tasks queued on [MainUIDispatcher]. Call from the Wayland poll loop. */
 fun flushMainUIDispatcher() {
     LinuxMainDispatcher.flush()
+}
+
+/**
+ * 注册「跨线程往 UI 队列投递任务」时的唤醒回调（null = 取消）。
+ *
+ * 对齐 Win32 [setMainUIDispatcherWakeUpHandler]；Linux 侧接到 eventfd / 短 sleep 泵。
+ */
+fun setMainUIDispatcherWakeUpHandler(handler: (() -> Unit)?) {
+    LinuxMainDispatcher.wakeUpHandler = handler
 }

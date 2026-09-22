@@ -143,6 +143,9 @@ internal external fun composekn_window_consume_close_requested(window: COpaquePo
 @SymbolName("composekn_window_set_title")
 internal external fun composekn_window_set_title(window: COpaquePointer, title: CPointer<ByteVar>)
 
+@SymbolName("composekn_window_request_size")
+internal external fun composekn_window_request_size(window: COpaquePointer, width: Int, height: Int)
+
 @SymbolName("composekn_window_begin_move")
 internal external fun composekn_window_begin_move(window: COpaquePointer)
 

@@ -84,6 +84,9 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.FileDialog
+import androidx.compose.ui.window.FileDialogFilter
+import androidx.compose.ui.window.FileDialogMode
 import com.composekn.windows.TaskbarProgressState
 import com.composekn.windows.WindowsComposeWindow
 import kotlin.concurrent.Volatile
@@ -93,6 +96,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.graphics.graphicsLayer
 import com.composekn.windows.internal.winlog
 import androidx.compose.runtime.withFrameNanos
+import org.jetbrains.skiko.ComposeKNFileDialog
 
 /**
  * 组件画廊的「观测点」。
@@ -139,6 +143,9 @@ class GalleryProbe {
     var frames by mutableStateOf(0)
     var clipboardText by mutableStateOf("")
 
+    /** 原生 MenuBar 最近一次点选（File/Edit 探针）。 */
+    var menuAction by mutableStateOf("(none)")
+
     /**
      * 「重组到底发生在哪个作用域」的诊断计数（性能日志用）。
      *
@@ -180,7 +187,7 @@ class GalleryProbe {
     private fun summaryImpl(): String =
         "clicks=$clickCount text='$text' check=$checkbox switch=$switchOn " +
             "slider=${(slider * 100).toInt()} radio=$radio theme=${if (darkTheme) "dark" else "light"} " +
-            "scroll=$scrollY lazy=$lazyScrollY frames=$frames"
+            "scroll=$scrollY lazy=$lazyScrollY frames=$frames menu='$menuAction'"
 
     fun resetInteractionCounters() {
         clickCount = 0
@@ -488,6 +495,10 @@ private fun LazyListScope.gallerySections(
         ClipboardCopyFilesButton()
     }
 
+    section("文件对话框 / FileDialog") {
+        FileDialogBox(window)
+    }
+
     section("拖放 / Drag & Drop") {
         DragAndDropDemoBox()
     }
@@ -737,6 +748,101 @@ private fun LazyListScope.gallerySections(
  * 所以「悬停/点击试试」这个盒子**必须**也把点击做成可见反馈，否则真机触摸用户
  * 得到的就是「点了没反应」（用户实测反馈，HANDOVER §17.28）。鼠标悬停照旧变色。
  */
+/**
+ * 文件对话框手动验证：命令式 open/save + 声明式 [FileDialog]。
+ *
+ * CI 不弹交互对话框（只断言 `ComposeKNFileDialog.available()`）；这里是给人点的。
+ */
+@Composable
+private fun FileDialogBox(window: WindowsComposeWindow) {
+    var selected by remember { mutableStateOf("尚未选择") }
+    var showOpenComposable by remember { mutableStateOf(false) }
+    var showSaveComposable by remember { mutableStateOf(false) }
+    val filters = remember {
+        listOf(
+            FileDialogFilter("文本", listOf("txt", "md", "kt")),
+            FileDialogFilter("所有文件", listOf("*.*")),
+        )
+    }
+
+    Card(modifier = Modifier.width(520.dp)) {
+        Column(Modifier.padding(12.dp)) {
+            Text("文件对话框", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "available=${ComposeKNFileDialog.available()}（comdlg32）",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.padding(top = 8.dp),
+            ) {
+                OutlinedButton(onClick = {
+                    val paths = window.openFileDialog(
+                        title = "打开文件…",
+                        multiple = true,
+                        filters = filters,
+                    )
+                    selected = if (paths.isEmpty()) "(取消)" else paths.joinToString("\n")
+                    winlog("filedialog: open -> $selected")
+                }) { Text("打开文件…") }
+
+                OutlinedButton(onClick = {
+                    val path = window.saveFileDialog(
+                        title = "保存文件…",
+                        initialFileName = "untitled.txt",
+                        filters = filters,
+                    )
+                    selected = path ?: "(取消)"
+                    winlog("filedialog: save -> $selected")
+                }) { Text("保存文件…") }
+
+                OutlinedButton(onClick = { showOpenComposable = true }) {
+                    Text("打开（Composable）")
+                }
+                OutlinedButton(onClick = { showSaveComposable = true }) {
+                    Text("保存（Composable）")
+                }
+            }
+            Text(
+                selected,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+    }
+
+    if (showOpenComposable) {
+        FileDialog(
+            onCloseRequest = { paths ->
+                showOpenComposable = false
+                selected = if (paths.isEmpty()) "(取消 / Composable)" else paths.joinToString("\n")
+                winlog("filedialog: composable open -> $selected")
+            },
+            mode = FileDialogMode.Load,
+            title = "打开文件…",
+            multiple = true,
+            filters = filters,
+            parent = null,
+        )
+    }
+    if (showSaveComposable) {
+        FileDialog(
+            onCloseRequest = { paths ->
+                showSaveComposable = false
+                selected = paths.firstOrNull() ?: "(取消 / Composable)"
+                winlog("filedialog: composable save -> $selected")
+            },
+            mode = FileDialogMode.Save,
+            title = "保存文件…",
+            initialFileName = "untitled.txt",
+            filters = filters,
+            parent = null,
+        )
+    }
+}
+
 /**
  * 窗口 API 的手动验证区：置顶 / 全屏 / 不可缩放 / 位置 / 大小 / 居中 / 任务栏进度。
  *

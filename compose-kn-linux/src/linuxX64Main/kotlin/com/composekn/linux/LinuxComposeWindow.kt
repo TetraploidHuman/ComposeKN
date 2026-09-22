@@ -33,8 +33,24 @@ class LinuxComposeWindow(
     /** 原生几何变化提示（resize / maximize）；声明式 Window 写回 WindowState。 */
     internal var onGeometryHint: (() -> Unit)? = null
 
-    /** true = DialogWindow；v1 软模态未实现（Wayland 无 EnableWindow 等价物）。 */
+    /**
+     * true = [androidx.compose.ui.window.DialogWindow]；Host 据此做软模态。
+     * 变更时刷新 [LinuxApplicationHost.refreshDialogModality]。
+     */
     internal var isDialogWindow: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (isHostAttached) {
+                LinuxApplicationHost.refreshDialogModality()
+            }
+        }
+
+    /**
+     * 软模态输入开关（对齐 Win32 EnableWindow）。
+     * 有任一 DialogWindow 时，非对话框由 Host 置为 false，派发侧跳过 pointer/key/touch。
+     */
+    internal var inputEnabled: Boolean = true
 
     var resizable: Boolean = true
     var alwaysOnTop: Boolean = false

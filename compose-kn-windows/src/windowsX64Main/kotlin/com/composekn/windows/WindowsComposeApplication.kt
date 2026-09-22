@@ -441,6 +441,10 @@ class WindowsComposeApplication(
             is WindowsEvent.MoveEvent -> {
                 window.onGeometryHint?.invoke()
             }
+            is WindowsEvent.MenuCommandEvent -> {
+                winlog("event: menu command id=${event.commandId}")
+                window.invokeMenuCommand(event.commandId)
+            }
         }
     }
 }

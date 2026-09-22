@@ -110,6 +110,38 @@ internal external fun composekn_win32_touch_enabled(window: COpaquePointer?): Bo
 internal external fun composekn_win32_set_cursor(window: COpaquePointer?, kind: Int)
 
 // ---------------------------------------------------------------------------
+// 原生菜单栏（HMENU）
+// ---------------------------------------------------------------------------
+
+@SymbolName("composekn_win32_menu_create")
+internal external fun composekn_win32_menu_create(popup: Boolean): COpaquePointer?
+
+@SymbolName("composekn_win32_menu_destroy")
+internal external fun composekn_win32_menu_destroy(hmenu: COpaquePointer?)
+
+@SymbolName("composekn_win32_menu_append_string")
+internal external fun composekn_win32_menu_append_string(
+    parent: COpaquePointer?,
+    id: UInt,
+    utf8: CPointer<ByteVar>?,
+    enabled: Boolean,
+): Boolean
+
+@SymbolName("composekn_win32_menu_append_separator")
+internal external fun composekn_win32_menu_append_separator(parent: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_menu_append_popup")
+internal external fun composekn_win32_menu_append_popup(
+    parent: COpaquePointer?,
+    utf8: CPointer<ByteVar>?,
+    child: COpaquePointer?,
+    enabled: Boolean,
+): Boolean
+
+@SymbolName("composekn_win32_menu_set")
+internal external fun composekn_win32_menu_set(window: COpaquePointer?, hmenu: COpaquePointer?)
+
+// ---------------------------------------------------------------------------
 // OpenGL / WGL（GPU 后端，对齐上游 linuxMain 的 EGL 版）
 //
 // 只绑定平台上下文操作；Skia 的 GPU 上下文由 Kotlin 侧 DirectContext.makeGL() 建
@@ -277,6 +309,29 @@ internal external fun composekn_win32_last_drop_effect(window: COpaquePointer?):
 
 @SymbolName("composekn_win32_ole_available")
 internal external fun composekn_win32_ole_available(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_file_dialog_available")
+internal external fun composekn_win32_file_dialog_available(): Boolean
+
+/**
+ * 系统文件对话框（comdlg32）。
+ *
+ * @param mode 0 = 打开，非 0 = 保存
+ * @param filterUtf8 `'\n'` 分隔的过滤器字段（见 C 侧注释）
+ * @return 写入字节数 / 需要的大小 / 0 取消 / -1 错误（两段式）
+ */
+@SymbolName("composekn_win32_file_dialog")
+internal external fun composekn_win32_file_dialog(
+    window: COpaquePointer?,
+    mode: Int,
+    title: CPointer<ByteVar>?,
+    initialDir: CPointer<ByteVar>?,
+    initialName: CPointer<ByteVar>?,
+    allowMultiple: Boolean,
+    filterUtf8: CPointer<ByteVar>?,
+    buffer: CPointer<ByteVar>?,
+    bufferSize: Int,
+): Int
 
 @SymbolName("composekn_win32_set_drop_accept")
 internal external fun composekn_win32_set_drop_accept(window: COpaquePointer?, accept: Boolean): Boolean
@@ -494,6 +549,18 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      * clickable 默认就是手型）驱动 —— 见 WindowsPlatformContext.setPointerIcon。
      */
     fun setCursor(kind: Int): Unit = composekn_win32_set_cursor(native, kind)
+
+    /**
+     * 挂原生菜单栏（HMENU）。[menu] 为 null 时清除。
+     *
+     * C 侧接管 [Win32Menu] 所有权：替换/清除时会 DestroyMenu 旧菜单（含子菜单）。
+     * 调用后不要再 [Win32Menu.destroy]。
+     */
+    fun setMenu(menu: Win32Menu?) {
+        composekn_win32_menu_set(native, menu?.handle)
+        // 所有权已交给 C；Kotlin 侧只清掉本地标记，避免二次 DestroyMenu。
+        menu?.markTransferred()
+    }
 
     // ---- OpenGL / WGL（GPU 后端）----
 
@@ -745,6 +812,32 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     /** 最近一次回给 OLE 的 effect（`DROPEFFECT_NONE` / `DROPEFFECT_COPY`）。 */
     val lastDropEffect: Int get() = composekn_win32_last_drop_effect(native)
 
+    // ---- 文件对话框（comdlg32）----
+
+    /**
+     * 打开/保存文件对话框（**UI 线程同步阻塞**；内部有模态消息循环）。
+     *
+     * @param mode 0 = 打开（Load），非 0 = 保存（Save）
+     * @param filterUtf8 `'\n'` 分隔的过滤器；空/null = 不设过滤
+     * @return 选中的路径列表；取消或失败 → 空列表
+     */
+    fun showFileDialog(
+        mode: Int,
+        title: String? = null,
+        initialDirectory: String? = null,
+        initialFileName: String? = null,
+        multiple: Boolean = false,
+        filterUtf8: String? = null,
+    ): List<String> = win32ShowFileDialog(
+        owner = this,
+        mode = mode,
+        title = title,
+        initialDirectory = initialDirectory,
+        initialFileName = initialFileName,
+        multiple = multiple,
+        filterUtf8 = filterUtf8,
+    )
+
     /**
      * 把 Compose 侧的判定写回宿主：true = 当前位置有控件愿意接收（OLE 的 effect 回
      * DROPEFFECT_COPY，光标显示「可放下」）。
@@ -966,6 +1059,59 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
 /** 富文本读缓冲的探测大小：够装绝大多数 HTML/RTF 片段，超了就走第二趟。 */
 private const val CLIPBOARD_PROBE_SIZE = 64 * 1024
+
+/** 文件对话框结果缓冲探测大小。 */
+private const val FILE_DIALOG_PROBE_SIZE = 16 * 1024
+
+/**
+ * 系统文件对话框（owner 可为 null = 无归属窗）。
+ *
+ * 两段式缓冲：先探测，不够再加大。取消 / 错误 → 空列表。
+ */
+fun win32ShowFileDialog(
+    owner: Win32Window?,
+    mode: Int,
+    title: String? = null,
+    initialDirectory: String? = null,
+    initialFileName: String? = null,
+    multiple: Boolean = false,
+    filterUtf8: String? = null,
+): List<String> {
+    val joined = fileDialogPopString { buffer, size ->
+        useCStringOrNull(title) { titlePtr ->
+            useCStringOrNull(initialDirectory) { dirPtr ->
+                useCStringOrNull(initialFileName) { namePtr ->
+                    useCStringOrNull(filterUtf8) { filterPtr ->
+                        composekn_win32_file_dialog(
+                            owner?.native,
+                            mode,
+                            titlePtr,
+                            dirPtr,
+                            namePtr,
+                            multiple,
+                            filterPtr,
+                            buffer,
+                            size,
+                        )
+                    }
+                }
+            }
+        }
+    } ?: return emptyList()
+    return joined.split('\n').filter { it.isNotEmpty() }
+}
+
+/** 两段式读文件对话框结果。 */
+private inline fun fileDialogPopString(pop: (CPointer<ByteVar>?, Int) -> Int): String? = memScoped {
+    val probe = allocArray<ByteVar>(FILE_DIALOG_PROBE_SIZE)
+    val needed = pop(probe, FILE_DIALOG_PROBE_SIZE)
+    if (needed <= 0) return@memScoped null
+    // C 侧在 bufferSize >= needed 时已写入；用 <= 避免「恰好填满探测缓冲」时误二次弹窗。
+    if (needed <= FILE_DIALOG_PROBE_SIZE) return@memScoped StringBytesDecoding(probe, needed)
+    val buffer = allocArray<ByteVar>(needed + 1)
+    val written = pop(buffer, needed + 1)
+    if (written <= 0) null else StringBytesDecoding(buffer, written)
+}
 
 /** `value == null` 时传 null 指针给 C；否则临时 NUL 结尾并把指针交出去。 */
 private inline fun <R> useCStringOrNull(value: String?, block: (CPointer<ByteVar>?) -> R): R =
@@ -1317,6 +1463,68 @@ data class Win32Event(
         const val DRAG_OVER = 20
         const val DRAG_LEAVE = 21
         const val DRAG_DROP = 22
+        /** 原生菜单栏命令；id 在 [a]（= LOWORD(wParam)）。 */
+        const val MENU_COMMAND = 23
+    }
+}
+
+/**
+ * Win32 HMENU 包装。菜单栏根用 [createBar]，子菜单用 [createPopup]。
+ *
+ * 挂到窗口（[Win32Window.setMenu]）或作为 MF_POPUP 子项追加后，所有权转移，
+ * 不要再 [destroy]。未挂上的菜单用 [destroy] 释放。
+ */
+class Win32Menu private constructor(internal val handle: COpaquePointer) {
+    private var transferred = false
+
+    fun appendString(id: Int, text: String, enabled: Boolean = true): Boolean {
+        check(!transferred) { "Win32Menu 所有权已转移，不能再 append" }
+        return text.useCString {
+            composekn_win32_menu_append_string(handle, id.toUInt(), it, enabled)
+        }
+    }
+
+    fun appendSeparator(): Boolean {
+        check(!transferred) { "Win32Menu 所有权已转移，不能再 append" }
+        return composekn_win32_menu_append_separator(handle)
+    }
+
+    /**
+     * 追加子菜单。[child] 所有权转给本菜单（MF_POPUP）；之后不要再 destroy child。
+     */
+    fun appendPopup(text: String, child: Win32Menu, enabled: Boolean = true): Boolean {
+        check(!transferred) { "Win32Menu 所有权已转移，不能再 append" }
+        val ok = text.useCString {
+            composekn_win32_menu_append_popup(handle, it, child.handle, enabled)
+        }
+        if (ok) child.markTransferred()
+        return ok
+    }
+
+    fun destroy() {
+        if (transferred) return
+        composekn_win32_menu_destroy(handle)
+        transferred = true
+    }
+
+    internal fun markTransferred() {
+        transferred = true
+    }
+
+    companion object {
+        /** CreateMenu —— 菜单栏根。 */
+        fun createBar(): Win32Menu {
+            val ptr = composekn_win32_menu_create(false)
+            checkNotNull(ptr) { "CreateMenu 失败" }
+            return Win32Menu(ptr)
+        }
+
+        /** CreatePopupMenu —— 下拉/子菜单。 */
+        fun createPopup(): Win32Menu {
+            val ptr = composekn_win32_menu_create(true)
+            checkNotNull(ptr) { "CreatePopupMenu 失败" }
+            return Win32Menu(ptr)
+        }
     }
 }
 

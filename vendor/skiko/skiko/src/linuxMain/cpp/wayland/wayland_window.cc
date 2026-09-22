@@ -88,6 +88,8 @@ struct ComposeKNWindow {
     bool resized = false;
     bool maximized = false;
     uint32_t configure_serial = 0;
+    /** True after request_size：下一次 toplevel configure 后清掉 min/max 约束。 */
+    bool clear_size_constraints_after_configure = false;
 
     bool pointer_inside = false;
     double pointer_x = 0.0;
@@ -312,6 +314,13 @@ static void xdg_toplevel_configure(
         } else {
             window->resized = true;
         }
+    }
+    // request_size 用 min=max 逼 compositor 给出目标尺寸；configure 后再放开，
+    // 以免长期锁死交互式缩放（对齐「可选清除」）。
+    if (window->clear_size_constraints_after_configure && window->toplevel != nullptr) {
+        window->clear_size_constraints_after_configure = false;
+        xdg_toplevel_set_min_size(window->toplevel, 0, 0);
+        xdg_toplevel_set_max_size(window->toplevel, 0, 0);
     }
     try_init_egl_if_needed(window);
     composekn_flush_deferred_frame(window);
@@ -1754,6 +1763,36 @@ extern "C" void composekn_window_set_title(ComposeKNWindow* window, const char* 
         return;
     }
     xdg_toplevel_set_title(window->toplevel, title != nullptr ? title : "");
+}
+
+extern "C" void composekn_window_request_size(ComposeKNWindow* window, int w, int h) {
+    window = resolve_window(window);
+    if (window == nullptr || window->toplevel == nullptr || window->shell_surface == nullptr) {
+        return;
+    }
+    const int width = sanitize_dimension(w);
+    const int height = sanitize_dimension(h);
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    window->width = width;
+    window->height = height;
+    // 用 min=max 提示 compositor 采用该尺寸（Wayland 无 SetWindowPos 等价物）。
+    xdg_toplevel_set_min_size(window->toplevel, width, height);
+    xdg_toplevel_set_max_size(window->toplevel, width, height);
+    xdg_surface_set_window_geometry(window->shell_surface, 0, 0, width, height);
+    window->clear_size_constraints_after_configure = true;
+    if (window->egl_window != nullptr) {
+        resize_egl_window(window);
+    } else {
+        window->resized = true;
+    }
+    if (window->surface != nullptr) {
+        wl_surface_commit(window->surface);
+    }
+    if (window->display != nullptr) {
+        wl_display_flush(window->display);
+    }
 }
 
 extern "C" void composekn_window_begin_move(ComposeKNWindow* window) {

@@ -3711,10 +3711,10 @@ COMPOSEKN_SELFTEST=window   # / all / logic
 #### 已知缺口
 
 * ~~Wayland / linux 尚未登记 `ComposeNativeWindowBackend`~~ → v0.5.26 已登记（见上）。
-* 无 Tray / MenuBar；`WindowPosition.Aligned` 目前只做居中。
+* 无 Tray；MenuBar / FileDialog / Aligned 见 v0.5.27。
 * ~~声明式路径下 state→原生窗的双向同步~~ → v0.5.25 已双向。
 * 拖出自定义装饰图 / MOVE 语义未做。
-* Linux v1：每窗独立 display、无 eventfd wake、Dialog 软模态 / applySize 未齐。
+* Linux：每窗独立 `wl_display`（无共享 display）；`Fullscreen` / always-on-top / setResizable 未接；绝对定位不可用。
 
 #### 启动崩溃修复（v0.5.21）
 
@@ -3786,5 +3786,29 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
   `application-api/dialog-frames` / `dialog-modality`
 * **Linux/Wayland**：`registerComposeKnLinuxBackend()` + `LinuxApplicationHost` 共享泵；
   关窗 DO_NOTHING（`consume_close_requested`）；wayland-demo 改走
-  `application { Window }`。v1 缺口：每窗独立 `wl_display`、无 eventfd wake、
-  无软模态 / applySize / 绝对定位
+  `application { Window }`。
+
+#### Linux ComposeNativeWindowBackend 对齐（v0.5.27）
+
+在 v0.5.26 登记后端之上补齐与 Win32 的声明式窗口语义：
+
+* **applySize**：C `composekn_window_request_size`（xdg min=max + geometry + commit，
+  configure 后清约束）→ `WaylandWindow.requestSize` / `setClientSize` →
+  `LinuxNativeWindowHandle.applySize`
+* **Dialog 软模态**：有任一 `isDialogWindow` 时，`LinuxApplicationHost` 置非对话框
+  `inputEnabled=false`；`handleEvent` 跳过 pointer/key/touch（无 EnableWindow 等价物）
+* **wake**：`eventfd` + `poll`（≤2ms）；失败退回 `usleep`。独占 `LinuxComposeApplication.run()` 不变
+* **几何写回**：`consumeResized` / Scale → `onGeometryHint` → `WindowGeometrySnapshot`
+* **定位**：`Absolute` / `Aligned` 均为 no-op（Aligned 打一次日志）；不伪造坐标
+
+仍缺：共享 `wl_display`、Fullscreen、always-on-top、真正 setResizable、绝对/对齐定位。
+
+#### MenuBar / FileDialog / Aligned（v0.5.27，Windows + Linux 对齐续）
+
+* **MenuBar**：`FrameWindowScope.MenuBar { Menu / Item / Separator }` → Win32 HMENU
+  （rebuild-on-change + `WM_COMMAND`）；无边框窗 no-op；画廊 File/Edit 示例
+* **FileDialog**：`FileDialog` composable + `openFileDialog` / `saveFileDialog`；
+  comdlg32 `GetOpenFileNameW` / `GetSaveFileNameW`；Linux stub 取消→空
+* **WindowPosition.Aligned**：`alignOnScreen(Alignment)`（TopStart / Center / …），
+  不再只居中
+* Linux 侧见上节（applySize / eventfd / 软模态 / 几何写回）

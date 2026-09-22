@@ -423,7 +423,9 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
                 options.addAll(resolvedBinaryInputs.directStaticArchivePaths)
             }
             options.addAll(resolvedBinaryInputs.linkFlags)
-            listOf("gdi32", "user32", "ole32", "shell32", "advapi32", "uuid", "kernel32").forEach {
+            listOf(
+                "gdi32", "user32", "ole32", "shell32", "advapi32", "uuid", "kernel32", "comdlg32",
+            ).forEach {
                 options.add("-l$it")
             }
             mutableListOfLinkerOptions(options)

@@ -11,6 +11,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogWindow
+import androidx.compose.ui.window.MenuBar
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberDialogState
@@ -71,6 +72,26 @@ fun main(args: Array<String>) {
             state = mainState,
             title = "ComposeKN Windows Demo",
         ) {
+            // 原生 Win32 HMENU（标题栏下方）；点选写到 probe.menuAction。
+            MenuBar {
+                Menu("文件(&F)") {
+                    Item("新建") { probe.menuAction = "File/New" }
+                    Item("打开…") { probe.menuAction = "File/Open" }
+                    Separator()
+                    Item("退出") {
+                        probe.menuAction = "File/Exit"
+                        exitApplication()
+                    }
+                }
+                Menu("编辑(&E)") {
+                    Item("撤销", enabled = false) { probe.menuAction = "Edit/Undo" }
+                    Separator()
+                    Item("剪切") { probe.menuAction = "Edit/Cut" }
+                    Item("复制") { probe.menuAction = "Edit/Copy" }
+                    Item("粘贴") { probe.menuAction = "Edit/Paste" }
+                }
+            }
+
             // 动画必须在 Window 内容里：application 层只有 YieldFrameClock（无 vsync），
             // 放外面会空转烧 CPU；这里走场景自己的 FrameRecomposer。
             if (animate) {

@@ -131,6 +131,14 @@ bool composekn_window_consume_close_requested(ComposeKNWindow* window);
 /** Update xdg_toplevel title (UTF-8). */
 void composekn_window_set_title(ComposeKNWindow* window, const char* title);
 
+/**
+ * Request a client size (logical pixels). Best-effort on Wayland:
+ * temporarily sets xdg_toplevel min=max to [w,h], updates window geometry,
+ * commits; min/max are cleared after the next configure so interactive resize
+ * can resume (when the app allows it).
+ */
+void composekn_window_request_size(ComposeKNWindow* window, int w, int h);
+
 void composekn_window_begin_move(ComposeKNWindow* window);
 void composekn_window_begin_resize(ComposeKNWindow* window, uint32_t edges);
 

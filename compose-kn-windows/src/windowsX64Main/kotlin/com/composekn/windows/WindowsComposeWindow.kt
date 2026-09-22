@@ -7,7 +7,9 @@ import org.jetbrains.skiko.Win32Event
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import org.jetbrains.skiko.ClipboardImage
+import org.jetbrains.skiko.ComposeKNFileDialog
 import org.jetbrains.skiko.Win32HitTest
+import org.jetbrains.skiko.Win32Menu
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.win32Log
@@ -15,6 +17,11 @@ import org.jetbrains.skiko.initWindowsMainThread
 import org.jetbrains.skiko.currentNanoTime
 import org.jetbrains.skiko.setMainUIDispatcherWakeUpHandler
 import org.jetbrains.skiko.setWindowsImeCaretProvider
+import androidx.compose.ui.window.FileDialogFilter
+import androidx.compose.ui.window.NativeMenuBarModel
+import androidx.compose.ui.window.NativeMenuNode
+import androidx.compose.ui.window.buildFileDialogFilterUtf8
+import androidx.compose.ui.window.structureKey
 import com.composekn.windows.internal.MOD_ALT
 import com.composekn.windows.internal.MOD_CTRL
 import com.composekn.windows.internal.MOD_SHIFT
@@ -156,6 +163,18 @@ class WindowsComposeWindow(
     private var hostEventHandler: ((WindowsEvent) -> Unit)? = null
     private var hostNextFrameNanos: Long = 0L
     private var hostFrames: Int = 0
+
+    /**
+     * 原生菜单栏命令 id → onClick（rebuild-on-change 时整表替换）。
+     * 无边框窗口不挂 HMENU，映射表也为空。
+     */
+    private val menuClickMap = mutableMapOf<Int, () -> Unit>()
+
+    /** attach 之前 [setMenuBar] 的暂存；窗口建好后立刻应用。 */
+    private var pendingMenuBar: NativeMenuBarModel? = null
+
+    /** 当前已 SetMenu 的结构指纹；相同则只刷新 onClick 映射，避免每帧重建 HMENU。 */
+    private var menuStructureKey: String? = null
 
     /**
      * 创建 HWND、attach SkiaLayer，并注册到共享宿主。**不**进入阻塞循环。
@@ -409,11 +428,92 @@ class WindowsComposeWindow(
         println("WindowsComposeWindow: created window '$title' (${win.width}x${win.height})")
         win32Log("create: window ok ${win.width}x${win.height}")
         if (pointerIconKind != 0) win.setCursor(pointerIconKind)
+        // 窗口建好后再应用挂起的菜单栏（MenuBar composition 可能早于 HWND）。
+        applyMenuBarLocked(pendingMenuBar)
         check(layer.renderDelegate != null) {
             "SkiaLayer.renderDelegate must be set before attach/run"
         }
         layer.attachTo(win)
         return win
+    }
+
+    /**
+     * 挂原生菜单栏（HMENU rebuild-on-change）。
+     *
+     * - [model] = null → 清除
+     * - 无边框（[undecorated]）→ 清除 / no-op（系统菜单栏只出现在有边框窗）
+     */
+    fun setMenuBar(model: NativeMenuBarModel?) {
+        pendingMenuBar = model
+        applyMenuBarLocked(model)
+    }
+
+    private fun applyMenuBarLocked(model: NativeMenuBarModel?) {
+        val win = win32Window ?: return
+        if (undecorated || model == null || model.menus.isEmpty()) {
+            menuClickMap.clear()
+            menuStructureKey = null
+            win.setMenu(null)
+            return
+        }
+        val key = model.structureKey()
+        // 结构未变：只换 onClick 映射（动画每帧会重组 MenuBar，不能每次 DestroyMenu）。
+        if (key == menuStructureKey) {
+            rematerializeMenuClickMap(model)
+            return
+        }
+        menuClickMap.clear()
+        var nextId = 1
+        fun buildPopup(nodes: List<NativeMenuNode>): Win32Menu {
+            val menu = Win32Menu.createPopup()
+            for (node in nodes) {
+                when (node) {
+                    is NativeMenuNode.Separator -> menu.appendSeparator()
+                    is NativeMenuNode.Item -> {
+                        val id = nextId++
+                        menu.appendString(id, node.text, node.enabled)
+                        menuClickMap[id] = node.onClick
+                    }
+                    is NativeMenuNode.Menu -> {
+                        val child = buildPopup(node.children)
+                        menu.appendPopup(node.text, child, node.enabled)
+                    }
+                }
+            }
+            return menu
+        }
+        val bar = Win32Menu.createBar()
+        for (top in model.menus) {
+            val child = buildPopup(top.children)
+            bar.appendPopup(top.text, child, top.enabled)
+        }
+        win.setMenu(bar)
+        menuStructureKey = key
+        win32Log("menu: SetMenu items=${menuClickMap.size} tops=${model.menus.size}")
+    }
+
+    /** 按与 [applyMenuBarLocked] 相同的遍历顺序重填 id → onClick（不碰 HMENU）。 */
+    private fun rematerializeMenuClickMap(model: NativeMenuBarModel) {
+        menuClickMap.clear()
+        var nextId = 1
+        fun walk(nodes: List<NativeMenuNode>) {
+            for (node in nodes) {
+                when (node) {
+                    is NativeMenuNode.Separator -> Unit
+                    is NativeMenuNode.Item -> {
+                        menuClickMap[nextId++] = node.onClick
+                    }
+                    is NativeMenuNode.Menu -> walk(node.children)
+                }
+            }
+        }
+        for (top in model.menus) walk(top.children)
+    }
+
+    /** 菜单栏点击：按 id 回调（由 [WindowsEvent.MenuCommandEvent] 驱动）。 */
+    fun invokeMenuCommand(commandId: Int) {
+        menuClickMap[commandId]?.invoke()
+            ?: win32Log("menu: 未知命令 id=$commandId（映射表 size=${menuClickMap.size}）")
     }
 
     private fun translateAndDispatch(win: Win32Window, onEvent: (WindowsEvent) -> Unit) {
@@ -553,6 +653,8 @@ class WindowsComposeWindow(
                 Win32Event.MOVE -> onEvent(WindowsEvent.MoveEvent(x = raw.x.toInt(), y = raw.y.toInt()))
                 Win32Event.CLOSE -> onEvent(WindowsEvent.CloseEvent)
                 Win32Event.FOCUS -> onEvent(WindowsEvent.FocusEvent(hasFocus = raw.a == 1))
+                // 原生菜单栏：命令 id 在 a（= LOWORD(wParam)）。
+                Win32Event.MENU_COMMAND -> onEvent(WindowsEvent.MenuCommandEvent(commandId = raw.a))
             }
         }
     }
@@ -694,17 +796,21 @@ class WindowsComposeWindow(
     }
 
     /**
-     * 把窗口移到主显示器工作区中间（尺寸不变）—— 上游 `WindowPosition.Aligned(Alignment.Center)`
-     * 的等价物。拿不到显示器信息时什么都不做。
+     * 把窗口按 [alignment] 摆进主显示器工作区（尺寸不变）。
+     * 对齐 Desktop `WindowPosition.Aligned`；拿不到显示器信息时什么都不做。
      */
-    fun centerOnScreen() {
+    fun alignOnScreen(alignment: androidx.compose.ui.Alignment) {
         val win = win32Window ?: return
         val screen = win.primaryMonitorWorkAreaDp() ?: return
         val size = windowSize
-        val x = screen[0] + (screen[2] - size.width) / 2
-        val y = screen[1] + (screen[3] - size.height) / 2
-        win.setWindowPosition(x, y)
+        val space = androidx.compose.ui.unit.IntSize(screen[2], screen[3])
+        val window = androidx.compose.ui.unit.IntSize(size.width, size.height)
+        val offset = alignment.align(window, space, androidx.compose.ui.unit.LayoutDirection.Ltr)
+        win.setWindowPosition(screen[0] + offset.x, screen[1] + offset.y)
     }
+
+    /** 等价于 [alignOnScreen]([androidx.compose.ui.Alignment.Center])。 */
+    fun centerOnScreen() = alignOnScreen(androidx.compose.ui.Alignment.Center)
 
     /** 任务栏进度能不能用（Wine / 没有 shell 时为 false）。 */
     val taskbarSupported: Boolean get() = win32Window?.taskbarSupported ?: false
@@ -743,6 +849,47 @@ class WindowsComposeWindow(
     fun setTitle(title: String) {
         win32Window?.setTitle(title)
     }
+
+    /**
+     * 打开文件对话框（comdlg32）。取消 → 空列表。
+     *
+     * **UI 线程同步阻塞**。内部走 `asPlatformWindow()` 同源的 [nativeWindow]。
+     */
+    fun openFileDialog(
+        title: String? = null,
+        initialDirectory: String? = null,
+        initialFileName: String? = null,
+        multiple: Boolean = false,
+        filters: List<FileDialogFilter> = emptyList(),
+    ): List<String> = ComposeKNFileDialog.show(
+        ownerPlatform = this,
+        mode = ComposeKNFileDialog.MODE_LOAD,
+        title = title,
+        initialDirectory = initialDirectory,
+        initialFileName = initialFileName,
+        multiple = multiple,
+        filterUtf8 = buildFileDialogFilterUtf8(filters),
+    )
+
+    /**
+     * 保存文件对话框。取消 → null。
+     *
+     * **UI 线程同步阻塞**。
+     */
+    fun saveFileDialog(
+        title: String? = null,
+        initialDirectory: String? = null,
+        initialFileName: String? = null,
+        filters: List<FileDialogFilter> = emptyList(),
+    ): String? = ComposeKNFileDialog.show(
+        ownerPlatform = this,
+        mode = ComposeKNFileDialog.MODE_SAVE,
+        title = title,
+        initialDirectory = initialDirectory,
+        initialFileName = initialFileName,
+        multiple = false,
+        filterUtf8 = buildFileDialogFilterUtf8(filters),
+    ).firstOrNull()
 
     /** 走过的 IME 消息条数（0 = 系统没发 IME 消息；自检/真机排查用）。 */
     val imeMessageCount: Int get() = win32Window?.imeMessageCount ?: 0

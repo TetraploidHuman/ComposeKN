@@ -135,6 +135,8 @@ struct ComposeKNWin32Window {
     int dpi = 96;
     bool closeRequested = false;
     bool quit = false;
+    /** 当前挂在窗口上的菜单栏（本桥接持有所有权；SetMenu 替换时 DestroyMenu）。 */
+    HMENU menuBar = nullptr;
     std::vector<ComposeKNWin32Event> events;
     int trackPointerButtons = 0;
     int pressedButtonMask = 0;
@@ -1920,6 +1922,17 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             }
             break;
         }
+        case WM_COMMAND: {
+            // 菜单命令：HIWORD==0；加速键 HIWORD==1。v1 只接菜单栏点击。
+            if (window != nullptr && HIWORD(wParam) == 0) {
+                ComposeKNWin32Event e{};
+                e.type = COMPOSEKN_WIN32_EVENT_MENU_COMMAND;
+                e.a = (int32_t)(LOWORD(wParam));
+                pushEvent(window, e);
+                return 0;
+            }
+            break;
+        }
         case WM_CLOSE: {
             // 对齐 Compose Desktop / AWT 的 DO_NOTHING_ON_CLOSE：
             // 只把 CLOSE 事件推给 Kotlin（onCloseRequest），**不** DestroyWindow、
@@ -2113,12 +2126,21 @@ extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
     // 防 Kotlin 漏调 gl_destroy：拆 HWND 前先丢掉本窗 WGL（多窗口下不能留悬空 DC）。
     composekn_win32_gl_destroy(window);
     if (window->hwnd != nullptr && IsWindow(window->hwnd)) {
+        // 菜单栏在 DestroyWindow 前摘掉并销毁（窗口不会自动 DestroyMenu）。
+        if (window->menuBar != nullptr) {
+            SetMenu(window->hwnd, nullptr);
+            DestroyMenu(window->menuBar);
+            window->menuBar = nullptr;
+        }
         // 先摘掉拖放目标再拆窗口：OLE 侧还握着一个指针（RevokeDragDrop 是唯一
         // 合法的注销点，必须在 DestroyWindow 之前）。
         if (window->dropTarget != nullptr) {
             RevokeDragDrop(window->hwnd);
         }
         DestroyWindow(window->hwnd);
+    } else if (window->menuBar != nullptr) {
+        DestroyMenu(window->menuBar);
+        window->menuBar = nullptr;
     }
     if (window->dropTarget != nullptr) {
         window->dropTarget->Release();
@@ -2564,6 +2586,75 @@ extern "C" int32_t composekn_win32_client_overflow_count(ComposeKNWin32Window* w
 extern "C" bool composekn_win32_touch_enabled(ComposeKNWin32Window* window) {
     if (window == nullptr) return false;
     return window->touchEnabled;
+}
+
+// ---------------------------------------------------------------------------
+// 原生菜单栏（HMENU）
+// ---------------------------------------------------------------------------
+
+static std::wstring utf8ToWideMenu(const char* utf8) {
+    if (utf8 == nullptr || utf8[0] == '\0') return std::wstring();
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    if (wlen <= 0) return std::wstring();
+    std::wstring wide(static_cast<size_t>(wlen - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide.data(), wlen);
+    return wide;
+}
+
+extern "C" void* composekn_win32_menu_create(bool popup) {
+    HMENU menu = popup ? CreatePopupMenu() : CreateMenu();
+    return reinterpret_cast<void*>(menu);
+}
+
+extern "C" void composekn_win32_menu_destroy(void* hmenu) {
+    if (hmenu == nullptr) return;
+    DestroyMenu(reinterpret_cast<HMENU>(hmenu));
+}
+
+extern "C" bool composekn_win32_menu_append_string(
+    void* parent, uint32_t id, const char* utf8, bool enabled
+) {
+    if (parent == nullptr) return false;
+    const std::wstring wide = utf8ToWideMenu(utf8);
+    UINT flags = MF_STRING | (enabled ? MF_ENABLED : (MF_GRAYED | MF_DISABLED));
+    return AppendMenuW(reinterpret_cast<HMENU>(parent), flags, id, wide.c_str()) != FALSE;
+}
+
+extern "C" bool composekn_win32_menu_append_separator(void* parent) {
+    if (parent == nullptr) return false;
+    return AppendMenuW(reinterpret_cast<HMENU>(parent), MF_SEPARATOR, 0, nullptr) != FALSE;
+}
+
+extern "C" bool composekn_win32_menu_append_popup(
+    void* parent, const char* utf8, void* child, bool enabled
+) {
+    if (parent == nullptr || child == nullptr) return false;
+    const std::wstring wide = utf8ToWideMenu(utf8);
+    UINT flags = MF_POPUP | MF_STRING | (enabled ? MF_ENABLED : (MF_GRAYED | MF_DISABLED));
+    // 64 位上 MF_POPUP 的「id」参数实际是子 HMENU 句柄。
+    return AppendMenuW(
+        reinterpret_cast<HMENU>(parent),
+        flags,
+        reinterpret_cast<UINT_PTR>(child),
+        wide.c_str()
+    ) != FALSE;
+}
+
+extern "C" void composekn_win32_menu_set(ComposeKNWin32Window* window, void* hmenu) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    HMENU next = reinterpret_cast<HMENU>(hmenu);
+    HMENU prev = window->menuBar;
+    if (prev == next) {
+        DrawMenuBar(window->hwnd);
+        return;
+    }
+    SetMenu(window->hwnd, next);
+    DrawMenuBar(window->hwnd);
+    window->menuBar = next;
+    // 接管所有权：旧菜单（含 MF_POPUP 挂上的子菜单）一并销毁。
+    if (prev != nullptr) {
+        DestroyMenu(prev);
+    }
 }
 
 extern "C" int32_t composekn_win32_refresh_hz(ComposeKNWin32Window* window) {

@@ -30,6 +30,12 @@ interface ComposeNativeWindowHandle {
      */
     fun setGeometryListener(listener: ((WindowGeometrySnapshot) -> Unit)?)
 
+    /**
+     * 挂原生菜单栏（Win32 = HMENU rebuild-on-change）。
+     * 默认 no-op（Wayland / 无边框窗口）。传 null 清除。
+     */
+    fun setMenuBar(model: NativeMenuBarModel?) {}
+
     fun dispose()
 }
 

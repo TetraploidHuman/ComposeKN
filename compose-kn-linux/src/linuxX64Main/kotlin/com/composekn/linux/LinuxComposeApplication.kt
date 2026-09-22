@@ -148,7 +148,9 @@ class LinuxComposeApplication(
         // 独占路径：无 SSD 时 withChrome 由 setContent 内逻辑自动补 CSD
         setContent(withChrome = undecorated, content = content)
 
-        composeWindow.window.onImeEvent = { imeEvent -> textInputService.handleImeEvent(imeEvent) }
+        composeWindow.window.onImeEvent = { imeEvent ->
+            if (composeWindow.inputEnabled) textInputService.handleImeEvent(imeEvent)
+        }
         composeWindow.run(onEvent = ::handleEvent)
 
         close()
@@ -177,7 +179,9 @@ class LinuxComposeApplication(
                 }
             }
         }
-        composeWindow.window.onImeEvent = { imeEvent -> textInputService.handleImeEvent(imeEvent) }
+        composeWindow.window.onImeEvent = { imeEvent ->
+            if (composeWindow.inputEnabled) textInputService.handleImeEvent(imeEvent)
+        }
         if (onCloseRequest != null) {
             composeWindow.onCloseRequest = onCloseRequest
         }
@@ -196,6 +200,10 @@ class LinuxComposeApplication(
             scene.density = Density(event.scale)
             return
         }
+        // 软模态：有 Dialog 时非对话框丢弃 pointer/key/touch（对齐 Win32 EnableWindow）
+        if (!composeWindow.inputEnabled && event.type.isPointerKeyOrTouch()) {
+            return
+        }
         if (event.type == WaylandEventType.Key) {
             println("composekn: key keyCode=${event.keyCode} keysym=${event.keysym} pressed=${event.pressed}")
             scene.dispatchWaylandKeyEvent(event, inputState, backNavigationInput)
@@ -203,4 +211,17 @@ class LinuxComposeApplication(
         }
         scene.dispatchWaylandEvent(event, composeWindow.layer.contentScale, inputState)
     }
+}
+
+private fun WaylandEventType.isPointerKeyOrTouch(): Boolean = when (this) {
+    WaylandEventType.PointerEnter,
+    WaylandEventType.PointerLeave,
+    WaylandEventType.PointerMotion,
+    WaylandEventType.PointerButton,
+    WaylandEventType.PointerAxis,
+    WaylandEventType.Key,
+    WaylandEventType.TouchDown,
+    WaylandEventType.TouchMotion,
+    WaylandEventType.TouchUp -> true
+    else -> false
 }

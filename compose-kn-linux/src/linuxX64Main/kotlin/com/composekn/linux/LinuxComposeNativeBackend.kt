@@ -75,8 +75,8 @@ private object LinuxComposeNativeBackend : ComposeNativeWindowBackend {
     }
 
     override fun wakeApplicationPump() {
+        // eventfd wake；失败时共享泵 idleWait ≤2ms
         LinuxApplicationHost.wake()
-        // v1 无 eventfd：共享泵空闲分支有短 sleep，可接受
     }
 }
 
@@ -90,6 +90,11 @@ class LinuxNativeWindowHandle(
 
     private var disposed = false
     private var geometryListener: ((WindowGeometrySnapshot) -> Unit)? = null
+
+    companion object {
+        /** Aligned 定位限制只打一次日志，避免 resize SideEffect 刷屏。 */
+        private var alignedPositionLogged = false
+    }
 
     override fun asPlatformWindow(): Any? = app.composeWindow
 
@@ -125,15 +130,27 @@ class LinuxNativeWindowHandle(
     }
 
     override fun applySize(size: DpSize) {
-        // 客户端主动改尺寸需 compositor configure；v1 跳过（创建时已用初始 size）
         if (!size.width.isSpecified || !size.height.isSpecified) return
+        // 经 composekn_window_request_size：min=max + geometry，configure 后清约束
+        app.composeWindow.window.requestSize(
+            size.width.value.toInt().coerceAtLeast(1),
+            size.height.value.toInt().coerceAtLeast(1),
+        )
     }
 
     override fun applyPosition(position: WindowPosition) {
-        // Wayland 客户端通常不能绝对定位
+        // Wayland 无通用绝对定位；不伪造 Absolute。Aligned 亦无可靠 API（无 layer-shell）。
         when (position) {
-            is WindowPosition.Absolute,
-            is WindowPosition.Aligned,
+            is WindowPosition.Absolute -> Unit
+            is WindowPosition.Aligned -> {
+                if (!alignedPositionLogged) {
+                    alignedPositionLogged = true
+                    println(
+                        "composekn: WindowPosition.Aligned is a no-op on Wayland " +
+                            "(compositor owns placement)",
+                    )
+                }
+            }
             WindowPosition.PlatformDefault -> Unit
         }
     }

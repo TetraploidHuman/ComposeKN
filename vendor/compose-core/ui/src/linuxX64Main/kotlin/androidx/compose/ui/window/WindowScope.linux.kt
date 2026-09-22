@@ -16,7 +16,7 @@ interface WindowScope {
 }
 
 /**
- * Frame window scope（Desktop 上还有 MenuBar；KN 暂不暴露菜单 API）。
+ * Frame window scope（[MenuBar] 挂原生菜单栏；Win32 = HMENU，其它平台 no-op）。
  */
 @Stable
 interface FrameWindowScope : WindowScope

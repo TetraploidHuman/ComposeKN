@@ -10,10 +10,12 @@ import androidx.compose.ui.window.ComposeNativeWindowBackend
 import androidx.compose.ui.window.ComposeNativeWindowBackendRegistry
 import androidx.compose.ui.window.ComposeNativeWindowCreateParams
 import androidx.compose.ui.window.ComposeNativeWindowHandle
+import androidx.compose.ui.window.NativeMenuBarModel
 import androidx.compose.ui.window.WindowGeometrySnapshot
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.WindowPosition
 import org.jetbrains.skiko.initWindowsMainThread
+import org.jetbrains.skiko.composeKnFileDialogOwnerResolver
 import org.jetbrains.skiko.win32Log
 
 /**
@@ -23,6 +25,10 @@ import org.jetbrains.skiko.win32Log
  * 幂等；[WindowsComposeApplication] 构造时也会自动调用。
  */
 fun registerComposeKnWindowsBackend() {
+    // FileDialog：asPlatformWindow() → WindowsComposeWindow → nativeWindow
+    composeKnFileDialogOwnerResolver = { platform ->
+        (platform as? WindowsComposeWindow)?.nativeWindow
+    }
     if (ComposeNativeWindowBackendRegistry.backend != null) return
     ComposeNativeWindowBackendRegistry.register(WindowsComposeNativeBackend)
     win32Log("backend: ComposeNativeWindowBackend registered (Windows)")
@@ -140,8 +146,7 @@ class WindowsNativeWindowHandle(
                 app.window.setWindowPosition(position.x.value.toInt(), position.y.value.toInt())
             }
             is WindowPosition.Aligned -> {
-                // 目前只实现 Center；其它对齐退化为居中
-                app.window.centerOnScreen()
+                app.window.alignOnScreen(position.alignment)
             }
             WindowPosition.PlatformDefault -> Unit
         }
@@ -164,6 +169,10 @@ class WindowsNativeWindowHandle(
         } else {
             null
         }
+    }
+
+    override fun setMenuBar(model: NativeMenuBarModel?) {
+        app.window.setMenuBar(model)
     }
 
     private fun notifyGeometryFromNative() {
@@ -192,6 +201,7 @@ class WindowsNativeWindowHandle(
         disposed = true
         geometryListener = null
         app.window.onGeometryHint = null
+        app.window.setMenuBar(null)
         app.detachFromSharedHost()
     }
 }

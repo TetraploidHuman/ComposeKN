@@ -65,6 +65,11 @@ typedef enum ComposeKNWin32EventType {
     COMPOSEKN_WIN32_EVENT_DRAG_OVER = 20,   /* = IDropTarget::DragOver */
     COMPOSEKN_WIN32_EVENT_DRAG_LEAVE = 21,  /* = IDropTarget::DragLeave */
     COMPOSEKN_WIN32_EVENT_DRAG_DROP = 22,   /* = IDropTarget::Drop */
+    /*
+     * 原生菜单栏（HMENU）命令：WM_COMMAND 且 HIWORD(wParam)==0（菜单，非加速键）。
+     * 命令 id 放在 a（= LOWORD(wParam)）。Kotlin 侧用 id → onClick 映射表回调。
+     */
+    COMPOSEKN_WIN32_EVENT_MENU_COMMAND = 23,
 } ComposeKNWin32EventType;
 
 typedef struct ComposeKNWin32Event {
@@ -75,7 +80,8 @@ typedef struct ComposeKNWin32Event {
     uint32_t state;   /* 0=released 1=pressed */
     int32_t a;        /* key: flags; wheel: delta (120 = line); focus: 1=acquired;
                        * touch: 真实事件时间（归一化成进程内毫秒，见 win32_window.cc
-                       *       的 touchTimeBase —— Compose 的甩动速度估计器要用它） */
+                       *       的 touchTimeBase —— Compose 的甩动速度估计器要用它）；
+                       * menu: 菜单命令 id（LOWORD(wParam)） */
     int32_t b;        /* char: unicode codepoint; key: scan code; mouse wheel: 1 = 横向 */
     uint32_t modifiers;
 } ComposeKNWin32Event;
@@ -221,6 +227,25 @@ void composekn_win32_set_cursor(ComposeKNWin32Window* window, int32_t kind);
 
 /** 触摸通道是否启用（COMPOSEKN_TOUCH=0 可关掉，退回系统「触摸提升成鼠标」的老行为）。 */
 bool composekn_win32_touch_enabled(ComposeKNWin32Window* window);
+
+// ---------------------------------------------------------------------------
+// 原生菜单栏（HMENU，经典 Win32 MenuBar）
+//
+// 策略：Compose 侧每次菜单结构变化都重建整棵 HMENU（rebuild-on-change），再
+// SetMenu + DrawMenuBar。无边框窗口不要挂菜单（Kotlin 侧直接 no-op）。
+//
+// 所有字符串参数都是 UTF-8；C 侧转 WCHAR。
+// menu_set 接管传入的 HMENU 所有权，替换时会 DestroyMenu 旧菜单；传 null 清除。
+// ---------------------------------------------------------------------------
+
+/** popup=false → CreateMenu（菜单栏根）；true → CreatePopupMenu（子菜单）。 */
+void* composekn_win32_menu_create(bool popup);
+void composekn_win32_menu_destroy(void* hmenu);
+bool composekn_win32_menu_append_string(void* parent, uint32_t id, const char* utf8, bool enabled);
+bool composekn_win32_menu_append_separator(void* parent);
+bool composekn_win32_menu_append_popup(void* parent, const char* utf8, void* child, bool enabled);
+/** SetMenu + DrawMenuBar；hmenu=null 清除。接管所有权（替换时销毁旧菜单）。 */
+void composekn_win32_menu_set(ComposeKNWin32Window* window, void* hmenu);
 
 // ---------------------------------------------------------------------------
 // IME（IMM32）
@@ -554,6 +579,34 @@ bool composekn_win32_clipboard_test_set_dib8(
  */
 int32_t composekn_win32_clipboard_get_raw_hex(
     ComposeKNWin32Window* window, const char* format_name, char* buffer, int32_t buffer_size);
+
+// ---------------------------------------------------------------------------
+// 文件对话框（comdlg32：GetOpenFileNameW / GetSaveFileNameW）
+//
+// 必须在 UI 线程调用。返回约定（两段式，对齐剪贴板）：
+//   * 0  = 用户取消；
+//   * -1 = 错误（CommDlgExtendedError ≠ 0）；
+//   * >0 = 写入的 UTF-8 字节数（不含结尾 NUL）；多路径用 '\n' 分隔；
+//         若 buffer 太小则返回**需要的字节数**（调用方加大缓冲再调一次）。
+//
+// filterUtf8：'\n' 分隔的过滤器字段，C 侧转成 COMDLG 双 NUL 宽串，例如
+//   "Images\n*.png;*.jpg\nAll\n*.*\n" → L"Images\0*.png;*.jpg\0All\0*.*\0\0"。
+// mode：0 = 打开（Load），非 0 = 保存（Save）。
+// ---------------------------------------------------------------------------
+
+/** comdlg32 是否可用（链接成功即 true；CI 用它跳过交互弹窗）。 */
+bool composekn_win32_file_dialog_available(void);
+
+int32_t composekn_win32_file_dialog(
+    ComposeKNWin32Window* owner,
+    int32_t mode,
+    const char* title,
+    const char* initialDir,
+    const char* initialName,
+    bool allowMultiple,
+    const char* filterUtf8,
+    char* buffer,
+    int32_t bufferSize);
 
 #ifdef __cplusplus
 } /* extern "C" */

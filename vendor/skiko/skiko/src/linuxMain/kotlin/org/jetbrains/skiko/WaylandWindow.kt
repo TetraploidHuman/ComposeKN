@@ -48,6 +48,17 @@ class WaylandWindow(
     }
 
     /**
+     * 请求客户端尺寸（逻辑像素）。Wayland 上通过 min=max + geometry 提示 compositor；
+     * 见 [composekn_window_request_size]。
+     */
+    fun requestSize(width: Int, height: Int) {
+        composekn_window_request_size(native, width, height)
+    }
+
+    /** 与 Win32 [setClientSize] 对齐的别名。 */
+    fun setClientSize(width: Int, height: Int) = requestSize(width, height)
+
+    /**
      * Process Wayland events and dispatch input/frame/IME callbacks.
      * Returns false only on display failure. Close requests do not stop polling —
      * use [consumeCloseRequested] for Desktop DO_NOTHING semantics.
