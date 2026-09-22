@@ -114,7 +114,8 @@ suspend fun awaitApplication(
                     }
                 }
             }
-            // 与 Desktop 相同：setContent 后 close，join 等到无活动 composition
+            // 与 Desktop 相同：setContent 后 close，join 等到无活动 composition。
+            // Window 必须用 LaunchedEffect 保活（见 Window.linux.kt），否则这里立刻返回→闪退。
             recomposer.close()
             recomposer.join()
         } finally {

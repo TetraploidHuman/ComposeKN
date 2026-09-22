@@ -83,6 +83,9 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.application
+import androidx.compose.ui.window.rememberWindowState
 import com.composekn.windows.MouseButton
 import com.composekn.windows.TaskbarProgressState
 import com.composekn.windows.TouchPhase
@@ -3145,6 +3148,7 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
 
     runDecoratedWindowResizeTests(report)
     runConcurrentWindowTests(report)
+    runApplicationApiSelfTest(report)
 }
 
 /**
@@ -3226,6 +3230,78 @@ private fun runConcurrentWindowTests(report: SelfTestReport) {
         "host count=${WindowsApplicationHost.liveWindowCount}",
     )
     report.check("window-multi/no-timeout", !guard.timedOut)
+}
+
+/**
+ * 声明式 `application { Window }` 保活回归（HANDOVER §17.38 / v0.5.22）。
+ *
+ * 原先 Window 内容在独立 FrameRecomposer 上，application 层没有活动协程，
+ * `recomposer.join()` 立刻返回 → 共享泵退出 → 画廊闪退。本用例要求至少出满
+ * 若干帧再 `exitApplication()`，否则必红。
+ */
+private fun runApplicationApiSelfTest(report: SelfTestReport) {
+    report.section("application{} 声明式入口保活")
+    com.composekn.windows.registerComposeKnWindowsBackend()
+
+    var frames = 0
+    var reachedExit = false
+    var exitApp: (() -> Unit)? = null
+
+    val guard = WindowPhaseGuard()
+    CoroutineScope(Dispatchers.Default).launch {
+        delay(20_000)
+        if (!guard.finished) {
+            guard.timedOut = true
+            winlog("application-api: TIMEOUT — calling exitApplication")
+            exitApp?.invoke()
+        }
+    }
+
+    try {
+        application(exitProcessOnExit = false) {
+            val exit = ::exitApplication
+            exitApp = exit
+            Window(
+                onCloseRequest = exit,
+                state = rememberWindowState(width = 400.dp, height = 300.dp),
+                title = "Selftest-application-api",
+                undecorated = true,
+            ) {
+                LaunchedEffect(Unit) {
+                    // 必须真的等到多帧：证明共享泵还在跑、Window 保活生效。
+                    while (frames < 12) {
+                        withFrameNanos {
+                            frames++
+                        }
+                    }
+                    reachedExit = true
+                    winlog("application-api: got $frames frames — exitApplication")
+                    exit()
+                }
+                Text("application-api selftest frames=$frames")
+            }
+        }
+    } catch (t: Throwable) {
+        report.check(
+            "application-api/no-exception",
+            false,
+            "${t::class.simpleName}: ${t.message}",
+        )
+    }
+    guard.finished = true
+
+    report.check(
+        "application-api/frames",
+        frames >= 12,
+        "frames=$frames (need >=12; 0 means join returned before first frame)",
+    )
+    report.check("application-api/reached-exit", reachedExit)
+    report.check(
+        "application-api/host-empty",
+        WindowsApplicationHost.liveWindowCount == 0,
+        "live=${WindowsApplicationHost.liveWindowCount}",
+    )
+    report.check("application-api/no-timeout", !guard.timedOut)
 }
 
 /**

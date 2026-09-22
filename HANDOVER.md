@@ -3725,3 +3725,27 @@ v0.5.20 的 `awaitApplication` 定义了 `YieldFrameClock` 却没挂进
 
 对齐 Desktop：`Recomposer(SkikoDispatchers.Main + YieldFrameClock)`。
 画廊「每帧 +1」动画也从 application 层挪进 `Window { }`（真实 FrameRecomposer）。
+
+#### 画廊闪退修复（v0.5.22）
+
+v0.5.21 挂上 YieldFrameClock 后能进 `application`，但立刻闪退：Window 内容跑在
+**独立** FrameRecomposer 上，application 层没有活动协程，`recomposer.join()` 马上返回，
+共享泵退出、`exitProcess(0)`。日志停在 `app: attached` / 改尺寸，没有 `host: shared pump`
+收尾前的持续帧。
+
+修法：`Window` 里 `LaunchedEffect(handle) { awaitCancellation() }` 保活 application
+Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 帧再 exit）。
+
+#### 画廊闪退（续）：二次 setContent / enableSavedStateHandles（v0.5.22）
+
+酒测复现：`createWindow` 先 `attachToSharedHost(content={})` 调了一次
+`enableSavedStateHandles`，`DisposableEffect` 再 `setContent` 真内容时再次调用 →
+`IllegalArgumentException: Failed requirement`（异常在 stderr，不进 startup.log，
+所以看起来像「没画面然后闪退」）。
+
+修法：
+* `setContent` 对 `enableSavedStateHandles` / 首次 `ON_RESUME` 做一次性守卫；
+* 声明式 `createWindow` 改为 `attachToSharedHost(content=null)`，内容只由
+  `DisposableEffect` 装一次；
+* 另：`Window` 里 `LaunchedEffect { awaitCancellation() }` 保活 application Recomposer
+  （独立 FrameRecomposer 时否则 `join()` 立刻返回）。

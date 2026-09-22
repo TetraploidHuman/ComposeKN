@@ -90,6 +90,7 @@ class WindowsComposeApplication(
     )
 
     private var closed = false
+    private var savedStateHandlesEnabled = false
 
     init {
         // 必须尽早标记「当前线程 = UI 主线程」。
@@ -148,8 +149,13 @@ class WindowsComposeApplication(
                 content()
             }
         }
-        archComponentsOwner.enableSavedStateHandles()
-        archComponentsOwner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        // enableSavedStateHandles 只能调一次（声明式 Window 会 attach 后再 setContent，
+        // 或多次替换内容；二次调用会 IllegalArgumentException: Failed requirement）。
+        if (!savedStateHandlesEnabled) {
+            archComponentsOwner.enableSavedStateHandles()
+            archComponentsOwner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            savedStateHandlesEnabled = true
+        }
 
         window.layer.renderDelegate = object : SkikoRenderDelegate {
             override fun onRender(canvas: Canvas, width: Int, height: Int, nanoTime: Long) {
@@ -264,14 +270,31 @@ class WindowsComposeApplication(
     /**
      * 装内容并挂到 [WindowsApplicationHost]（不阻塞）。
      * 供声明式 Window / 多窗口自检使用；之后由共享泵驱动。
+     *
+     * @param content null 时只挂宿主、不装 Compose 内容（声明式 Window 的
+     *   createWindow 用：真正内容由随后的 [setContent] / DisposableEffect 装上，
+     *   避免空 `{}` 先 enableSavedStateHandles 再装真内容时二次崩溃）。
      */
     fun attachToSharedHost(
         withChrome: Boolean = undecorated,
         onCloseRequest: (() -> Unit)? = null,
-        content: @Composable () -> Unit,
+        content: (@Composable () -> Unit)? = null,
     ) {
         ensureWindowsComposeBackendRegistered()
-        setContent(withChrome = withChrome, content = content)
+        if (content != null) {
+            setContent(withChrome = withChrome, content = content)
+        } else {
+            // 仍要预置尺寸与 renderDelegate，否则首帧前指针事件会 infinity-measure。
+            val initialSize = initialSceneSize()
+            scene.size = initialSize
+            scene.density = effectiveDensity()
+            platformContext.updateContainerSize(initialSize, scene.density)
+            window.layer.renderDelegate = object : SkikoRenderDelegate {
+                override fun onRender(canvas: Canvas, width: Int, height: Int, nanoTime: Long) {
+                    renderFrame(canvas, width, height, nanoTime)
+                }
+            }
+        }
         platformContext.cursorSink = { kind -> window.pointerIconKind = kind }
         platformContext.dragWindowProvider = { window.nativeWindow }
         textInputService.onSessionEnded = { window.imeCancelComposition() }

@@ -11,10 +11,12 @@ package androidx.compose.ui.window
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.unit.isSpecified
+import kotlinx.coroutines.awaitCancellation
 
 /**
  * Composes a platform window. Entering composition creates the native window;
@@ -28,6 +30,11 @@ import androidx.compose.ui.unit.isSpecified
  *     Window(onCloseRequest = ::exitApplication) { }
  * }
  * ```
+ *
+ * 注意：原生窗的 Compose 内容跑在**独立** [androidx.compose.ui.platform.FrameRecomposer] 上，
+ * 不是 application [Recomposer] 的子 composition。因此必须在这里挂一个
+ * [LaunchedEffect] 保活 application 层，否则 `recomposer.close(); join()` 会立刻返回、
+ * 共享泵退出、进程闪退（v0.5.21 真机复现）。
  */
 @Composable
 fun Window(
@@ -65,6 +72,11 @@ fun Window(
 
     val latestContent = rememberUpdatedState(content)
     val latestOnClose = rememberUpdatedState(onCloseRequest)
+
+    // 保活 application Recomposer：本窗在 composition 里的整段寿命。
+    LaunchedEffect(handle) {
+        awaitCancellation()
+    }
 
     // 属性同步（不要每帧 setContent —— 那会重置场景）
     SideEffect {

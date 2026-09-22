@@ -49,11 +49,11 @@ private object WindowsComposeNativeBackend : ComposeNativeWindowBackend {
         handle.setAlwaysOnTop(params.alwaysOnTop)
         handle.setOnCloseRequest(params.onCloseRequest)
         handle.applyPlacement(params.placement, params.isMinimized)
-        // 先挂空内容，attach 进共享宿主；真正 content 由 Window SideEffect setContent
+        // 先挂宿主（不装空 composition）；真正 content 由 Window DisposableEffect setContent
         app.attachToSharedHost(
             withChrome = params.undecorated,
             onCloseRequest = params.onCloseRequest,
-            content = {},
+            content = null,
         )
         when (val pos = params.position) {
             is WindowPosition.Absolute -> handle.applyPosition(pos)
