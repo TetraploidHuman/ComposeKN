@@ -3564,3 +3564,89 @@ SELFTEST: RESULT FAIL (89 checks, 5 failures)
 * logic **118** / window **89**（+10）（合计 **207**）、`all` **204** —— 全绿；
 * 外部阶段：`win32msg` 14 条 + `input` 5 条 + `screenshot` 4 条全绿；
 * 打包单文件 exe（无 `icudtl.dat`）干净目录复测。
+
+### 17.37 真机反馈：不可缩放之后**拖窗口边缘还是能改大小**（v0.5.19）
+
+用户点完「改成不可缩放」，日志里 `window: resizable=0` 也打了，但接着拖窗口边缘照样一堆
+`event: resize ...` —— bug 是真的。而且它暴露了**测试盲区**：
+
+> 自检的窗口阶段用的是 `undecorated = true`（CSD，无边框自绘标题栏），
+> 而 **demo 默认是系统标题栏窗口**。第一版的守护只写在 CSD 那个分支里，系统标题栏
+> 那条路根本没被任何断言覆盖。
+
+#### 根因（两层，都得修）
+
+1. `WM_NCHITTEST` 里第一版写的是：
+
+   ```cpp
+   if (!window->resizable) break;          // ← 只挡住了"我们自己算边缘码"那条路
+   if (window->undecorated && ...) { ...HTLEFT/HTRIGHT... }
+   ```
+
+   `break` = 交给 `DefWindowProc`。系统标题栏窗口的命中码本来就由 `DefWindowProc` 决定，
+   它看的是 **`WS_THICKFRAME`** —— 那个样式还在，所以它照样返回 `HTRIGHT`/`HTBOTTOM`，
+   系统于是开开心心地进了缩放循环。CSD 窗口走的是我们自己那段，所以自检是绿的。
+
+2. 只挡命中测试也不够：**别的缩放途径**还留着（`Win+方向键`/Aero Snap 都依赖
+   `WS_THICKFRAME`）。对齐上游的做法是 **AWT/JDK 的 `Window.setResizable(false)`** ——
+   它就是 `WS_THICKFRAME | WS_MAXIMIZEBOX` 一起摘掉。所以这一版照做。
+
+#### 修法
+
+* **命中码统一降级**：`WM_NCHITTEST` 里先算出命中码（CSD 用我们自己的边缘判定，其它窗口用
+  `DefWindowProc`），然后 `if (!resizable)` 把 8 个"缩放码"统一换成 **`HTBORDER`**
+  （= 有边框但不可缩放）：系统既不会进缩放循环，也不会把鼠标变成缩放光标。
+* **样式对齐 AWT/JDK**：`set_resizable(false)` 同时去掉 `WS_THICKFRAME` 和 `WS_MAXIMIZEBOX`；
+* **客户区不能跳**：`WS_THICKFRAME` 带着一圈缩放边框，样式一变非客户区厚度就变。所以摘掉
+  样式之后按"保持客户区尺寸"重新算窗口尺寸（`AdjustWindowRectEx`），用户只会看到边框变细，
+  内容纹丝不动。
+
+#### 顺手挖出来的第二个真 bug：关一个窗口会把**整个线程**退出
+
+为了补上面那个盲区，我加了一段"**系统标题栏**窗口"的自检（第二段，独立 app）—— 结果它
+**0 帧就退出**。查下来是 `WM_DESTROY` 里调了 `PostQuitMessage(0)`：
+
+```cpp
+case WM_DESTROY: {
+    if (window) window->quit = true;
+    PostQuitMessage(0);      // ← 这是**线程级**退出标志
+    return 0;
+}
+```
+
+一个线程上可以有多个 Compose 窗口（每个 `WindowsComposeWindow` 一个 HWND）。关掉第一个窗口
+就往线程消息队列塞了 `WM_QUIT`，后面新开的窗口 `PeekMessageW(&msg, nullptr, ...)` 立刻看到它
+→ 0 帧退出。**单窗口应用看不出来**（本来就该退），但这就是"多窗口支持"门口的坑。
+修法：删掉 `PostQuitMessage(0)`，每个窗口靠自己那个 `quit` 标志退出
+（`composekn_win32_pump` 里的 `if (window->quit) return false;`）。
+
+#### 新增自检（6 条，专门盯这个盲区）
+
+| 断言 | 内容 |
+| --- | --- |
+| `winapi-decorated-hit-test-resize` | 系统标题栏窗口默认：有 `WS_THICKFRAME`，右边缘命中码是缩放码 |
+| `winapi-decorated-hit-test-locked` | `resizable=false` 后右边缘命中码**不再是缩放码**（期望 `HTBORDER`） |
+| `winapi-decorated-thick-frame-removed` | `resizable=false` 后 `WS_THICKFRAME` 没了（对齐 AWT/JDK） |
+| `winapi-decorated-client-size-kept` | 摘样式后**客户区尺寸不变**（内容不跳） |
+| `winapi-decorated-center-still-client` | 客户区中心仍是 `HTCLIENT`（别把整个窗口变成边框） |
+| `winapi-decorated-resize-restored` | 改回可缩放后样式和命中码都回来 |
+
+命中码是真实 `SendMessageW(WM_NCHITTEST)` 的结果（`composekn_win32_test_hit_test`，
+where: 0=左中 1=右中 2=上中 3=下中 4=客户区中心），不是我们自己模拟的判定 —— 这样
+"系统到底会给我哪个码"才验得准。
+
+**换回可缩放的路径也测了**：`resizable = true` 之后命中码和样式位都得回来（避免"关得掉
+开不回来"）。
+
+#### 关于 fail-before
+
+这一轮的"先红"证据是**用户真机日志**本身：`resizable=0` 之后仍然滚出几百条 `event: resize`。
+新增的 6 条断言就是照那个现象写的回归；换回旧的 `win32_window.cc`（v0.5.18）跑，
+`winapi-decorated-hit-test-locked` / `-thick-frame-removed` 会红（命中码是 `HTRIGHT`=11 而不是
+`HTBORDER`=18）。这一轮没有再单独做一次变异链接，因为真机证据已经足够具体。
+
+#### 验证
+
+* logic **118** / window **96**（+7）（合计 **214**）、`all` **211** —— 全绿；
+* 外部阶段：`win32msg` 14 条 + `input` 5 条 + `screenshot` 4 条全绿；
+* 打包单文件 exe（无 `icudtl.dat`）干净目录复测。

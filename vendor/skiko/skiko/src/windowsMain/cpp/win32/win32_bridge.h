@@ -380,6 +380,18 @@ void composekn_win32_set_client_size(ComposeKNWin32Window* window, int32_t w_dp,
 /** 主显示器工作区（排除任务栏），dp：`out = {x, y, w, h}`。拿不到时全 0。 */
 void composekn_win32_primary_work_area(ComposeKNWin32Window* window, int32_t* out);
 
+/**
+ * 自检用：对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码。
+ *
+ * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心。返回 HTLEFT(10)…HTBORDER(18)、
+ * HTCLIENT(1) 等（Win32 常量）。存在的理由：真机反馈"不可缩放之后还能拖边缘改大小"，
+ * 而自检窗口是 CSD、demo 是系统标题栏 —— 命中码是这个 bug 最直接的观测量。
+ */
+int32_t composekn_win32_test_hit_test(ComposeKNWin32Window* window, int32_t where);
+
+/** 自检用：窗口样式里有没有 `WS_THICKFRAME`（可缩放的标志位）。 */
+bool composekn_win32_has_thick_frame(ComposeKNWin32Window* window);
+
 /** 任务栏进度能不能用（Wine/无 shell 时为 false —— 我们**不假装成功**）。 */
 bool composekn_win32_taskbar_supported(ComposeKNWin32Window* window);
 

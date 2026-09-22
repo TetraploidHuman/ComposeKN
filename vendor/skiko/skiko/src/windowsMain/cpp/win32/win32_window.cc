@@ -963,37 +963,63 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             composeknLog("wndproc: WM_CREATE hwnd=%p", (void*)hwnd);
             break;
         case WM_NCHITTEST: {
-            // resizable=false 时不做边缘命中（返回 HTCLIENT/HTBORDER），于是拖动边框改
-            // 不了大小 —— 这就是"不可缩放"。注意这里**不**动 WS_THICKFRAME：那个样式
-            // 一变，系统窗口管理器/我们的 CSD 布局都会跟着抖；只在命中测试上收口更稳。
-            if (!window->resizable) break;
-            if (window->undecorated && window->hwnd == hwnd) {
-                // Parent is our window; keep default edges for maximized/menus
-                if (IsZoomed(hwnd) || IsIconic(hwnd)) break;
+            // 命中码分两路算：
+            //   * 无边框（CSD）窗口：边缘那圈由**我们自己**判定（见下），因为系统看不见
+            //     我们自绘的标题栏/边框；
+            //   * 系统标题栏窗口：交给 DefWindowProc（它会按 WS_THICKFRAME 给出缩放码）。
+            // 然后**统一**做一次"不可缩放"降级 —— 这一点很关键，第一版只在 CSD 分支里
+            // 挡，于是系统标题栏窗口（demo 的默认形态）拖动边缘照样能改大小（真机反馈，
+            // HANDOVER §17.37）：`break` 落到 DefWindowProc，而它看的是 WS_THICKFRAME。
+            LRESULT hit = HTCLIENT;
+            bool decided = false;
+            if (window->undecorated && window->hwnd == hwnd &&
+                !IsZoomed(hwnd) && !IsIconic(hwnd)) {
                 LONG gx = GET_X_LPARAM(lParam);
                 LONG gy = GET_Y_LPARAM(lParam);
                 RECT r;
-                if (!GetWindowRect(hwnd, &r)) break;
-                int m = edgeMargin(window);
-                // Overshoot guard: min window dims bigger than 2*m handled by WM_GETMINMAXINFO
-                bool leftEdge = gx < r.left + m;
-                bool rightEdge = gx > r.right - m;
-                bool topEdge = gy < r.top + m;
-                bool bottomEdge = gy > r.bottom - m;
-                if (topEdge) {
-                    if (leftEdge) return HTTOPLEFT;
-                    if (rightEdge) return HTTOPRIGHT;
-                    return HTTOP;
+                if (GetWindowRect(hwnd, &r)) {
+                    int m = edgeMargin(window);
+                    // Overshoot guard: min window dims bigger than 2*m handled by WM_GETMINMAXINFO
+                    bool leftEdge = gx < r.left + m;
+                    bool rightEdge = gx > r.right - m;
+                    bool topEdge = gy < r.top + m;
+                    bool bottomEdge = gy > r.bottom - m;
+                    if (topEdge) {
+                        hit = leftEdge ? HTTOPLEFT : (rightEdge ? HTTOPRIGHT : HTTOP);
+                        decided = true;
+                    } else if (bottomEdge) {
+                        hit = leftEdge ? HTBOTTOMLEFT : (rightEdge ? HTBOTTOMRIGHT : HTBOTTOM);
+                        decided = true;
+                    } else if (leftEdge) {
+                        hit = HTLEFT;
+                        decided = true;
+                    } else if (rightEdge) {
+                        hit = HTRIGHT;
+                        decided = true;
+                    }
                 }
-                if (bottomEdge) {
-                    if (leftEdge) return HTBOTTOMLEFT;
-                    if (rightEdge) return HTBOTTOMRIGHT;
-                    return HTBOTTOM;
-                }
-                if (leftEdge) return HTLEFT;
-                if (rightEdge) return HTRIGHT;
             }
-            break;
+            if (!decided) {
+                hit = DefWindowProcW(hwnd, WM_NCHITTEST, wParam, lParam);
+            }
+            if (!window->resizable) {
+                switch (hit) {
+                    case HTLEFT:
+                    case HTRIGHT:
+                    case HTTOP:
+                    case HTBOTTOM:
+                    case HTTOPLEFT:
+                    case HTTOPRIGHT:
+                    case HTBOTTOMLEFT:
+                    case HTBOTTOMRIGHT:
+                        // 不可缩放：边缘不给"缩放"命中码，改回 HTBORDER（= 有边框但不
+                        // 可缩放）。系统因此既不会进入缩放循环，也不会把鼠标变成缩放光标。
+                        return HTBORDER;
+                    default:
+                        break;
+                }
+            }
+            return hit;
         }
         case WM_DPICHANGED: {
             // 跨显示器（缩放不同）时 Windows 会发这条：我们必须
@@ -1901,8 +1927,15 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             // 纯粹用来唤醒 MsgWaitForMultipleObjectsEx；没有任何副作用。
             return 0;
         case WM_DESTROY: {
+            // ⚠ 这里**不能** PostQuitMessage(0)：那是**整个线程**的退出标志，而一个
+            // 线程上可能有多个 Compose 窗口（每个 WindowsComposeWindow 一个 HWND）。
+            // 关掉第一个窗口就往线程消息队列里塞 WM_QUIT，后面新开的窗口
+            // `PeekMessageW(&msg, nullptr, ...)` 会立刻看到它、0 帧就退出
+            //（v0.5.18 的真机上没人碰到，是自检想开第二个窗口时炸出来的 —— HANDOVER §17.37）。
+            //
+            // 每个窗口自己有 `quit` 标志：设置它，本窗口的消息循环就会退出（见
+            // composekn_win32_pump 里 `if (window->quit) return false;`）。
             if (window) window->quit = true;
-            PostQuitMessage(0);
             return 0;
         }
         case WM_NCCREATE: {
@@ -2569,16 +2602,41 @@ extern "C" bool composekn_win32_is_resizable(ComposeKNWin32Window* window) {
 
 extern "C" void composekn_win32_set_resizable(ComposeKNWin32Window* window, bool resizable) {
     if (window == nullptr || window->hwnd == nullptr) return;
+    if (window->resizable == resizable) return;   // 幂等：别白折腾样式
     window->resizable = resizable;
-    // 最大化按钮也跟着走：不可缩放的窗口不该能被最大化（对齐上游 resizable=false 的语义）。
-    LONG_PTR style = GetWindowLongPtrW(window->hwnd, GWL_STYLE);
-    if (resizable) {
-        style |= WS_MAXIMIZEBOX;
-    } else {
-        style &= ~static_cast<LONG_PTR>(WS_MAXIMIZEBOX);
+
+    // 对齐 AWT/JDK 的 `Window.setResizable(false)`：它也是把 WS_THICKFRAME 和
+    // WS_MAXIMIZEBOX 一起摘掉 —— 只挡命中测试的话，别的缩放途径（Win+方向键、
+    // Aero Snap 之类）仍然能改窗口大小。
+    const LONG_PTR style = GetWindowLongPtrW(window->hwnd, GWL_STYLE);
+    const LONG_PTR newStyle = resizable
+        ? (style | WS_THICKFRAME | WS_MAXIMIZEBOX)
+        : (style & ~static_cast<LONG_PTR>(WS_THICKFRAME | WS_MAXIMIZEBOX));
+    SetWindowLongPtrW(window->hwnd, GWL_STYLE, newStyle);
+
+    // 样式改了，非客户区厚度就变了（WS_THICKFRAME 带着一圈缩放边框）。如果用同一个
+    // **窗口**尺寸，客户区会跟着变 —— 内容会"跳一下"。这里按"保持客户区尺寸"重算窗口
+    // 尺寸，用户只会看到边框变细/变粗，内容纹丝不动。
+    int widthPx = window->width;
+    int heightPx = window->height;
+    if (!window->undecorated) {
+        RECT rect = {0, 0, widthPx, heightPx};
+        const LONG_PTR exStyle = GetWindowLongPtrW(window->hwnd, GWL_EXSTYLE);
+        if (AdjustWindowRectEx(&rect, static_cast<DWORD>(newStyle), FALSE, static_cast<DWORD>(exStyle))) {
+            widthPx = rect.right - rect.left;
+            heightPx = rect.bottom - rect.top;
+        }
     }
-    SetWindowLongPtrW(window->hwnd, GWL_STYLE, style);
-    composeknLog("window: resizable=%d", resizable ? 1 : 0);
+    SetWindowPos(
+        window->hwnd, nullptr, 0, 0, widthPx, heightPx,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+    );
+    composeknLog(
+        "window: resizable=%d（WS_THICKFRAME=%s，窗口 %dx%d 物理 -> 客户区保持 %dx%d）",
+        resizable ? 1 : 0,
+        (newStyle & WS_THICKFRAME) != 0 ? "有" : "无",
+        widthPx, heightPx, window->width, window->height
+    );
 }
 
 extern "C" bool composekn_win32_is_fullscreen(ComposeKNWin32Window* window) {
@@ -2769,6 +2827,45 @@ extern "C" void composekn_win32_primary_work_area(ComposeKNWin32Window* window, 
     out[1] = static_cast<int32_t>(work.top / scale >= 0 ? work.top / scale + 0.5 : work.top / scale - 0.5);
     out[2] = static_cast<int32_t>((work.right - work.left) / scale + 0.5);
     out[3] = static_cast<int32_t>((work.bottom - work.top) / scale + 0.5);
+}
+
+/**
+ * 自检用：直接对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码。
+ *
+ * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心（都是 1~2 物理像素的偏移，
+ * 保证落在缩放边带里）。返回 HTLEFT(10)…HTBORDER(18)、HTCLIENT(1) 等。
+ *
+ * 为什么要有这条：真机反馈"不可缩放之后还能拖边缘改大小"（HANDOVER §17.37）——
+ * 第一版只在 CSD 分支里挡，而 `window` 阶段用的自检窗口是 CSD、demo 是系统标题栏，
+ * 于是**测试看不见这个 bug**。命中码是这个 bug 最直接的观测量。
+ */
+extern "C" int32_t composekn_win32_test_hit_test(ComposeKNWin32Window* window, int32_t where) {
+    if (window == nullptr || window->hwnd == nullptr) return 0;
+    RECT windowRect = {};
+    RECT clientRect = {};
+    if (!GetWindowRect(window->hwnd, &windowRect)) return 0;
+    if (!GetClientRect(window->hwnd, &clientRect)) return 0;
+    POINT pt = {};
+    const LONG midX = (windowRect.left + windowRect.right) / 2;
+    const LONG midY = (windowRect.top + windowRect.bottom) / 2;
+    switch (where) {
+        case 0: pt.x = windowRect.left + 1; pt.y = midY; break;
+        case 1: pt.x = windowRect.right - 2; pt.y = midY; break;
+        case 2: pt.x = midX; pt.y = windowRect.top + 1; break;
+        case 3: pt.x = midX; pt.y = windowRect.bottom - 2; break;
+        default:
+            pt.x = (clientRect.right - clientRect.left) / 2;
+            pt.y = (clientRect.bottom - clientRect.top) / 2;
+            ClientToScreen(window->hwnd, &pt);
+            break;
+    }
+    return static_cast<int32_t>(SendMessageW(window->hwnd, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y)));
+}
+
+/** 自检用：窗口样式里有没有 WS_THICKFRAME（可缩放的标志位）。 */
+extern "C" bool composekn_win32_has_thick_frame(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    return (GetWindowLongPtrW(window->hwnd, GWL_STYLE) & WS_THICKFRAME) != 0;
 }
 
 /** 自检用：读回宿主记的进度状态（没有任务栏时也能验 API 的参数校验/映射）。 */

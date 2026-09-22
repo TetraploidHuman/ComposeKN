@@ -122,8 +122,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
 输出形如：
       SELFTEST ok   : logic/vk-rwin
       ...
-      SELFTEST: RESULT PASS (207 checks, 0 failures)     ← logic / window 各跑一次
-      SELFTEST: RESULT PASS (204 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
+      SELFTEST: RESULT PASS (214 checks, 0 failures)     ← logic / window 各跑一次
+      SELFTEST: RESULT PASS (211 checks, 0 failures)     ← all 一次跑完（性能契约那条自动跳过）
 
   logic  = 纯逻辑 + 离屏渲染断言（键位映射表、消息参数解码、布局/密度、CSD 标题栏、
            滚轮滚动、焦点/光标/选区、**中文输入法组字/提交/候选窗锚点**、弹层与对话框
@@ -148,7 +148,9 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            悬停进出、按压/点击、竖向与横向滚轮、精确滚轮 zDelta=-40、真实点击聚焦文本框、
            真实按键输入字符都必须成立）、
            **窗口 API**：位置/客户区尺寸（dp）、置顶（读 WS_EX_TOPMOST）、全屏
-           （铺满显示器且退出后原样还原）、不可缩放（WM_NCHITTEST 收口 + 最大化被忽略）、
+           （铺满显示器且退出后原样还原）、不可缩放（命中码降级成 HTBORDER +
+           摘掉 WS_THICKFRAME/WS_MAXIMIZEBOX，且客户区尺寸不变；系统标题栏窗口与
+           CSD 窗口**都**验了命中码）、
            工作区居中、任务栏进度（ITaskbarList3；没有任务栏时老实回 false）、
            **富文本剪贴板**：clipboard.setClip(ClipEntry.withHtml/withRtf/withImage)
            -> CF_HTML（标准偏移头，含非 ASCII 片段）/ 注册格式 Rich Text Format /
@@ -161,8 +163,8 @@ exe 内置三层自检，用退出码 0/1 汇报，可以直接在 CI / 脚本�
            派发给 Modifier.dragAndDropTarget（Enter/Over/Drop/Leave、负载、命中位置、
            effect 写回、shouldStartDragAndDrop 的筛选）、
            **性能契约**：静止不空转 / 跨线程刷新能唤醒 /
-           动画按刷新率节流）（89 条）
-  all    = 两者都跑（204 条断言）
+           动画按刷新率节流）（96 条）
+  all    = 两者都跑（211 条断言）
            注意：`all` 是"一个进程里跑完两个阶段"，必须真的有一个显示（第 2 个阶段
            要开窗口）；性能契约那三条在 `all` 模式下**自动跳过**（离屏阶段先跑过之后，
            窗口阶段的"后台写状态 -> 唤醒消息泵"链路在这个进程里不再驱动帧，实测三个

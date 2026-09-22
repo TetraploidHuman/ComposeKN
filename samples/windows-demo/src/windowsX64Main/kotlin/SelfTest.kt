@@ -115,6 +115,7 @@ import org.jetbrains.skia.ColorType
 import org.jetbrains.skia.Image
 import org.jetbrains.skia.ImageInfo
 import org.jetbrains.skiko.ClipboardImage
+import org.jetbrains.skiko.Win32HitTest
 import org.jetbrains.skiko.Win32Message
 
 // =====================================================================
@@ -3102,7 +3103,97 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
     guard.finished = true
     report.check("window/loop-exited", true)
     assertWindowPerfReport(report, perf, guard, perfContractChecks)
+
+    runDecoratedWindowResizeTests(report)
 }
+
+/**
+ * 「不可缩放」在**系统标题栏**窗口上的回归（真机反馈，HANDOVER §17.37）。
+ *
+ * 为什么必须单独来一段：上面那个自检窗口是 `undecorated = true`（CSD），而
+ * **demo 默认是系统标题栏**。第一版只在 CSD 的命中测试分支里挡 resizable=false，
+ * 系统标题栏窗口的 `WM_NCHITTEST` 直接落到 `DefWindowProc`，它按 `WS_THICKFRAME`
+ * 照旧返回 `HTRIGHT`/`HTBOTTOM` → 拖动边缘仍然能改大小。真机撞到之后才补上：
+ *   * 命中测试统一降级（不可缩放时边缘一律回 `HTBORDER`）；
+ *   * `set_resizable` 对齐 AWT/JDK，连 `WS_THICKFRAME` 一起摘掉（并且保持客户区尺寸不变）。
+ *
+ * 这一段就是那个盲区的补丁：**用系统标题栏窗口**验命中码和样式位。
+ */
+private fun runDecoratedWindowResizeTests(report: SelfTestReport) {
+    report.section("window 系统标题栏：不可缩放的命中测试")
+    val app = WindowsComposeApplication(
+        title = "ComposeKN Resize Test", width = 700, height = 500, undecorated = false,
+    )
+    var frame = 0
+    var clientBefore = IntSize.Zero
+    var clientDuringLock = IntSize.Zero
+    app.window.frameHook = { f ->
+        frame = f
+        when (f) {
+            6 -> {
+                // 默认：可缩放 + 有 WS_THICKFRAME + 右边缘命中是"缩放"
+                val hit = app.window.testHitTest(HIT_RIGHT_EDGE)
+                report.check(
+                    "window/winapi-decorated-hit-test-resize",
+                    app.window.hasThickFrame && Win32HitTest.isResizeHit(hit),
+                    "默认：WS_THICKFRAME=${app.window.hasThickFrame} 右边缘命中码=$hit" +
+                        "（期望缩放码，HTRIGHT=${Win32HitTest.RIGHT}）",
+                )
+                clientBefore = app.window.windowSize
+                app.window.resizable = false
+            }
+            10 -> {
+                val hit = app.window.testHitTest(HIT_RIGHT_EDGE)
+                clientDuringLock = app.window.windowSize
+                report.check(
+                    "window/winapi-decorated-hit-test-locked",
+                    !Win32HitTest.isResizeHit(hit),
+                    "不可缩放：右边缘命中码=$hit（期望不是缩放码；HTBORDER=" +
+                        "${Win32HitTest.BORDER}）—— 真机上「拖边缘还能改大小」就是这个码没降级",
+                )
+                report.check(
+                    "window/winapi-decorated-thick-frame-removed",
+                    !app.window.hasThickFrame,
+                    "不可缩放：WS_THICKFRAME=${app.window.hasThickFrame}（期望 false，对齐 AWT/JDK）",
+                )
+                // 去掉缩放边框后**客户区不能跳**：内容尺寸必须原样
+                report.check(
+                    "window/winapi-decorated-client-size-kept",
+                    clientBefore == clientDuringLock && clientDuringLock.width > 0,
+                    "切换前客户区=$clientBefore 切换后=$clientDuringLock（期望相同）",
+                )
+                // 客户区中心仍然必须是 HTCLIENT（别把整个窗口都变成边框）
+                val centerHit = app.window.testHitTest(HIT_CLIENT_CENTER)
+                report.check(
+                    "window/winapi-decorated-center-still-client",
+                    centerHit == Win32HitTest.CLIENT,
+                    "客户区中心命中码=$centerHit（期望 HTCLIENT=${Win32HitTest.CLIENT}）",
+                )
+                app.window.resizable = true
+            }
+            14 -> {
+                val restored = app.window.testHitTest(HIT_RIGHT_EDGE)
+                report.check(
+                    "window/winapi-decorated-resize-restored",
+                    app.window.hasThickFrame && Win32HitTest.isResizeHit(restored),
+                    "改回可缩放：WS_THICKFRAME=${app.window.hasThickFrame} 右边缘命中码=$restored",
+                )
+                app.window.requestClose()
+            }
+        }
+        if (frame > 30) app.window.requestClose()
+        app.window.layer.needRender()
+    }
+    app.run {
+        Box(Modifier.fillMaxSize().background(Color(0xFF202020)))
+    }
+    report.check("window/winapi-decorated-loop-exited", true)
+}
+
+/** [WindowsComposeWindow.testHitTest] 的 where 取值（和服务端/C 侧的约定一致）。 */
+private const val HIT_LEFT_EDGE = 0
+private const val HIT_RIGHT_EDGE = 1
+private const val HIT_CLIENT_CENTER = 4
 
 // ---------------------------------------------------------------------
 // 性能自检（按需渲染 + 帧节流）

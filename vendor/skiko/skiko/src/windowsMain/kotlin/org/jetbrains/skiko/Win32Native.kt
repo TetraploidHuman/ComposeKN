@@ -147,6 +147,12 @@ internal external fun composekn_win32_is_always_on_top(window: COpaquePointer?):
 @SymbolName("composekn_win32_set_always_on_top")
 internal external fun composekn_win32_set_always_on_top(window: COpaquePointer?, onTop: Boolean)
 
+@SymbolName("composekn_win32_test_hit_test")
+internal external fun composekn_win32_test_hit_test(window: COpaquePointer?, where: Int): Int
+
+@SymbolName("composekn_win32_has_thick_frame")
+internal external fun composekn_win32_has_thick_frame(window: COpaquePointer?): Boolean
+
 @SymbolName("composekn_win32_is_resizable")
 internal external fun composekn_win32_is_resizable(window: COpaquePointer?): Boolean
 
@@ -588,9 +594,19 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     /** 置顶/取消置顶（`SetWindowPos` 的 `HWND_TOPMOST`/`HWND_NOTOPMOST`）。 */
     fun setAlwaysOnTop(onTop: Boolean) = composekn_win32_set_always_on_top(native, onTop)
 
-    /** 能不能拖边框改大小（false 时 `WM_NCHITTEST` 不再返回边缘命中码）。 */
+    /** 能不能拖边框改大小（false 时 `WM_NCHITTEST` 不再返回边缘命中码，且去掉 `WS_THICKFRAME`）。 */
     val resizable: Boolean get() = composekn_win32_is_resizable(native)
     fun setResizable(resizable: Boolean) = composekn_win32_set_resizable(native, resizable)
+
+    /** 窗口样式里有没有 `WS_THICKFRAME`（可缩放的标志位）；自检用。 */
+    val hasThickFrame: Boolean get() = composekn_win32_has_thick_frame(native)
+
+    /**
+     * 自检用：对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码。
+     *
+     * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心。命中码见 [Win32HitTest]。
+     */
+    fun testHitTest(where: Int): Int = composekn_win32_test_hit_test(native, where)
 
     /** 是否在无边框全屏（铺满窗口所在显示器）。 */
     val isFullscreen: Boolean get() = composekn_win32_is_fullscreen(native)
@@ -896,6 +912,28 @@ private const val CLIPBOARD_PROBE_SIZE = 64 * 1024
 /** `value == null` 时传 null 指针给 C；否则临时 NUL 结尾并把指针交出去。 */
 private inline fun <R> useCStringOrNull(value: String?, block: (CPointer<ByteVar>?) -> R): R =
     if (value == null) block(null) else value.useCString(block)
+
+/**
+ * Win32 的命中测试码（`WM_NCHITTEST` 的返回值）。
+ *
+ * 只放自检真的会用到的那些；数值是 Windows ABI 里固定的常量。
+ */
+object Win32HitTest {
+    const val CLIENT = 1
+    const val CAPTION = 2
+    const val LEFT = 10
+    const val RIGHT = 11
+    const val TOP = 12
+    const val TOPLEFT = 13
+    const val TOPRIGHT = 14
+    const val BOTTOM = 15
+    const val BOTTOMLEFT = 16
+    const val BOTTOMRIGHT = 17
+    const val BORDER = 18
+
+    /** 这个命中码是不是"缩放窗口边缘"。 */
+    fun isResizeHit(hit: Int): Boolean = hit in LEFT..BOTTOMRIGHT
+}
 
 /** 拖放负载缓冲区大小（一次拖进来的路径列表/文本长度上限）。 */
 private const val DRAG_PAYLOAD_BUFFER_SIZE = 8192

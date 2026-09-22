@@ -7,6 +7,7 @@ import org.jetbrains.skiko.Win32Event
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import org.jetbrains.skiko.ClipboardImage
+import org.jetbrains.skiko.Win32HitTest
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.flushMainUIDispatcher
 import org.jetbrains.skiko.win32Log
@@ -447,6 +448,16 @@ class WindowsComposeWindow(
             field = value
             win32Window?.setResizable(value)
         }
+
+    /** 自检用：窗口样式里有没有 `WS_THICKFRAME`（可缩放的标志位）。 */
+    val hasThickFrame: Boolean get() = win32Window?.hasThickFrame ?: false
+
+    /**
+     * 自检用：对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码（见 [Win32HitTest]）。
+     *
+     * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心。
+     */
+    fun testHitTest(where: Int): Int = win32Window?.testHitTest(where) ?: 0
 
     /** 是否在无边框全屏（铺满窗口所在显示器）。 */
     val isFullscreen: Boolean get() = win32Window?.isFullscreen ?: false
