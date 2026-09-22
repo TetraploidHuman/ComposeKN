@@ -83,6 +83,8 @@ struct ComposeKNWindow {
     bool configured = false;
     bool egl_ready = false;
     bool close_requested = false;
+    /** True until Kotlin [consume_close_requested] fires onCloseRequest once (DO_NOTHING). */
+    bool close_event_pending = false;
     bool resized = false;
     bool maximized = false;
     uint32_t configure_serial = 0;
@@ -125,8 +127,18 @@ struct ComposeKNWindow {
 
 static ComposeKNWindow* g_primary_window = nullptr;
 
+/** Prefer the caller's window pointer; fall back to primary (clipboard / legacy single-window). */
 static ComposeKNWindow* resolve_window(ComposeKNWindow* window) {
-    return g_primary_window != nullptr ? g_primary_window : window;
+    return window != nullptr ? window : g_primary_window;
+}
+
+/** Desktop DO_NOTHING_ON_CLOSE: mark close + pending notify; do not tear down the surface. */
+static void mark_close_requested(ComposeKNWindow* window) {
+    if (window == nullptr) {
+        return;
+    }
+    window->close_requested = true;
+    window->close_event_pending = true;
 }
 
 static void ensure_data_device(ComposeKNWindow* window);
@@ -308,7 +320,8 @@ static void xdg_toplevel_configure(
 static void xdg_toplevel_close(void* data, xdg_toplevel* toplevel) {
     (void)toplevel;
     auto* window = static_cast<ComposeKNWindow*>(data);
-    window->close_requested = true;
+    // DO_NOTHING：只通知 Kotlin onCloseRequest，不销毁 surface（对齐 Win32 WM_CLOSE）。
+    mark_close_requested(window);
 }
 
 static void xdg_toplevel_configure_bounds(
@@ -1283,7 +1296,7 @@ static void try_init_egl_if_needed(ComposeKNWindow* window) {
     }
     if (!init_egl(window)) {
         std::fprintf(stderr, "composekn: EGL init failed after configure\n");
-        window->close_requested = true;
+        mark_close_requested(window);
         return;
     }
     window->egl_ready = true;
@@ -1461,9 +1474,11 @@ extern "C" void composekn_window_destroy(ComposeKNWindow* window) {
 
 extern "C" bool composekn_window_poll(ComposeKNWindow* window) {
     ComposeKNWindow* w = resolve_window(window);
-    if (w == nullptr || w->close_requested) {
+    if (w == nullptr) {
         return false;
     }
+    // DO_NOTHING：close_requested 后仍继续派发 Wayland 事件，直到 destroy。
+    // 关窗通知走 composekn_window_consume_close_requested，不靠 poll 返回 false。
 
     w->in_dispatch = true;
 
@@ -1488,7 +1503,7 @@ extern "C" bool composekn_window_poll(ComposeKNWindow* window) {
     w->in_dispatch = false;
     composekn_flush_deferred_frame(w);
     composekn_process_deferred_selection(w);
-    return !w->close_requested;
+    return true;
 }
 
 extern "C" bool composekn_window_pop_event(ComposeKNWindow* window, ComposeKNEvent* out) {
@@ -1716,10 +1731,29 @@ extern "C" bool composekn_window_is_maximized(ComposeKNWindow* window) {
 
 extern "C" void composekn_window_request_close(ComposeKNWindow* window) {
     window = resolve_window(window);
-    if (window == nullptr) {
+    mark_close_requested(window);
+}
+
+extern "C" bool composekn_window_is_close_requested(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    return window != nullptr && window->close_requested;
+}
+
+extern "C" bool composekn_window_consume_close_requested(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    if (window == nullptr || !window->close_event_pending) {
+        return false;
+    }
+    window->close_event_pending = false;
+    return true;
+}
+
+extern "C" void composekn_window_set_title(ComposeKNWindow* window, const char* title) {
+    window = resolve_window(window);
+    if (window == nullptr || window->toplevel == nullptr) {
         return;
     }
-    window->close_requested = true;
+    xdg_toplevel_set_title(window->toplevel, title != nullptr ? title : "");
 }
 
 extern "C" void composekn_window_begin_move(ComposeKNWindow* window) {

@@ -55,6 +55,10 @@ data class ComposeNativeWindowCreateParams(
     val undecorated: Boolean = false,
     val resizable: Boolean = true,
     val alwaysOnTop: Boolean = false,
+    /**
+     * true = [DialogWindow]：宿主可对非对话框窗做软模态（禁用输入）。
+     */
+    val isDialog: Boolean = false,
     val onCloseRequest: () -> Unit = {},
 )
 
@@ -93,8 +97,9 @@ object ComposeNativeWindowBackendRegistry {
     fun requireBackend(): ComposeNativeWindowBackend =
         backend
             ?: error(
-                "ComposeNativeWindowBackend 未注册。Windows 上请在 main 里调用 " +
-                    "com.composekn.windows.registerComposeKnWindowsBackend()，" +
-                    "或先构造 WindowsComposeApplication（其 init 会自动登记）。",
+                "ComposeNativeWindowBackend 未注册。请在 main 里调用平台登记函数：" +
+                    "Windows → com.composekn.windows.registerComposeKnWindowsBackend()；" +
+                    "Linux/Wayland → com.composekn.linux.registerComposeKnLinuxBackend()。" +
+                    "（构造 WindowsComposeApplication / LinuxComposeApplication 时也会自动登记。）",
             )
 }

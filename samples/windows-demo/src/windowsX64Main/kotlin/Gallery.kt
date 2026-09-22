@@ -216,6 +216,8 @@ fun ComponentGallery(
     animate: Boolean = true,
     /** 打开第二扇窗（application { if (open2) Window(...) }）。 */
     onOpenSecondWindow: (() -> Unit)? = null,
+    /** 打开 DialogWindow（软模态对话框）。 */
+    onOpenDialogWindow: (() -> Unit)? = null,
 ) {
     probe.galleryComposes++
     MaterialTheme(
@@ -264,7 +266,7 @@ fun ComponentGallery(
 
             LazyColumn(state = outerState, modifier = Modifier.fillMaxSize()) {
                 item { DiagnosticsHud(probe, window) }
-                gallerySections(probe, animate, innerState, window, onOpenSecondWindow)
+                gallerySections(probe, animate, innerState, window, onOpenSecondWindow, onOpenDialogWindow)
                 item { Spacer(Modifier.height(24.dp)) }
             }
         }
@@ -307,6 +309,7 @@ private fun LazyListScope.gallerySections(
     innerState: LazyListState,
     window: WindowsComposeWindow,
     onOpenSecondWindow: (() -> Unit)?,
+    onOpenDialogWindow: (() -> Unit)?,
 ) {
     section("按钮 / Buttons") {
         Row(
@@ -342,14 +345,22 @@ private fun LazyListScope.gallerySections(
         }
     }
 
-    if (onOpenSecondWindow != null) {
+    if (onOpenSecondWindow != null || onOpenDialogWindow != null) {
         section("多窗口 / Multi-window") {
-            Button(onClick = onOpenSecondWindow) {
-                Text("打开第二扇窗")
+            if (onOpenSecondWindow != null) {
+                Button(onClick = onOpenSecondWindow) {
+                    Text("打开第二扇窗")
+                }
+            }
+            if (onOpenDialogWindow != null) {
+                Button(onClick = onOpenDialogWindow) {
+                    Text("打开 DialogWindow")
+                }
             }
             Text(
-                "Desktop 对齐：application { if (open2) Window(onCloseRequest={ open2=false }) }。" +
-                    "关第二扇只拆那一扇；关主窗 exitApplication 退整应用。",
+                "Desktop 对齐：application { if (open) Window/DialogWindow(...) }。" +
+                    "关副窗/对话框只拆那一扇；DialogWindow 打开时会软禁用其它窗输入；" +
+                    "关主窗 exitApplication 退整应用。",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
@@ -1140,11 +1151,37 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.25：剪贴板 withFiles / 拖放发出 / application{Window} + WindowState 双向同步",
+                    "v0.5.26：DialogWindow + WindowState 双向同步 / 每窗 WGL / application{}",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {
                     Text("关闭本窗")
+                }
+            }
+        }
+    }
+}
+
+
+/**
+ * DialogWindow 内容（软模态：打开时主窗输入被 EnableWindow 禁用）。
+ */
+@Composable
+fun DialogWindowContent(onClose: () -> Unit) {
+    MaterialTheme {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("DialogWindow", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "对齐 Desktop：独立顶层窗 + DocumentModal 软模态。" +
+                        "打开期间其它窗不可点；关闭后恢复。",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Button(onClick = onClose) {
+                    Text("关闭对话框")
                 }
             }
         }

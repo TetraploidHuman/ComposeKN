@@ -67,6 +67,7 @@ object WindowsApplicationHost {
         lastActiveSession = window
         refreshWakeHandler()
         refreshImeProviders()
+        refreshDialogModality()
         win32Log("host: register window count=${sessions.size}")
     }
 
@@ -81,7 +82,20 @@ object WindowsApplicationHost {
         }
         refreshWakeHandler()
         refreshImeProviders()
+        refreshDialogModality()
         win32Log("host: unregister window count=${sessions.size}")
+    }
+
+    /**
+     * Desktop DocumentModal 子集：有任一 DialogWindow 时，禁用其它窗的输入
+     *（`EnableWindow(FALSE)`），对话框本身保持可点。
+     */
+    fun refreshDialogModality() {
+        val hasDialog = sessions.any { it.isDialogWindow }
+        for (session in sessions) {
+            val enabled = !hasDialog || session.isDialogWindow
+            session.setEnabled(enabled)
+        }
     }
 
     /**

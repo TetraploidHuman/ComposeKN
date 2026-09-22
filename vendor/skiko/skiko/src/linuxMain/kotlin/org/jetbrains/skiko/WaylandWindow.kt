@@ -30,7 +30,28 @@ class WaylandWindow(
     /** Returns true once after the compositor changed the surface size. */
     fun consumeResized(): Boolean = composekn_window_consume_resized(native)
 
-    /** Process Wayland events and dispatch input/frame/IME callbacks. Returns false when closing. */
+    /**
+     * True after compositor/app requested close; surface stays alive until [destroy]
+     * (Desktop DO_NOTHING_ON_CLOSE).
+     */
+    fun isCloseRequested(): Boolean = composekn_window_is_close_requested(native)
+
+    /**
+     * Returns true once per close request so the host can fire onCloseRequest
+     * without destroying. Clears the pending-notify flag.
+     */
+    fun consumeCloseRequested(): Boolean = composekn_window_consume_close_requested(native)
+
+    /** Update xdg_toplevel title. */
+    fun setTitle(title: String) = memScoped {
+        composekn_window_set_title(native, title.cstr.ptr)
+    }
+
+    /**
+     * Process Wayland events and dispatch input/frame/IME callbacks.
+     * Returns false only on display failure. Close requests do not stop polling —
+     * use [consumeCloseRequested] for Desktop DO_NOTHING semantics.
+     */
     fun poll(): Boolean {
         if (!composekn_window_poll(native)) {
             return false

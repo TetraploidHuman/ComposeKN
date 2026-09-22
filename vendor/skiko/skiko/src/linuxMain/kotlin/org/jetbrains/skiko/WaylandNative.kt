@@ -134,6 +134,15 @@ internal external fun composekn_window_is_maximized(window: COpaquePointer): Boo
 @SymbolName("composekn_window_request_close")
 internal external fun composekn_window_request_close(window: COpaquePointer)
 
+@SymbolName("composekn_window_is_close_requested")
+internal external fun composekn_window_is_close_requested(window: COpaquePointer): Boolean
+
+@SymbolName("composekn_window_consume_close_requested")
+internal external fun composekn_window_consume_close_requested(window: COpaquePointer): Boolean
+
+@SymbolName("composekn_window_set_title")
+internal external fun composekn_window_set_title(window: COpaquePointer, title: CPointer<ByteVar>)
+
 @SymbolName("composekn_window_begin_move")
 internal external fun composekn_window_begin_move(window: COpaquePointer)
 

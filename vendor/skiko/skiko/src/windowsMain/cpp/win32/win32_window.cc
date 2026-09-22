@@ -2631,6 +2631,16 @@ extern "C" void composekn_win32_set_always_on_top(ComposeKNWin32Window* window, 
     composeknLog("window: alwaysOnTop=%d", on_top ? 1 : 0);
 }
 
+extern "C" void composekn_win32_set_enabled(ComposeKNWin32Window* window, bool enabled) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    EnableWindow(window->hwnd, enabled ? TRUE : FALSE);
+}
+
+extern "C" bool composekn_win32_is_enabled(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    return IsWindowEnabled(window->hwnd) != FALSE;
+}
+
 extern "C" bool composekn_win32_is_resizable(ComposeKNWin32Window* window) {
     return window != nullptr && window->resizable;
 }

@@ -20,3 +20,9 @@ interface WindowScope {
  */
 @Stable
 interface FrameWindowScope : WindowScope
+
+/**
+ * Receiver scope for [DialogWindow] content.
+ */
+@Stable
+interface DialogWindowScope : WindowScope

@@ -82,10 +82,12 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.window.DialogWindow
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.rememberDialogState
 import androidx.compose.ui.window.rememberWindowState
 import com.composekn.windows.MouseButton
 import com.composekn.windows.TaskbarProgressState
@@ -3245,19 +3247,22 @@ private fun runConcurrentWindowTests(report: SelfTestReport) {
  * （改 WindowState.size 后客户区跟上），避免拖动回写后 SideEffect 再把窗拽回去。
  */
 private fun runApplicationApiSelfTest(report: SelfTestReport) {
-    report.section("application{} 声明式入口保活 + 双窗 GL + WindowState 同步")
+    report.section("application{} 声明式入口保活 + 双窗 GL + WindowState 同步 + DialogWindow")
     com.composekn.windows.registerComposeKnWindowsBackend()
 
     var frames = 0
     var framesSecond = 0
+    var framesDialog = 0
     var reachedExit = false
     var nativeToStateOk = false
     var stateToNativeOk = false
+    var dialogFramesOk = false
+    var dialogModalityOk = false
     var exitApp: (() -> Unit)? = null
 
     val guard = WindowPhaseGuard()
     CoroutineScope(Dispatchers.Default).launch {
-        delay(30_000)
+        delay(45_000)
         if (!guard.finished) {
             guard.timedOut = true
             winlog("application-api: TIMEOUT — calling exitApplication")
@@ -3270,6 +3275,7 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
             val exit = ::exitApplication
             exitApp = exit
             var openSecond by mutableStateOf(true)
+            var openDialog by mutableStateOf(false)
             val mainState = rememberWindowState(width = 400.dp, height = 300.dp)
 
             Window(
@@ -3323,9 +3329,50 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
                         )
                     }
 
+                    // DialogWindow：能出帧 + 软模态禁用主窗
+                    openDialog = true
+                    waited = 0
+                    while (framesDialog < 6 && waited < 120) {
+                        withFrameNanos { waited++ }
+                    }
+                    dialogFramesOk = framesDialog >= 6
+                    val mainEnabledWhileDialog =
+                        (window as? WindowsNativeWindowHandle)
+                            ?.composeWindow
+                            ?.nativeWindow
+                            ?.isEnabled
+                    dialogModalityOk = mainEnabledWhileDialog == false
+                    winlog(
+                        "application-api: dialogFrames=$framesDialog " +
+                            "mainEnabled=$mainEnabledWhileDialog modalityOk=$dialogModalityOk",
+                    )
+                    openDialog = false
+                    waited = 0
+                    while (openDialog && waited < 30) {
+                        withFrameNanos { waited++ }
+                    }
+                    // 关对话框后主窗应恢复可点
+                    waited = 0
+                    var restored = false
+                    while (waited < 60) {
+                        withFrameNanos { waited++ }
+                        if ((window as? WindowsNativeWindowHandle)
+                                ?.composeWindow
+                                ?.nativeWindow
+                                ?.isEnabled == true
+                        ) {
+                            restored = true
+                            break
+                        }
+                    }
+                    if (!restored) {
+                        dialogModalityOk = false
+                    }
+
                     reachedExit = true
                     winlog(
-                        "application-api: mainFrames=$frames secondFrames=$framesSecond — exitApplication",
+                        "application-api: mainFrames=$frames secondFrames=$framesSecond " +
+                            "dialogFrames=$framesDialog — exitApplication",
                     )
                     exit()
                 }
@@ -3345,6 +3392,22 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
                         }
                     }
                     Text("second frames=$framesSecond")
+                }
+            }
+
+            if (openDialog) {
+                DialogWindow(
+                    onCloseRequest = { openDialog = false },
+                    state = rememberDialogState(width = 300.dp, height = 200.dp),
+                    title = "Selftest-dialog",
+                    undecorated = true,
+                ) {
+                    LaunchedEffect(Unit) {
+                        while (true) {
+                            withFrameNanos { framesDialog++ }
+                        }
+                    }
+                    Text("dialog frames=$framesDialog")
                 }
             }
         }
@@ -3376,6 +3439,16 @@ private fun runApplicationApiSelfTest(report: SelfTestReport) {
         "application-api/state-to-native",
         stateToNativeOk,
         "客户区未跟上 WindowState.size=480x360",
+    )
+    report.check(
+        "application-api/dialog-frames",
+        dialogFramesOk,
+        "dialogFrames=$framesDialog (need >=6)",
+    )
+    report.check(
+        "application-api/dialog-modality",
+        dialogModalityOk,
+        "DialogWindow 打开时主窗应 EnableWindow(FALSE)，关闭后恢复",
     )
     report.check("application-api/reached-exit", reachedExit)
     report.check(

@@ -10,8 +10,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogWindow
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.rememberDialogState
 import androidx.compose.ui.window.rememberWindowState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +61,7 @@ fun main(args: Array<String>) {
     application {
         val probe = remember { GalleryProbe() }
         var openSecond by remember { mutableStateOf(false) }
+        var openDialog by remember { mutableStateOf(false) }
         val mainState = rememberWindowState(size = DpSize(1100.dp, 760.dp))
 
         val cores = win32ProcessorCount
@@ -165,6 +168,7 @@ fun main(args: Array<String>) {
                     window = win,
                     animate = animate,
                     onOpenSecondWindow = { openSecond = true },
+                    onOpenDialogWindow = { openDialog = true },
                 )
             }
         }
@@ -176,6 +180,16 @@ fun main(args: Array<String>) {
                 title = "ComposeKN · 第二扇窗",
             ) {
                 SecondWindowContent(onClose = { openSecond = false })
+            }
+        }
+
+        if (openDialog) {
+            DialogWindow(
+                onCloseRequest = { openDialog = false },
+                state = rememberDialogState(width = 420.dp, height = 280.dp),
+                title = "ComposeKN · DialogWindow",
+            ) {
+                DialogWindowContent(onClose = { openDialog = false })
             }
         }
     }

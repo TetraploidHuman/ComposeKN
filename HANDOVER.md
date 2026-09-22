@@ -3710,10 +3710,11 @@ COMPOSEKN_SELFTEST=window   # / all / logic
 
 #### 已知缺口
 
-* Wayland / linux 尚未登记 `ComposeNativeWindowBackend`（调用 `application{}` 会明确报错）。
-* 无 Tray / MenuBar / DialogWindow；`WindowPosition.Aligned` 目前只做居中。
-* 声明式路径下 state→原生窗的双向同步（拖动改 size 写回 WindowState）仍是单向为主。
+* ~~Wayland / linux 尚未登记 `ComposeNativeWindowBackend`~~ → v0.5.26 已登记（见上）。
+* 无 Tray / MenuBar；`WindowPosition.Aligned` 目前只做居中。
+* ~~声明式路径下 state→原生窗的双向同步~~ → v0.5.25 已双向。
 * 拖出自定义装饰图 / MOVE 语义未做。
+* Linux v1：每窗独立 display、无 eventfd wake、Dialog 软模态 / applySize 未齐。
 
 #### 启动崩溃修复（v0.5.21）
 
@@ -3777,3 +3778,13 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
 * SideEffect 仅当 `state != appliedState` 时才 `applySize` / `applyPosition` /
   `applyPlacement`
 * 自检 `application-api/native-to-state` + `application-api/state-to-native`
+
+#### DialogWindow + Linux application{}（v0.5.26）
+
+* **DialogWindow / DialogState**：独立顶层窗（对齐 Desktop）；`isDialog=true` 时
+  Win32 软模态（`EnableWindow` 禁用其它窗）；画廊按钮 + 自检
+  `application-api/dialog-frames` / `dialog-modality`
+* **Linux/Wayland**：`registerComposeKnLinuxBackend()` + `LinuxApplicationHost` 共享泵；
+  关窗 DO_NOTHING（`consume_close_requested`）；wayland-demo 改走
+  `application { Window }`。v1 缺口：每窗独立 `wl_display`、无 eventfd wake、
+  无软模态 / applySize / 绝对定位

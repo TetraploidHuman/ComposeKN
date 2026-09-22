@@ -53,7 +53,12 @@ typedef struct ComposeKNEvent {
 ComposeKNWindow* composekn_window_create(const char* title, int width, int height);
 void composekn_window_destroy(ComposeKNWindow* window);
 
-/** Process pending Wayland events. Returns false when the window should close. */
+/**
+ * Process pending Wayland events.
+ * Returns false only on display/read failure or null window.
+ * Close requests do NOT stop polling (Desktop DO_NOTHING); use
+ * composekn_window_consume_close_requested / is_close_requested instead.
+ */
 bool composekn_window_poll(ComposeKNWindow* window);
 
 /** Pop the next input/resize/frame event, if any. Returns false when the queue is empty. */
@@ -113,6 +118,19 @@ void composekn_window_minimize(ComposeKNWindow* window);
 void composekn_window_toggle_maximized(ComposeKNWindow* window);
 bool composekn_window_is_maximized(ComposeKNWindow* window);
 void composekn_window_request_close(ComposeKNWindow* window);
+
+/** True after compositor/app requested close (surface still alive until destroy). */
+bool composekn_window_is_close_requested(ComposeKNWindow* window);
+
+/**
+ * Returns true once per close request so Kotlin can fire onCloseRequest
+ * without destroying (Desktop DO_NOTHING_ON_CLOSE). Clears the pending-notify flag.
+ */
+bool composekn_window_consume_close_requested(ComposeKNWindow* window);
+
+/** Update xdg_toplevel title (UTF-8). */
+void composekn_window_set_title(ComposeKNWindow* window, const char* title);
+
 void composekn_window_begin_move(ComposeKNWindow* window);
 void composekn_window_begin_resize(ComposeKNWindow* window, uint32_t edges);
 

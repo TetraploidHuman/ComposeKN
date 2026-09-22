@@ -132,6 +132,23 @@ class WindowsComposeWindow(
      */
     internal var onGeometryHint: (() -> Unit)? = null
 
+    /**
+     * true = 本窗是 [androidx.compose.ui.window.DialogWindow]；Host 据此做软模态。
+     */
+    internal var isDialogWindow: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (isHostAttached) {
+                WindowsApplicationHost.refreshDialogModality()
+            }
+        }
+
+    /** 启用/禁用 HWND 输入（软模态）。 */
+    fun setEnabled(enabled: Boolean) {
+        win32Window?.setEnabled(enabled)
+    }
+
     /** 是否已挂到 [WindowsApplicationHost]（共享泵）；与独占 [run] 互斥。 */
     var isHostAttached: Boolean = false
         private set

@@ -151,6 +151,12 @@ internal external fun composekn_win32_is_always_on_top(window: COpaquePointer?):
 @SymbolName("composekn_win32_set_always_on_top")
 internal external fun composekn_win32_set_always_on_top(window: COpaquePointer?, onTop: Boolean)
 
+@SymbolName("composekn_win32_set_enabled")
+internal external fun composekn_win32_set_enabled(window: COpaquePointer?, enabled: Boolean)
+
+@SymbolName("composekn_win32_is_enabled")
+internal external fun composekn_win32_is_enabled(window: COpaquePointer?): Boolean
+
 @SymbolName("composekn_win32_test_hit_test")
 internal external fun composekn_win32_test_hit_test(window: COpaquePointer?, where: Int): Int
 
@@ -620,6 +626,10 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
     /** 置顶/取消置顶（`SetWindowPos` 的 `HWND_TOPMOST`/`HWND_NOTOPMOST`）。 */
     fun setAlwaysOnTop(onTop: Boolean) = composekn_win32_set_always_on_top(native, onTop)
+
+    /** 启用/禁用输入（对话框软模态：`EnableWindow`）。 */
+    fun setEnabled(enabled: Boolean) = composekn_win32_set_enabled(native, enabled)
+    val isEnabled: Boolean get() = composekn_win32_is_enabled(native)
 
     /** 能不能拖边框改大小（false 时 `WM_NCHITTEST` 不再返回边缘命中码，且去掉 `WS_THICKFRAME`）。 */
     val resizable: Boolean get() = composekn_win32_is_resizable(native)
