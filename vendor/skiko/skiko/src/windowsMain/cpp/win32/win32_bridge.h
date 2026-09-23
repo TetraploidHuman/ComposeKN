@@ -456,12 +456,23 @@ bool composekn_win32_set_taskbar_progress(
 void composekn_win32_taskbar_progress_state(
     ComposeKNWin32Window* window, int32_t* state, double* completed);
 
-/** ShowWindow wrapper: cmd 3=SW_MAXIMIZE 6=SW_MINIMIZE 9=SW_RESTORE 5=SW_SHOW */
+/** ShowWindow wrapper: cmd 0=SW_HIDE 3=SW_MAXIMIZE 6=SW_MINIMIZE 9=SW_RESTORE 5=SW_SHOW */
 void composekn_win32_show(ComposeKNWin32Window* window, int cmd);
 bool composekn_win32_is_maximized(ComposeKNWin32Window* window);
 bool composekn_win32_is_minimized(ComposeKNWin32Window* window);
 void composekn_win32_request_close(ComposeKNWin32Window* window);
 void composekn_win32_set_title(ComposeKNWin32Window* window, const char* title);
+
+/**
+ * 系统 ClearType / 字体平滑对应的 SkPixelGeometry 序号：
+ *   0 = UNKNOWN（未开平滑 / 非 ClearType）
+ *   1 = RGB_H
+ *   2 = BGR_H
+ *   3 = RGB_V
+ *   4 = BGR_V
+ * （与 org.jetbrains.skia.PixelGeometry 枚举序一致）
+ */
+int32_t composekn_win32_pixel_geometry(void);
 
 void composekn_win32_clipboard_get_text(ComposeKNWin32Window* window, char* buffer, size_t buffer_size, bool* ok);
 void composekn_win32_clipboard_set_text(ComposeKNWin32Window* window, const char* text);

@@ -3828,3 +3828,18 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
 * **异常落盘**：共享泵 `drain`/`tick`、`renderFrame`、菜单 `onClick`、IME 三个
   provider 全部 try/catch 写 `composekn-startup.log`（再出现 0x20474343 前能看到
   具体 `EXCEPTION Class: message` + 栈）
+#### ClearType 字体锯齿 + 关窗 Check failed（v0.5.29）
+
+真机截图：中文笔画「断成点/锯齿」；关窗日志
+`render: EXCEPTION IllegalStateException: Check failed`（栈在
+`SingleComposeSceneRenderingScope`）。
+
+根因：
+
+1. **字体**：`SkiaLayer.pixelGeometry` 写死 `UNKNOWN`，Compose 又关掉了
+   `SubpixelAntiAlias`；DirectWrite 仍可能出 ClearType 子像素位图，被当成灰度解读
+   → 笔画碎裂。现改为读 `SPI_GETFONTSMOOTHING*` → `RGB_H`/`BGR_H`，并恢复
+   Windows 默认 `FontSmoothing.SubpixelAntiAlias`。
+2. **关窗**：`composekn_win32_show` 在 `SW_HIDE` 后仍 `InvalidateRect`，叠加
+   Hide→`WM_SIZE`→`fireRenderTick` 嵌套进 `render`；现 Hide 不再 Invalidate，
+   `detach` 先拆 redrawer 再 Hide，嵌套 render 改为直接 return。

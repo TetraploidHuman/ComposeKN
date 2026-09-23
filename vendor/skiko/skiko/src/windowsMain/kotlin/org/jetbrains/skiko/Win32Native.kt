@@ -69,6 +69,13 @@ internal external fun composekn_win32_wake(window: COpaquePointer?)
 internal external fun composekn_win32_refresh_hz(window: COpaquePointer?): Int
 
 /**
+ * 系统 ClearType 对应的 [org.jetbrains.skia.PixelGeometry] 序号（0=UNKNOWN … 4=BGR_V）。
+ * 见 C 侧 `composekn_win32_pixel_geometry`。
+ */
+@SymbolName("composekn_win32_pixel_geometry")
+internal external fun composekn_win32_pixel_geometry(): Int
+
+/**
  * 后备缓冲像素指针（C 侧持有，紧密 BGRA）：Skia 直接画进这块内存，present 时
  * GDI 从同一块内存上传 —— 零拷贝。见 WindowsSoftwareContextHandler。
  *

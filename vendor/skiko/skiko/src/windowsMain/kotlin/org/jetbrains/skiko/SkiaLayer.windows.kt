@@ -188,7 +188,8 @@ actual open class SkiaLayer {
         picture?.let { canvas.drawPicture(it.instance) }
     }
 
-    actual val pixelGeometry: PixelGeometry = PixelGeometry.UNKNOWN
+    actual val pixelGeometry: PixelGeometry
+        get() = windowsPixelGeometry()
 
     internal fun inDrawScope(block: LayerDrawScope.() -> Unit) {
         val window = win32Window ?: return
@@ -209,6 +210,19 @@ actual open class SkiaLayer {
         redrawer?.renderImmediately()
     }
 }
+
+/**
+ * 缓存一次系统 ClearType 几何，避免每帧 SPI。用户改系统设置需重启进程才刷新 ——
+ * 与绝大多数桌面应用一致。
+ */
+private val cachedWindowsPixelGeometry: PixelGeometry by lazy {
+    val ordinal = composekn_win32_pixel_geometry().coerceIn(0, PixelGeometry.entries.size - 1)
+    val geo = PixelGeometry.entries[ordinal]
+    win32Log("font: PixelGeometry=$geo（来自系统 ClearType/SPI）")
+    geo
+}
+
+internal fun windowsPixelGeometry(): PixelGeometry = cachedWindowsPixelGeometry
 
 /**
  * `COMPOSEKN_RENDER_API=gl|opengl|software|sw|gdi`：强制指定后端（CI / 排查用）。

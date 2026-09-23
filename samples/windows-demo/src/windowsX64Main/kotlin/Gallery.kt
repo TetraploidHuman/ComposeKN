@@ -1276,7 +1276,7 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.28：MenuBar 画廊说明 / 关窗先 Hide / 渲染异常落盘",
+                    "v0.5.29：ClearType PixelGeometry + 关窗嵌套 render 防护",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {

@@ -302,22 +302,22 @@ class WindowsComposeWindow(
     fun detachFromHost() {
         if (!isHostAttached && win32Window == null) return
         win32Log("detachFromHost: frames=$hostFrames")
-        // 先藏窗再拆 GL/OLE：DirectContext.close + DestroyWindow 在 Intel 上常要
-        // 一两百毫秒，若不先 Hide，用户会觉得「点了关闭却卡住」。
+        // 先摘 redrawer（去掉 WM_SIZE render tick），再 Hide：否则 Hide→WM_SIZE
+        // 会在即将销毁的场景上同步再绘一帧。
         val t0 = currentNanoTime()
-        win32Window?.hide()
         WindowsApplicationHost.unregister(this)
         isHostAttached = false
         hostEventHandler = null
         layer.setRenderRequestHandler(null)
         layer.detach()
         val t1 = currentNanoTime()
+        win32Window?.hide()
         win32Window?.close()
         win32Window = null
         val t2 = currentNanoTime()
         win32Log(
-            "detachFromHost: done hide+gl=${(t1 - t0) / 1_000_000}ms " +
-                "destroy=${(t2 - t1) / 1_000_000}ms total=${(t2 - t0) / 1_000_000}ms",
+            "detachFromHost: done gl=${(t1 - t0) / 1_000_000}ms " +
+                "hide+destroy=${(t2 - t1) / 1_000_000}ms total=${(t2 - t0) / 1_000_000}ms",
         )
     }
 

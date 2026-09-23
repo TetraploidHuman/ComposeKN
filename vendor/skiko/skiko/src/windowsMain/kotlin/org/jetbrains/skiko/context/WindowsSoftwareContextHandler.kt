@@ -136,15 +136,16 @@ internal class WindowsSoftwareContextHandler(layer: SkiaLayer) : ContextHandler(
 
         val info = sizedInfo(w, h)
         val win = layer.component as? Win32Window
+        val props = SurfaceProps(pixelGeometry = layer.pixelGeometry)
 
         // 首选：让 Skia 直接画进 present buffer（上游 SOFTWARE_FAST 的做法）。
         val direct = win?.backbufferPixels(w, h)
         if (direct != null) {
-            surface = Surface.makeRasterDirect(info, direct, w * 4)
+            surface = Surface.makeRasterDirect(info, direct, w * 4, props)
             directSurface = true
         } else {
             win32Log("swctx.initCanvas: 拿不到 present buffer，回退到拷贝路径")
-            surface = Surface.makeRaster(info, info.minRowBytes, null)
+            surface = Surface.makeRaster(info, info.minRowBytes, props)
                 ?: throw RenderException("Cannot create Windows raster surface ${w}x$h")
             directSurface = false
         }

@@ -2668,10 +2668,39 @@ extern "C" int32_t composekn_win32_refresh_hz(ComposeKNWin32Window* window) {
     return hz;
 }
 
+/**
+ * 读系统 ClearType 方向，映射到 SkPixelGeometry 序号。
+ * 不开字体平滑 / 非 ClearType → UNKNOWN(0)，Skia 走灰度 AA。
+ */
+extern "C" int32_t composekn_win32_pixel_geometry(void) {
+    BOOL smoothing = FALSE;
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0) || !smoothing) {
+        return 0; // UNKNOWN
+    }
+    UINT type = 0;
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE, 0, &type, 0) ||
+        type != FE_FONTSMOOTHINGCLEARTYPE) {
+        return 0; // 标准灰度平滑 → UNKNOWN（Skia 用 ANTI_ALIAS）
+    }
+    UINT orientation = FE_FONTSMOOTHINGORIENTATIONRGB;
+    SystemParametersInfoW(SPI_GETFONTSMOOTHINGORIENTATION, 0, &orientation, 0);
+    // SkPixelGeometry: UNKNOWN=0 RGB_H=1 BGR_H=2 RGB_V=3 BGR_V=4
+    // Windows 几乎都是横向；BGR vs RGB 由 ORIENTATION 决定。
+    if (orientation == FE_FONTSMOOTHINGORIENTATIONBGR) {
+        return 2; // BGR_H
+    }
+    return 1; // RGB_H
+}
+
 extern "C" void composekn_win32_show(ComposeKNWin32Window* window, int cmd) {
     if (window == nullptr || window->hwnd == nullptr) return;
     ShowWindow(window->hwnd, cmd);
-    InvalidateRect(window->hwnd, nullptr, FALSE);
+    // SW_HIDE(=0) 不要 Invalidate：Hide 本身会同步派 WM_SIZE（触发 fireRenderTick），
+    // 再 Invalidate 容易在关窗路径上嵌套进 render（SingleComposeSceneRenderingScope
+    // 的 check(!isRendering) → IllegalStateException: Check failed）。
+    if (cmd != SW_HIDE) {
+        InvalidateRect(window->hwnd, nullptr, FALSE);
+    }
 }
 
 extern "C" bool composekn_win32_is_maximized(ComposeKNWin32Window* window) {
