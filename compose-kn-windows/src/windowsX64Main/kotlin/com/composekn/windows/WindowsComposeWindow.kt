@@ -234,12 +234,16 @@ class WindowsComposeWindow(
                         WindowsApplicationHost.noteFocus(this, event.hasFocus)
                         handler(event)
                     }
-                is WindowsEvent.CloseEvent -> {
+                    is WindowsEvent.CloseEvent -> {
                         // 先藏再回调：exitApplication → dispose → detach 的 GL teardown
                         // 可能要百毫秒级；Hide 让用户立刻看到窗口消失。
                         win.hide()
                         onCloseRequest?.invoke()
-                        handler(event)
+                        // 回调里可能已经 detach/destroy；勿再派 Close，也不要继续 popEvent
+                        //（已释放的 HWND 上抽事件会 AV，见真机 0xC0000005 @ +0xc）。
+                        if (win32Window != null) {
+                            handler(event)
+                        }
                     }
                     else -> handler(event)
                 }
@@ -554,7 +558,7 @@ class WindowsComposeWindow(
     }
 
     private fun translateAndDispatch(win: Win32Window, onEvent: (WindowsEvent) -> Unit) {
-        while (true) {
+        while (win32Window != null) {
             val raw = win.popEvent() ?: return
             when (raw.type) {
                 Win32Event.MOUSE_MOVE -> onEvent(

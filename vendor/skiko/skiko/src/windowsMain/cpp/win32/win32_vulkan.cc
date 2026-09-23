@@ -80,6 +80,7 @@ struct ComposeKNVkContext {
 
     HMODULE vulkanLib = nullptr;
     PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
+    PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr;
 
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -142,18 +143,52 @@ PFN_vkVoidFunction getProc(ComposeKNVkContext* ctx,
                            const char* name,
                            VkInstance instance,
                            VkDevice device) {
+    if (!ctx || !name) return nullptr;
+
+    // Device-level：必须走 vkGetDeviceProcAddr（不能靠 gipa(instance, …)）。
     if (device != VK_NULL_HANDLE) {
-        static PFN_vkGetDeviceProcAddr getDeviceProc = nullptr;
-        if (!getDeviceProc && ctx->getInstanceProcAddr) {
-            getDeviceProc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                    ctx->getInstanceProcAddr(VK_NULL_HANDLE, "vkGetDeviceProcAddr"));
+        if (!ctx->getDeviceProcAddr) {
+            VkInstance instForGdpa =
+                    (instance != VK_NULL_HANDLE) ? instance : ctx->instance;
+            if (ctx->getInstanceProcAddr && instForGdpa != VK_NULL_HANDLE) {
+                ctx->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                        ctx->getInstanceProcAddr(instForGdpa, "vkGetDeviceProcAddr"));
+            }
+            if (!ctx->getDeviceProcAddr && ctx->getInstanceProcAddr) {
+                ctx->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                        ctx->getInstanceProcAddr(VK_NULL_HANDLE, "vkGetDeviceProcAddr"));
+            }
+            if (!ctx->getDeviceProcAddr && ctx->vulkanLib) {
+                ctx->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                        GetProcAddress(ctx->vulkanLib, "vkGetDeviceProcAddr"));
+            }
         }
-        if (getDeviceProc) {
-            PFN_vkVoidFunction p = getDeviceProc(device, name);
-            if (p) return p;
+        if (ctx->getDeviceProcAddr) {
+            if (PFN_vkVoidFunction p = ctx->getDeviceProcAddr(device, name)) {
+                return p;
+            }
         }
     }
-    return ctx->getInstanceProcAddr(instance, name);
+
+    // Instance-level
+    if (instance != VK_NULL_HANDLE && ctx->getInstanceProcAddr) {
+        if (PFN_vkVoidFunction p = ctx->getInstanceProcAddr(instance, name)) {
+            return p;
+        }
+    }
+
+    // Global（CreateInstance 之前 / MakeInterface 校验 CreateInstance 等）：
+    // Windows 加载器对 gipa(NULL, "vkCreateInstance") 常返回 NULL，必须先 GetProcAddress。
+    if (ctx->vulkanLib) {
+        if (PFN_vkVoidFunction p = reinterpret_cast<PFN_vkVoidFunction>(
+                    GetProcAddress(ctx->vulkanLib, name))) {
+            return p;
+        }
+    }
+    if (ctx->getInstanceProcAddr) {
+        return ctx->getInstanceProcAddr(VK_NULL_HANDLE, name);
+    }
+    return nullptr;
 }
 
 bool loadVulkan(ComposeKNVkContext* ctx) {
@@ -326,6 +361,17 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
         return false;
     }
 
+    if (getPhysProps) {
+        VkPhysicalDeviceProperties props{};
+        getPhysProps(ctx->physicalDevice, &props);
+        vkLog("vk: device=%s type=%u api=%u.%u.%u",
+              props.deviceName,
+              static_cast<unsigned>(props.deviceType),
+              VK_VERSION_MAJOR(props.apiVersion),
+              VK_VERSION_MINOR(props.apiVersion),
+              VK_VERSION_PATCH(props.apiVersion));
+    }
+
     uint32_t devExtCount = 0;
     enumDeviceExt(ctx->physicalDevice, nullptr, &devExtCount, nullptr);
     std::vector<VkExtensionProperties> availableDevExts(devExtCount);
@@ -431,7 +477,11 @@ bool createGraphite(ComposeKNVkContext* ctx) {
     backend.fMemoryAllocator =
             skgpu::VulkanMemoryAllocators::Make(backend, skgpu::ThreadSafe::kNo);
     if (!backend.fMemoryAllocator) {
-        vkLog("vk: VulkanMemoryAllocators::Make failed");
+        // 常见根因：fGetProc 对全局入口返回 NULL → MakeInterface/validate 失败。
+        vkLog("vk: VulkanMemoryAllocators::Make failed "
+              "(check getProc globals; device=%p queue=%p)",
+              (void*)ctx->device,
+              (void*)ctx->graphicsQueue);
         return false;
     }
     ctx->memoryAllocator = backend.fMemoryAllocator;
