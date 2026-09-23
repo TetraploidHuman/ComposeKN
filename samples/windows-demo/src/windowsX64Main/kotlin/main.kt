@@ -80,6 +80,8 @@ fun main(args: Array<String>) {
                     Separator()
                     Item("退出") {
                         probe.menuAction = "File/Exit"
+                        // 先藏窗再退：与系统关窗路径一致，避免 GL teardown 时窗还挂着。
+                        (window as? WindowsNativeWindowHandle)?.composeWindow?.hide()
                         exitApplication()
                     }
                 }

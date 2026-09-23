@@ -101,6 +101,9 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
     ⚠ Linux/Wayland 侧目前仍是纯文本（多 MIME 那条协议还没接）。
   · 多窗口：Desktop 对齐的 `application { Window(...) }`；第二扇窗关窗只清自己的
     `open` 状态，不会把整线程 `PostQuitMessage` 掉（共享消息泵）。
+  · **原生菜单栏（MenuBar）**：标题栏下方系统 HMENU（文件/编辑）；画廊「菜单栏 /
+    MenuBar」一节会显示最近点选。无边框窗不显示。
+  · **文件对话框（FileDialog）**：画廊「文件对话框」一节可点命令式 / Composable 打开与保存。
   · 拖放（接收 + 发出）：
     接收 — 从资源管理器拖文件、或从别的应用拖文本到窗口上，
     `Modifier.dragAndDropTarget` 会收到 onStarted/onEntered/onMoved/onDrop/onEnded。
@@ -235,7 +238,23 @@ EOF
 # 注入版本号（heredoc 带引号后无法做变量替换）
 sed -i "s/__VERSION__/$VERSION/g" "$STAGE/README.txt"
 
-( cd "$OUT_DIR" && rm -f "$ZIP" && zip -q -r "$ZIP" "ComposeKN-Windows-Native" )
+( cd "$OUT_DIR" && rm -f "$ZIP" && {
+    if command -v zip >/dev/null 2>&1; then
+        zip -q -r "$ZIP" "ComposeKN-Windows-Native"
+    else
+        # nix/CI 环境可能没有 zip(1)；用 Python 标准库兜底。
+        python3 - "$ZIP" "ComposeKN-Windows-Native" <<'PY'
+import sys, zipfile, os
+zip_path, root = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            zf.write(full, full)
+print(f"python zip ok: {zip_path}", file=sys.stderr)
+PY
+    fi
+} )
 echo
 echo "==> 产物: $ZIP"
 ls -l "$ZIP" "$STAGE"

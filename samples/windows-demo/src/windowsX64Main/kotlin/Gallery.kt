@@ -373,6 +373,25 @@ private fun LazyListScope.gallerySections(
         }
     }
 
+    section("菜单栏 / MenuBar") {
+        Text(
+            "原生 Win32 HMENU 在**标题栏正下方**（不是本列表里的控件）。" +
+                "请点系统菜单：文件(&F) / 编辑(&E)；最近点选会写到下面。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text(
+            "最近菜单动作：${probe.menuAction}",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+        Text(
+            "「文件 → 退出」会 exitApplication；其它项只更新探针。" +
+                "无边框窗（undecorated）不会显示系统菜单栏。",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+    }
+
     section("文本 / Text") {
         Text("headlineSmall 标题", style = MaterialTheme.typography.headlineSmall)
         Text("titleMedium 小标题", style = MaterialTheme.typography.titleMedium)
@@ -1257,7 +1276,7 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.26：DialogWindow + WindowState 双向同步 / 每窗 WGL / application{}",
+                    "v0.5.28：MenuBar 画廊说明 / 关窗先 Hide / 渲染异常落盘",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {

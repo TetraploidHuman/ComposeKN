@@ -137,30 +137,41 @@ internal abstract class WindowsRenderLoopRedrawer(
         //   update —— Compose 场景渲染（重组/布局/绘制 -> 录制 Picture）
         //   draw   —— 回放 Picture 到 surface（软件路径 = CPU 光栅化；GL = GPU 提交）
         //   present—— 上传/交换（软件路径 = GDI blit；GL = SwapBuffers）
-        val t0 = currentNanoTime()
-        update(t0)
-        val t1 = currentNanoTime()
-        val presentNanos = renderOneFrame()
-        val t2 = currentNanoTime()
-        profileFrames++
-        profileUpdateNanos += t1 - t0
-        profileDrawNanos += t2 - t1
-        profilePresentNanos += presentNanos
-        if (profileFrames >= PROFILE_WINDOW_FRAMES) {
-            val n = profileFrames.toDouble()
-            val drawOnlyNanos = profileDrawNanos - profilePresentNanos
-            val line = "profile: ${profileFrames} 帧  update=${fmtMs(profileUpdateNanos / n)}" +
-                "  draw=${fmtMs(drawOnlyNanos.toDouble() / n)}" +
-                "  present=${fmtMs(profilePresentNanos.toDouble() / n)}" +
-                "  draw+present=${fmtMs(profileDrawNanos / n)}" +
-                "  total=${fmtMs((profileUpdateNanos + profileDrawNanos) / n)}" +
-                "  窗口=${w}x$h  呈现=$presentationMode"
-            println(line)
-            win32Log(line)
-            profileFrames = 0
-            profileUpdateNanos = 0
-            profileDrawNanos = 0
-            profilePresentNanos = 0
+        try {
+            val t0 = currentNanoTime()
+            update(t0)
+            val t1 = currentNanoTime()
+            val presentNanos = renderOneFrame()
+            val t2 = currentNanoTime()
+            profileFrames++
+            profileUpdateNanos += t1 - t0
+            profileDrawNanos += t2 - t1
+            profilePresentNanos += presentNanos
+            if (profileFrames >= PROFILE_WINDOW_FRAMES) {
+                val n = profileFrames.toDouble()
+                val drawOnlyNanos = profileDrawNanos - profilePresentNanos
+                val line = "profile: ${profileFrames} 帧  update=${fmtMs(profileUpdateNanos / n)}" +
+                    "  draw=${fmtMs(drawOnlyNanos.toDouble() / n)}" +
+                    "  present=${fmtMs(profilePresentNanos.toDouble() / n)}" +
+                    "  draw+present=${fmtMs(profileDrawNanos / n)}" +
+                    "  total=${fmtMs((profileUpdateNanos + profileDrawNanos) / n)}" +
+                    "  窗口=${w}x$h  呈现=$presentationMode"
+                println(line)
+                win32Log(line)
+                profileFrames = 0
+                profileUpdateNanos = 0
+                profileDrawNanos = 0
+                profilePresentNanos = 0
+            }
+        } catch (t: Throwable) {
+            // GPU 丢上下文 / Skia 抛 RenderException / Compose 布局断言：若不拦，
+            // K/N 顶层会变成 !!! UNHANDLED EXCEPTION code=0x20474343。
+            win32Log(
+                "render: EXCEPTION ${t::class.simpleName}: ${t.message}",
+            )
+            t.stackTraceToString().lineSequence().take(25).forEach { win32Log("    $it") }
+            // 保留请求，下一帧再试（瞬时 GL 错误有机会自愈；持续失败至少有日志）。
+            renderRequested = true
         }
     }
 }

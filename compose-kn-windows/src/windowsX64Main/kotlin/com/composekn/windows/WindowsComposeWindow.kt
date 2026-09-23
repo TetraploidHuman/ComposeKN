@@ -213,6 +213,11 @@ class WindowsComposeWindow(
         win32Window?.show()
     }
 
+    /** 立刻隐藏（关窗路径用，见 [detachFromHost]）。 */
+    fun hide() {
+        win32Window?.hide()
+    }
+
     /**
      * 从本窗口事件队列取出并翻译，交给宿主会话。
      *
@@ -222,19 +227,29 @@ class WindowsComposeWindow(
     fun drainEventsForHost() {
         val win = win32Window ?: return
         val handler = hostEventHandler ?: return
-        translateAndDispatch(win) { event ->
-            when (event) {
-                is WindowsEvent.FocusEvent -> {
-                    WindowsApplicationHost.noteFocus(this, event.hasFocus)
-                    handler(event)
-                }
+        try {
+            translateAndDispatch(win) { event ->
+                when (event) {
+                    is WindowsEvent.FocusEvent -> {
+                        WindowsApplicationHost.noteFocus(this, event.hasFocus)
+                        handler(event)
+                    }
                 is WindowsEvent.CloseEvent -> {
-                    // DO_NOTHING：系统关窗 → 回调；真正 destroy 由上层决定
-                    onCloseRequest?.invoke()
-                    handler(event)
+                        // 先藏再回调：exitApplication → dispose → detach 的 GL teardown
+                        // 可能要百毫秒级；Hide 让用户立刻看到窗口消失。
+                        win.hide()
+                        onCloseRequest?.invoke()
+                        handler(event)
+                    }
+                    else -> handler(event)
                 }
-                else -> handler(event)
             }
+        } catch (t: Throwable) {
+            win32Log(
+                "drainEventsForHost: EXCEPTION ${t::class.simpleName}: ${t.message}",
+            )
+            t.stackTraceToString().lineSequence().take(25).forEach { win32Log("    $it") }
+            throw t
         }
     }
 
@@ -287,13 +302,23 @@ class WindowsComposeWindow(
     fun detachFromHost() {
         if (!isHostAttached && win32Window == null) return
         win32Log("detachFromHost: frames=$hostFrames")
+        // 先藏窗再拆 GL/OLE：DirectContext.close + DestroyWindow 在 Intel 上常要
+        // 一两百毫秒，若不先 Hide，用户会觉得「点了关闭却卡住」。
+        val t0 = currentNanoTime()
+        win32Window?.hide()
         WindowsApplicationHost.unregister(this)
         isHostAttached = false
         hostEventHandler = null
         layer.setRenderRequestHandler(null)
         layer.detach()
+        val t1 = currentNanoTime()
         win32Window?.close()
         win32Window = null
+        val t2 = currentNanoTime()
+        win32Log(
+            "detachFromHost: done hide+gl=${(t1 - t0) / 1_000_000}ms " +
+                "destroy=${(t2 - t1) / 1_000_000}ms total=${(t2 - t0) / 1_000_000}ms",
+        )
     }
 
     /**
@@ -512,8 +537,20 @@ class WindowsComposeWindow(
 
     /** 菜单栏点击：按 id 回调（由 [WindowsEvent.MenuCommandEvent] 驱动）。 */
     fun invokeMenuCommand(commandId: Int) {
-        menuClickMap[commandId]?.invoke()
-            ?: win32Log("menu: 未知命令 id=$commandId（映射表 size=${menuClickMap.size}）")
+        val action = menuClickMap[commandId]
+        if (action == null) {
+            win32Log("menu: 未知命令 id=$commandId（映射表 size=${menuClickMap.size}）")
+            return
+        }
+        try {
+            action.invoke()
+        } catch (t: Throwable) {
+            // 菜单 onClick 在消息泵线程同步跑：异常逃出去 = 0x20474343 崩进程。
+            win32Log(
+                "menu: onClick id=$commandId EXCEPTION ${t::class.simpleName}: ${t.message}",
+            )
+            t.stackTraceToString().lineSequence().take(20).forEach { win32Log("    $it") }
+        }
     }
 
     private fun translateAndDispatch(win: Win32Window, onEvent: (WindowsEvent) -> Unit) {

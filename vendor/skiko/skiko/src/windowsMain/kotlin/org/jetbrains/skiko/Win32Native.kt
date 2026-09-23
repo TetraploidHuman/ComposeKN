@@ -259,6 +259,7 @@ internal external fun composekn_win32_clipboard_get_text(
 internal external fun composekn_win32_clipboard_set_text(window: COpaquePointer?, text: CPointer<ByteVar>)
 
 /** SW_SHOWMINIMIZED etc. */
+const val SW_WINDOWS_HIDE = 0
 const val SW_WINDOWS_SHOW = 5
 const val SW_WINDOWS_MAXIMIZE = 3
 const val SW_WINDOWS_MINIMIZE = 6
@@ -682,6 +683,8 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     fun maximize() = composekn_win32_show(native, SW_WINDOWS_MAXIMIZE)
     fun restore() = composekn_win32_show(native, SW_WINDOWS_RESTORE)
     fun show() = composekn_win32_show(native, SW_WINDOWS_SHOW)
+    /** 立刻隐藏（关窗拆 GL/OLE 前调用，避免用户感知到 teardown 卡顿）。 */
+    fun hide() = composekn_win32_show(native, SW_WINDOWS_HIDE)
 
     fun requestClose() = composekn_win32_request_close(native)
     fun setTitle(title: String) = title.useCString { composekn_win32_set_title(native, it) }

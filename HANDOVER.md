@@ -3812,3 +3812,19 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
 * **WindowPosition.Aligned**：`alignOnScreen(Alignment)`（TopStart / Center / …），
   不再只居中
 * Linux 侧见上节（applySize / eventfd / 软模态 / 几何写回）
+
+#### MenuBar 画廊可见性 + 关窗卡顿 / 0x20474343（v0.5.28）
+
+真机反馈：画廊里找不到 MenuBar 测试块；关应用会卡一小会；日志出现
+`!!! UNHANDLED EXCEPTION code=0x20474343`（MinGW = 未捕获的 Kotlin/C++ 异常）。
+
+修法：
+
+* **画廊**：新增「菜单栏 / MenuBar」一节，说明原生 HMENU 在标题栏下方，并显示
+  `probe.menuAction` 最近点选
+* **关窗先 Hide**：`CloseEvent` / `detachFromHost` / 菜单「退出」都先 `ShowWindow(SW_HIDE)`，
+  再拆 GL `DirectContext` / OLE / `DestroyWindow`（Intel 上 teardown 常要百毫秒级，
+  藏窗后用户不再感觉「卡在关窗」）；`detachFromHost` 打分段耗时日志
+* **异常落盘**：共享泵 `drain`/`tick`、`renderFrame`、菜单 `onClick`、IME 三个
+  provider 全部 try/catch 写 `composekn-startup.log`（再出现 0x20474343 前能看到
+  具体 `EXCEPTION Class: message` + 栈）

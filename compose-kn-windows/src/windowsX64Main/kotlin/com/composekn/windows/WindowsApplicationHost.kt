@@ -142,17 +142,33 @@ object WindowsApplicationHost {
             return
         }
         // 全局只有一套 IME provider：按焦点/最近活跃窗转发（见文件头注释）。
+        // 全部 try/catch：这些在 WM_IME_* 的 SendMessage 里同步跑，异常 = 0x20474343。
         setWindowsImeCaretProvider { charIndex ->
-            val w = imeTarget() ?: return@setWindowsImeCaretProvider null
-            imeCaretByWindow[w]?.invoke(charIndex)
+            try {
+                val w = imeTarget() ?: return@setWindowsImeCaretProvider null
+                imeCaretByWindow[w]?.invoke(charIndex)
+            } catch (t: Throwable) {
+                win32Log("ime: caret provider EXCEPTION ${t::class.simpleName}: ${t.message}")
+                null
+            }
         }
         setWindowsImeTextProvider {
-            val w = imeTarget() ?: return@setWindowsImeTextProvider null
-            imeTextByWindow[w]?.invoke()
+            try {
+                val w = imeTarget() ?: return@setWindowsImeTextProvider null
+                imeTextByWindow[w]?.invoke()
+            } catch (t: Throwable) {
+                win32Log("ime: text provider EXCEPTION ${t::class.simpleName}: ${t.message}")
+                null
+            }
         }
         setWindowsImeReconvertProvider { text, targetOffset, targetLen ->
-            val w = imeTarget() ?: return@setWindowsImeReconvertProvider null
-            imeReconvertByWindow[w]?.invoke(text, targetOffset, targetLen)
+            try {
+                val w = imeTarget() ?: return@setWindowsImeReconvertProvider null
+                imeReconvertByWindow[w]?.invoke(text, targetOffset, targetLen)
+            } catch (t: Throwable) {
+                win32Log("ime: reconvert provider EXCEPTION ${t::class.simpleName}: ${t.message}")
+                null
+            }
         }
     }
 
@@ -208,7 +224,16 @@ object WindowsApplicationHost {
                 val snapshot = sessions.toList()
                 for (session in snapshot) {
                     if (!sessions.contains(session)) continue
-                    session.drainEventsForHost()
+                    try {
+                        session.drainEventsForHost()
+                    } catch (t: Throwable) {
+                        win32Log(
+                            "host: drain EXCEPTION ${t::class.simpleName}: ${t.message}",
+                        )
+                        t.stackTraceToString().lineSequence().take(25)
+                            .forEach { win32Log("    $it") }
+                        // 不让单窗事件异常拆掉整条泵；下一轮继续服务其它窗。
+                    }
                 }
                 flushMainUIDispatcher()
 
@@ -216,7 +241,17 @@ object WindowsApplicationHost {
                 var nextFrameNanos = Long.MAX_VALUE
                 val now = currentNanoTime()
                 for (session in sessions.toList()) {
-                    when (val tick = session.tickRenderForHost(now)) {
+                    val tick = try {
+                        session.tickRenderForHost(now)
+                    } catch (t: Throwable) {
+                        win32Log(
+                            "host: tick EXCEPTION ${t::class.simpleName}: ${t.message}",
+                        )
+                        t.stackTraceToString().lineSequence().take(25)
+                            .forEach { win32Log("    $it") }
+                        HostRenderTick.Idle
+                    }
+                    when (tick) {
                         is HostRenderTick.Rendered -> {
                             anyPendingRender = anyPendingRender || tick.stillDirty
                             if (tick.nextFrameNanos < nextFrameNanos) {
@@ -251,6 +286,12 @@ object WindowsApplicationHost {
                     waiter.waitNative(HOST_MINIMIZED_POLL_MS)
                 }
             }
+        } catch (t: Throwable) {
+            win32Log(
+                "host: shared pump EXCEPTION ${t::class.simpleName}: ${t.message}",
+            )
+            t.stackTraceToString().lineSequence().take(30).forEach { win32Log("    $it") }
+            throw t
         } finally {
             setMainUIDispatcherWakeUpHandler(null)
             win32Log("host: shared pump exit (windows=${sessions.size})")
