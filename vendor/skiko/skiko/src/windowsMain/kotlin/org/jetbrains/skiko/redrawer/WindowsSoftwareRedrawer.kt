@@ -22,6 +22,10 @@ internal class WindowsSoftwareRedrawer(
     override val renderInfo: String get() = contextHandler.rendererInfo()
     override val presentationMode: String get() = contextHandler.presentationMode
 
+    init {
+        installResizeTick()
+    }
+
     override fun renderOneFrame(): Long {
         skiaLayer.inDrawScope {
             contextHandler.draw()

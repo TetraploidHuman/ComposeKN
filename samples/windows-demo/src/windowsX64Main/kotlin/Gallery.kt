@@ -1276,7 +1276,7 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.30：默认 Graphite/Vulkan（失败回退 GL / 软件）",
+                    "v0.5.31：修 Vulkan 回退僵尸 tick + GetProcAddress 加载",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {

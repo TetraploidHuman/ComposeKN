@@ -147,8 +147,9 @@ actual open class SkiaLayer {
 
         if (tryVulkan) {
             try {
-                val vk = WindowsVulkanRedrawer(this, window)
+                // 先写回 renderApi，避免子类日志仍显示「请求的」VULKAN。
                 renderApi = GraphicsApi.VULKAN
+                val vk = WindowsVulkanRedrawer(this, window)
                 win32Log("skialayer: 使用 Graphite/Vulkan 后端")
                 return vk
             } catch (t: Throwable) {
@@ -159,8 +160,8 @@ actual open class SkiaLayer {
         }
         if (tryGl) {
             try {
-                val gl = WindowsGLRedrawer(this, window)
                 renderApi = GraphicsApi.OPENGL
+                val gl = WindowsGLRedrawer(this, window)
                 win32Log("skialayer: 使用 GL(GPU) 后端")
                 return gl
             } catch (t: Throwable) {

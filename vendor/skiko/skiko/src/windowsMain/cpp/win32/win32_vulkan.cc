@@ -162,6 +162,10 @@ bool loadVulkan(ComposeKNVkContext* ctx) {
         vkLog("vk: LoadLibrary(vulkan-1.dll) failed (%lu)", GetLastError());
         return false;
     }
+    char modPath[MAX_PATH] = {};
+    if (GetModuleFileNameA(ctx->vulkanLib, modPath, MAX_PATH) > 0) {
+        vkLog("vk: loaded %s", modPath);
+    }
     ctx->getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
             GetProcAddress(ctx->vulkanLib, "vkGetInstanceProcAddr"));
     if (!ctx->getInstanceProcAddr) {
@@ -171,17 +175,46 @@ bool loadVulkan(ComposeKNVkContext* ctx) {
     return true;
 }
 
+// 全局入口（CreateInstance 之前）：部分 Windows 加载器对
+// vkGetInstanceProcAddr(NULL, "vkCreateInstance") 返回 NULL，但 DLL 导出表有这些符号。
+// GLFW / SDL / Skia tools 都是优先 GetProcAddress，再回退 gipa(NULL)。
+template <typename T>
+T loadGlobalProc(ComposeKNVkContext* ctx, const char* name) {
+    T viaDll = reinterpret_cast<T>(GetProcAddress(ctx->vulkanLib, name));
+    if (viaDll) return viaDll;
+    if (ctx->getInstanceProcAddr) {
+        return reinterpret_cast<T>(ctx->getInstanceProcAddr(VK_NULL_HANDLE, name));
+    }
+    return nullptr;
+}
+
 bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
     auto gipa = ctx->getInstanceProcAddr;
-    auto enumerateInstanceExt = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
-            gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
-    auto createInstance = reinterpret_cast<PFN_vkCreateInstance>(
-            gipa(VK_NULL_HANDLE, "vkCreateInstance"));
-    auto enumeratePhys = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
-            gipa(VK_NULL_HANDLE, "vkEnumeratePhysicalDevices"));
+    auto enumerateInstanceExt =
+            loadGlobalProc<PFN_vkEnumerateInstanceExtensionProperties>(
+                    ctx, "vkEnumerateInstanceExtensionProperties");
+    auto createInstance =
+            loadGlobalProc<PFN_vkCreateInstance>(ctx, "vkCreateInstance");
+    auto enumeratePhys =
+            loadGlobalProc<PFN_vkEnumeratePhysicalDevices>(ctx, "vkEnumeratePhysicalDevices");
+    auto enumerateInstanceVersion =
+            loadGlobalProc<PFN_vkEnumerateInstanceVersion>(ctx, "vkEnumerateInstanceVersion");
     if (!enumerateInstanceExt || !createInstance || !enumeratePhys) {
-        vkLog("vk: missing instance procs");
+        vkLog("vk: missing global procs (ext=%p create=%p phys=%p gipa=%p)",
+              (void*)enumerateInstanceExt,
+              (void*)createInstance,
+              (void*)enumeratePhys,
+              (void*)gipa);
         return false;
+    }
+    if (enumerateInstanceVersion) {
+        uint32_t loaderVersion = 0;
+        if (enumerateInstanceVersion(&loaderVersion) == VK_SUCCESS) {
+            vkLog("vk: loader apiVersion=%u.%u.%u",
+                  VK_VERSION_MAJOR(loaderVersion),
+                  VK_VERSION_MINOR(loaderVersion),
+                  VK_VERSION_PATCH(loaderVersion));
+        }
     }
 
     ctx->apiVersion = VK_API_VERSION_1_1;

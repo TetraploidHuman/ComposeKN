@@ -32,6 +32,7 @@ internal class WindowsVulkanRedrawer(
         if (!window.vkCreate()) {
             throw RenderException("Cannot create Graphite/Vulkan context on Windows (mingw)")
         }
+        installResizeTick()
         win32Log("vkredrawer: Graphite/Vulkan 后端就绪")
     }
 

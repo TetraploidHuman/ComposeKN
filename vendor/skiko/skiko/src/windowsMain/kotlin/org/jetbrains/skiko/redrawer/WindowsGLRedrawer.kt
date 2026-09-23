@@ -31,6 +31,7 @@ internal class WindowsGLRedrawer(
         window.glMakeCurrent()
         // WGL_EXT_swap_interval：present 跟垂直同步对齐（上游 EGL 路径同样设置）。
         window.glSetSwapInterval(1)
+        installResizeTick()
         // renderInfo 是多行的；日志一行一条，所以把换行换成 ';' 再打。
         // （换行符用下面的 NEWLINE_CHAR 常量传给 replace —— 写成字符字面量放在
         //   字符串模板里时，Kotlin 词法会报 "Too many characters in a character literal"。）

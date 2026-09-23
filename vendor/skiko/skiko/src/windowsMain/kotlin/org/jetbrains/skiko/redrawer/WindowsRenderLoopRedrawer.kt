@@ -65,17 +65,36 @@ internal abstract class WindowsRenderLoopRedrawer(
     /** 本窗的缩放同步 tick（必须是稳定引用，才能 remove）。 */
     private val resizeTick: () -> Unit = { renderImmediately() }
 
+    /**
+     * 是否已把 [resizeTick] 挂进全局列表。
+     *
+     * **不能**在本类 `init` 里挂：子类（Vulkan/GL）在父类 init 之后才建后端，
+     * 创建失败抛 [RenderException] 时对象被丢弃但 tick 仍在 → 回退后仍调用僵尸
+     * `WindowsVulkanRedrawer.renderOneFrame`（真机 v0.5.30：`vk_begin_frame returned null`
+     * + 关窗 AV）。子类在后端就绪后显式 [installResizeTick]。
+     */
+    private var resizeTickInstalled = false
+
     init {
         initWindowsMainThread()
+    }
+
+    /** 后端创建成功后调用；失败抛异常的路径不要调。 */
+    protected fun installResizeTick() {
+        if (resizeTickInstalled) return
         // 缩放期间（模态循环）也能逐帧重组：见 addWindowsRenderTick 注释。
         // 多窗口必须 add/remove，不能 set(null) 把兄弟窗的 tick 一锅端。
         addWindowsRenderTick(resizeTick)
+        resizeTickInstalled = true
     }
 
     override fun dispose() {
         if (disposed) return
         disposed = true
-        removeWindowsRenderTick(resizeTick)
+        if (resizeTickInstalled) {
+            removeWindowsRenderTick(resizeTick)
+            resizeTickInstalled = false
+        }
         disposeBackend()
     }
 
