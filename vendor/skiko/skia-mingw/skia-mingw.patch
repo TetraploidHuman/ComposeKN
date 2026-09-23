@@ -636,3 +636,18 @@ index 7ebdbdb..bdca866 100644
          cflags = [
            "-msse4.2",
            "-mpclmul",
+
+diff --git a/src/gpu/vk/vulkanmemoryallocator/BUILD.gn b/src/gpu/vk/vulkanmemoryallocator/BUILD.gn
+index 23c3c66..78fee4b 100644
+--- a/src/gpu/vk/vulkanmemoryallocator/BUILD.gn
++++ b/src/gpu/vk/vulkanmemoryallocator/BUILD.gn
+@@ -31,7 +31,8 @@ source_set("vulkanmemoryallocator") {
+   ]
+ 
+   # Warnings are just noise if we're not maintaining the code.
+-  if (is_win) {
++  # is_msvc (not is_win): MinGW rejects MSVC-style /w as a bogus linker input.
++  if (is_msvc) {
+     cflags = [ "/w" ]
+   } else {
+     cflags = [ "-w" ]

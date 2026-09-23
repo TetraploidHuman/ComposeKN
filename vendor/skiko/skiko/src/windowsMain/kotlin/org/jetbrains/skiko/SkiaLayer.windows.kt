@@ -9,6 +9,7 @@ import org.jetbrains.skiko.redrawer.Redrawer
 import org.jetbrains.skiko.redrawer.WindowsGLRedrawer
 import org.jetbrains.skiko.redrawer.WindowsRenderLoopRedrawer
 import org.jetbrains.skiko.redrawer.WindowsSoftwareRedrawer
+import org.jetbrains.skiko.redrawer.WindowsVulkanRedrawer
 import kotlinx.cinterop.toKString
 
 /**
@@ -19,16 +20,19 @@ actual open class SkiaLayer {
     /**
      * 渲染后端选择（与上游一致：OPENGL = GPU，SOFTWARE_* = 软件回退）。
      *
+     * - [GraphicsApi.VULKAN]：Graphite + Vulkan swapchain（需 mingw-graphite-vk Skia）。
+     *   创建失败回退 OPENGL，再失败回退软件。
      * - [GraphicsApi.OPENGL]：WGL + Ganesh（GPU）。**创建失败会自动回退到软件路径**，
      *   并把这里改写成 [GraphicsApi.SOFTWARE_FAST]，所以读回来的值就是实际生效的后端。
      * - [GraphicsApi.SOFTWARE_FAST] / [GraphicsApi.SOFTWARE_COMPAT]：CPU raster + GDI
      *   （对齐上游 SOFTWARE_FAST 形状，见 WindowsSoftwareContextHandler）。
      *
-     * 环境变量 `COMPOSEKN_RENDER_API=gl|software` 可强制指定（CI / 排查用）。
+     * 环境变量 `COMPOSEKN_RENDER_API=vulkan|gl|software` 可强制指定（CI / 排查用）。
      */
     actual var renderApi: GraphicsApi = defaultWindowsRenderApi()
         set(value) {
             if (value != GraphicsApi.OPENGL &&
+                value != GraphicsApi.VULKAN &&
                 value != GraphicsApi.SOFTWARE_FAST &&
                 value != GraphicsApi.SOFTWARE_COMPAT
             ) {
@@ -134,12 +138,26 @@ actual open class SkiaLayer {
         get() = redrawer?.renderInfo?.trim()?.replace('\n', ';') ?: "n/a"
 
     /**
-     * 建后端：默认先试 GPU（OPENGL），失败（虚拟机/远程桌面/只有 GL 1.1 的驱动）
-     * 自动回退到软件路径 —— 与上游的「主后端 + 软件回退」一致。
+     * 建后端：默认 Graphite/Vulkan → GL → 软件；可用 `COMPOSEKN_RENDER_API` 强制。
      */
     private fun createRedrawer(window: Win32Window): Redrawer {
         val requested = windowsRenderApiOverride() ?: renderApi
-        if (requested == GraphicsApi.OPENGL) {
+        val tryVulkan = requested == GraphicsApi.VULKAN
+        val tryGl = requested == GraphicsApi.OPENGL || requested == GraphicsApi.VULKAN
+
+        if (tryVulkan) {
+            try {
+                val vk = WindowsVulkanRedrawer(this, window)
+                renderApi = GraphicsApi.VULKAN
+                win32Log("skialayer: 使用 Graphite/Vulkan 后端")
+                return vk
+            } catch (t: Throwable) {
+                win32Log(
+                    "skialayer: Vulkan 后端创建失败（${t::class.simpleName}: ${t.message}），回退 GL"
+                )
+            }
+        }
+        if (tryGl) {
             try {
                 val gl = WindowsGLRedrawer(this, window)
                 renderApi = GraphicsApi.OPENGL
@@ -225,12 +243,13 @@ private val cachedWindowsPixelGeometry: PixelGeometry by lazy {
 internal fun windowsPixelGeometry(): PixelGeometry = cachedWindowsPixelGeometry
 
 /**
- * `COMPOSEKN_RENDER_API=gl|opengl|software|sw|gdi`：强制指定后端（CI / 排查用）。
+ * `COMPOSEKN_RENDER_API=vulkan|vk|graphite|gl|opengl|software|sw|gdi`：强制指定后端。
  * 未设置时返回 null，表示按 [SkiaLayer.renderApi] 走默认逻辑。
  */
 private fun windowsRenderApiOverride(): GraphicsApi? {
     val raw = platform.posix.getenv("COMPOSEKN_RENDER_API")?.toKString()?.trim()?.lowercase() ?: return null
     return when (raw) {
+        "vulkan", "vk", "graphite", "graphite-vk" -> GraphicsApi.VULKAN
         "gl", "opengl", "gpu" -> GraphicsApi.OPENGL
         "software", "sw", "gdi", "cpu" -> GraphicsApi.SOFTWARE_FAST
         else -> {
@@ -241,7 +260,7 @@ private fun windowsRenderApiOverride(): GraphicsApi? {
 }
 
 /**
- * 默认后端 = GPU（OPENGL），与上游各平台一致：上游 Windows 桌面默认 D3D12/ANGLE、
- * macOS METAL、Linux Wayland OPENGL；软件路径是回退，不是主路线。
+ * 默认后端 = Graphite/Vulkan，失败回退 GL，再失败回退软件。
+ * 强制指定：`COMPOSEKN_RENDER_API=vulkan|gl|software`。
  */
-private fun defaultWindowsRenderApi(): GraphicsApi = GraphicsApi.OPENGL
+private fun defaultWindowsRenderApi(): GraphicsApi = GraphicsApi.VULKAN

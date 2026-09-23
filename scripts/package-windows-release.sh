@@ -26,8 +26,9 @@ STAGE="$OUT_DIR/ComposeKN-Windows-Native"
 ZIP="$OUT_DIR/ComposeKN-Windows-Native-v$VERSION.zip"
 
 if [ "$DO_BUILD" = "--build" ]; then
-    echo "==> 链接 windows-demo.exe（约 7 分钟）"
+    echo "==> 链接 windows-demo.exe（约 7 分钟；优先 mingw-graphite-vk Skia）"
     SKIA_MINGW_WORK="$SKIA_WORK" \
+    SKIA_OUT_DIR="${SKIA_OUT_DIR:-$SKIA_WORK/skia/out/mingw-graphite-vk}" \
         nix-shell "$REPO/shell.nix" --run "$REPO/vendor/skiko/skia-mingw/build-windows-native-demo.sh"
 fi
 
@@ -61,7 +62,7 @@ ICU 数据文件（icudtl.dat，10MB，Skia 文本排版用）在链接期被直
 内容
 ----
 Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
-默认走 GPU（OpenGL/WGL + Ganesh）、失败自动回退软件光栅（GDI），
+默认先试 **Graphite/Vulkan**，失败回退 OpenGL/WGL（Ganesh），再失败回退软件光栅（GDI）；
 不依赖任何第三方 DLL / 运行库。默认系统标题栏（对齐 Compose 桌面的 Window()），
 支持**触摸屏**（单指拖动滚动 + 甩动惯性）与**中文输入法**（IMM32 组字/候选窗）。
 
@@ -77,14 +78,13 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
     （触摸走 WM_POINTER -> PointerType.Touch；`set COMPOSEKN_TOUCH=0` 可关掉，
       退回系统「触摸提升成鼠标」的老行为）
   · Canvas 绘制（渐变/路径/描边/旋转）、FlowRow 自动换行、主题切换（深/浅色）
-  · 渲染：**按需渲染 + 按刷新率节流**（没有内容变化就不重绘，空闲时 CPU ≈ 0；
-    这个窗口的标题栏实时显示实测帧率）
-  · 渲染：**默认走 GPU（OpenGL/WGL + Skia Ganesh）**，创建失败会自动回退到软件路径
-    （CPU raster + GDI，零拷贝）——两者共用同一份 Skia，行为一致
+  · 渲染：**默认 Graphite/Vulkan**；创建失败自动回退 OpenGL/WGL（Ganesh），再失败回退
+    软件路径（CPU raster + GDI）。真机有 Vulkan 驱动时应走 Graphite；Wine 上常会回退 GL。
+  · 想强制后端：set COMPOSEKN_RENDER_API=vulkan（或 gl / software）——看
+    composekn-startup.log 里的「skialayer: 使用 …」确认实际后端
   · 渲染：**按需渲染 + 按刷新率节流**（没有内容变化就不重绘，空闲时 CPU ≈ 0；
     这个窗口的标题栏实时显示实测帧率）
   · 想看空闲行为：ComposeKN-Windows-Native.exe --no-animate（关掉每帧动画）
-  · 想强制后端：set COMPOSEKN_RENDER_API=software（或 gl）——日志里会写明实际用了哪条
   · 顶部诊断条：窗口尺寸、dpi、交互计数、**每帧重组计数**
   · 窗口 API：`windowPosition` / `setWindowPosition` / `windowSize` / `setWindowSize` /
     `alwaysOnTop` / `setAlwaysOnTop` / `isFullscreen` / `setFullscreen` / `resizable` /

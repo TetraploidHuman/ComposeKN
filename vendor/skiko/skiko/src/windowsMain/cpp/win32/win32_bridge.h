@@ -207,6 +207,30 @@ void composekn_win32_gl_swap_buffers(ComposeKNWin32Window* window);
 /** 销毁上下文并释放 DC。 */
 void composekn_win32_gl_destroy(ComposeKNWin32Window* window);
 
+// ---------------------------------------------------------------------------
+// Graphite + Vulkan（GPU 后端，与 GL 并存；失败时上层回退 GL/软件）
+//
+// C 侧拥有 VkInstance/Device/Swapchain + skgpu::graphite::Context/Recorder。
+// 每帧 begin → 返回 SkCanvas*（swapchain 图像上的 Graphite Surface），Kotlin
+// 画完后 end（snap Recording → insertRecording → QueuePresent）。
+// 未编 SK_VULKAN+SK_GRAPHITE 时全部返回失败/nullptr。
+// ---------------------------------------------------------------------------
+
+/** 建 Vulkan 设备 + Graphite Context + 针对 HWND 的 swapchain。失败 → false。 */
+bool composekn_win32_vk_create(ComposeKNWin32Window* window);
+
+/**
+ * 获取下一帧 backbuffer 的 SkCanvas*（不转移所有权；仅在 end 前有效）。
+ * width/height 为像素尺寸；尺寸变化会重建 swapchain。失败返回 nullptr。
+ */
+void* composekn_win32_vk_begin_frame(ComposeKNWin32Window* window, int width, int height);
+
+/** snap + present。成功 true。 */
+bool composekn_win32_vk_end_frame(ComposeKNWin32Window* window);
+
+/** 销毁 Graphite/Vulkan 资源。 */
+void composekn_win32_vk_destroy(ComposeKNWin32Window* window);
+
 int composekn_win32_width(ComposeKNWin32Window* window);
 int composekn_win32_height(ComposeKNWin32Window* window);
 

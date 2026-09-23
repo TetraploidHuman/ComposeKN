@@ -3843,3 +3843,34 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
 2. **关窗**：`composekn_win32_show` 在 `SW_HIDE` 后仍 `InvalidateRect`，叠加
    Hide→`WM_SIZE`→`fireRenderTick` 嵌套进 `render`；现 Hide 不再 Invalidate，
    `detach` 先拆 redrawer 再 Hide，嵌套 render 改为直接 return。
+
+#### Graphite / Vulkan（v0.5.30 —— 真机探针版）
+
+目标：一条 **Graphite + Vulkan** 路径同时服务 Windows 与 Linux（Skia Graphite
+公开后端只有 Dawn / Metal / Vulkan，没有 D3D；DX12 只存在于 Ganesh 且仅 Windows）。
+现有 **Ganesh + GL/WGL** 保留为回退。
+
+里程碑：
+
+1. **Skia 重建** ✅ — `gn_args_graphite_vk.txt` +
+   `build-skia-mingw-graphite-vk.sh` → `out/mingw-graphite-vk`；额外 deps
+   `vulkanmemoryallocator` / `vulkan-headers` / `vulkan-tools` /
+   `spirv-headers` / `spirv-tools`（`fetch_deps.py` 已改写 googlesource→GitHub）；
+   `skia-mingw.patch` 修 VMA 的 `/w`→`is_msvc`
+2. **Win32 Vulkan 桥** ✅ — `win32_vulkan.cc`：LoadLibrary `vulkan-1.dll`、
+   Instance/Device/`VkSurfaceKHR`/swapchain、`ContextFactory::MakeVulkan`、
+   `begin_frame`→`SkCanvas*` / `end_frame`→present（finished-proc 销毁 acquire
+   semaphore；swapchain `OUT_OF_DATE` 重建）
+3. **Skiko** ✅ — `WindowsVulkanRedrawer` + 默认先试 Vulkan→GL→软件；
+   `COMPOSEKN_RENDER_API=vulkan|gl|software` 可强制
+4. **发布** ✅ — `ComposeKN-Windows-Native-v0.5.30.zip`；`--build` 默认链
+   `mingw-graphite-vk`
+
+Wine 上常因 winevulkan 缺 instance procs 回退 GL（日志 `vk: missing instance procs`）——
+**必须真机**看 `composekn-startup.log` 是否出现 `skialayer: 使用 Graphite/Vulkan`
+或 `vk: Graphite/Vulkan ready`。
+
+注意：`gn --args="$(tr '\n' ' ' < file)"` 时 **args 文件不能有 `#` 注释行**，
+否则整串被当成一行注释（曾误开默认 dng_sdk）。
+
+后续：Linux/Wayland `VK_KHR_wayland_surface`。

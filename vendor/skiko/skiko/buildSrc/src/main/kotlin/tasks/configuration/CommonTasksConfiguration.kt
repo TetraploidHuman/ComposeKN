@@ -50,6 +50,8 @@ fun skiaHeadersDirs(skiaDir: File): List<File> =
         skiaDir.resolve("include/utils"),
         skiaDir.resolve("include/codec"),
         skiaDir.resolve("include/svg"),
+        // Graphite/Vulkan：SK_USE_INTERNAL_VULKAN_HEADERS → include/third_party/vulkan
+        skiaDir.resolve("include/third_party/vulkan"),
         skiaDir.resolve("modules/jsonreader"),
         skiaDir.resolve("modules/skottie/include"),
         skiaDir.resolve("modules/skparagraph/include"),
@@ -423,6 +425,16 @@ fun mingwGpuBackendFlags(mingwSkiaDir: String? = null): Array<String> {
     val flags = mutableListOf<String>()
     if (mingwGnArgEnabled(mingwSkiaDir, "skia_use_direct3d")) flags += "-DSK_DIRECT3D"
     if (mingwGnArgEnabled(mingwSkiaDir, "skia_use_angle")) flags += "-DSK_ANGLE"
+    // Graphite/Vulkan（out/mingw-graphite-vk）：桥接 win32_vulkan.cc 与
+    // ContextFactory::MakeVulkan 需要这些宏；仅 Ganesh+GL 的包不会定义它们。
+    if (mingwGnArgEnabled(mingwSkiaDir, "skia_use_vulkan")) {
+        flags += "-DSK_VULKAN"
+        flags += "-DSK_USE_INTERNAL_VULKAN_HEADERS"
+        flags += "-DVK_USE_PLATFORM_WIN32_KHR"
+    }
+    if (mingwGnArgEnabled(mingwSkiaDir, "skia_enable_graphite")) {
+        flags += "-DSK_GRAPHITE"
+    }
     return flags.toTypedArray()
 }
 

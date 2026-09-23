@@ -58,10 +58,12 @@ else
     # B. 从源码构建模式（需要 nix-shell 提供的 mingw 交叉工具链）
     # ------------------------------------------------------------------
     WORK="${SKIA_MINGW_WORK:?请设置 SKIA_MINGW_WORK（或改用 SKIA_MINGW_PREBUILT）}"
-    # Windows 宿主默认走 GL/WGL（DirectContext.makeGL）；必须链 Ganesh+GL 的 Skia。
-    # 优先 out/mingw-gl（build-skia-mingw-gl.sh），可用 SKIA_OUT_DIR 覆盖。
+    # Windows 宿主：优先 Graphite+Vulkan（兼带 Ganesh+GL），其次纯 GL，再退 CPU。
+    # 可用 SKIA_OUT_DIR 强制指定。
     if [ -n "${SKIA_OUT_DIR:-}" ]; then
         SKIA_OUT="$SKIA_OUT_DIR"
+    elif [ -f "$WORK/skia/out/mingw-graphite-vk/libskia.a" ]; then
+        SKIA_OUT="$WORK/skia/out/mingw-graphite-vk"
     elif [ -f "$WORK/skia/out/mingw-gl/libskia.a" ]; then
         SKIA_OUT="$WORK/skia/out/mingw-gl"
     else
@@ -113,9 +115,12 @@ else
     #          ② 顺手删掉这两个包装成员，避免它们因别的原因被拉进来造成重复定义。
     mkdir -p "$PATCHED_DIR"
     patch_ucrt_lib() {   # $1 = 原始归档, $2 = 输出归档名
-        local src="$1" out="$PATCHED_DIR/$2" mem="" nm_out=""
-        cp --no-preserve=mode -f "$src" "$out"
-        chmod u+w "$out"
+        local src="$1" out="$PATCHED_DIR/$2" mem="" nm_out="" tmp=""
+        # 写到临时文件再原子 mv，避免 `ar d` 中途失败留下 truncated 归档
+        # （上一次并发/中断曾让 libucrtbase.a 读到 file truncated）。
+        tmp="$(mktemp "$PATCHED_DIR/.$2.XXXXXX")"
+        cp --no-preserve=mode -f "$src" "$tmp"
+        chmod u+w "$tmp"
         # 注意：不要把 `nm` 直接管道给 `awk ... exit`。
         # awk 一命中就退出 → nm 收到 SIGPIPE → 在 `set -o pipefail` 下整行返回 141，
         # `set -e` 把脚本当场干掉（症状：脚本无任何输出、退出码 141）。
@@ -125,13 +130,16 @@ else
             !found && / [TtWw] _onexit$/ {sub("^"a, ""); sub(":.*", ""); mem=$0; found=1}
             END {if (found) print mem}')"
         if [ -n "$mem" ]; then
-            x86_64-w64-mingw32-ar d "$out" "$mem"
+            x86_64-w64-mingw32-ar d "$tmp" "$mem"
         fi
         local left
-        left="$(x86_64-w64-mingw32-nm --defined-only "$out" 2>/dev/null \
+        left="$(x86_64-w64-mingw32-nm --defined-only "$tmp" 2>/dev/null \
                | grep -cE ' [TtWw] _onexit$' || true)"
         printf '    patched %-16s 删除成员[%s] 剩余_onexit=%s\n' "$2" "$mem" "$left"
-        [ "$left" = "0" ] || die "$2 仍有 _onexit 定义，链接会再次递归"
+        [ "$left" = "0" ] || { rm -f "$tmp"; die "$2 仍有 _onexit 定义，链接会再次递归"; }
+        x86_64-w64-mingw32-ar t "$tmp" >/dev/null \
+            || { rm -f "$tmp"; die "$2 修补后 ar t 失败（归档损坏）"; }
+        mv -f "$tmp" "$out"
     }
 
     patch_ucrt_lib "$MINGW_W64_LIB/libucrtbase.a" libucrtbase.a

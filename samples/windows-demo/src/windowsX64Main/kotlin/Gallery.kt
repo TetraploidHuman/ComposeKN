@@ -1276,7 +1276,7 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.29：ClearType PixelGeometry + 关窗嵌套 render 防护",
+                    "v0.5.30：默认 Graphite/Vulkan（失败回退 GL / 软件）",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {

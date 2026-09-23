@@ -178,6 +178,26 @@ internal external fun composekn_win32_gl_swap_buffers(window: COpaquePointer?)
 @SymbolName("composekn_win32_gl_destroy")
 internal external fun composekn_win32_gl_destroy(window: COpaquePointer?)
 
+// ---------------------------------------------------------------------------
+// Graphite + Vulkan
+// ---------------------------------------------------------------------------
+
+@SymbolName("composekn_win32_vk_create")
+internal external fun composekn_win32_vk_create(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_vk_begin_frame")
+internal external fun composekn_win32_vk_begin_frame(
+    window: COpaquePointer?,
+    width: Int,
+    height: Int,
+): NativePointer
+
+@SymbolName("composekn_win32_vk_end_frame")
+internal external fun composekn_win32_vk_end_frame(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_win32_vk_destroy")
+internal external fun composekn_win32_vk_destroy(window: COpaquePointer?)
+
 @SymbolName("composekn_win32_width")
 internal external fun composekn_win32_width(window: COpaquePointer?): Int
 
@@ -591,6 +611,18 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
 
     /** 销毁 WGL 上下文。 */
     fun glDestroy(): Unit = composekn_win32_gl_destroy(native)
+
+    // ---- Graphite + Vulkan ----
+
+    fun vkCreate(): Boolean = composekn_win32_vk_create(native)
+
+    /** 下一帧 backbuffer 的 SkCanvas*；失败返回 [Native.NullPointer]。 */
+    fun vkBeginFrame(width: Int, height: Int): NativePointer =
+        composekn_win32_vk_begin_frame(native, width, height)
+
+    fun vkEndFrame(): Boolean = composekn_win32_vk_end_frame(native)
+
+    fun vkDestroy(): Unit = composekn_win32_vk_destroy(native)
 
     // 注意：这里必须用 memScoped + alloc<>().ptr 传「真实指针」。
     // Kotlin 的 IntArray/FloatArray/UIntArray 是托管对象，传给 external 函数时
