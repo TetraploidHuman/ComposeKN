@@ -472,6 +472,8 @@ internal external fun composekn_win32_post_test_key(
  * High-level wrapper over the Win32 C bridge. All calls are main-thread only.
  */
 class Win32Window internal constructor(internal val native: COpaquePointer) : AutoCloseable {
+    private var destroyed = false
+
     /**
      * 建窗口。`width`/`height` 的单位是 **dp（逻辑像素）**，与 Compose 桌面的
      * `WindowState(size = DpSize(...))` 一致：C 侧会按系统 DPI 换算成物理像素，
@@ -1095,6 +1097,8 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     }
 
     override fun close() {
+        if (destroyed) return
+        destroyed = true
         composekn_win32_destroy(native)
     }
 }

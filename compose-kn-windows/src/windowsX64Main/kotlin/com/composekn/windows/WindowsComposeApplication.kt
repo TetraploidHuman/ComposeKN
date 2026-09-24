@@ -327,8 +327,10 @@ class WindowsComposeApplication(
     /** 从共享宿主摘掉并释放场景（声明式 Window 离开 composition 时）。 */
     fun detachFromSharedHost() {
         WindowsApplicationHost.installImeProviders(window, null, null, null)
-        window.detachFromHost()
+        // 先关 Compose 场景（可能仍碰 SkiaLayer），再拆 HWND/WGL。
+        // 反过来时 scene.close()/recomposer 会打到已 delete 的 native → 真机 AV @0xc。
         close()
+        window.detachFromHost()
     }
 
     /** 独占泵路径：直接挂全局 IME（单窗，无 Host 路由）。 */

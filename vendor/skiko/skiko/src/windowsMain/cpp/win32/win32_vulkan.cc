@@ -584,6 +584,20 @@ bool createSwapchain(ComposeKNVkContext* ctx, int width, int height) {
     VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // Graphite VulkanCaps：可渲染颜色纹理必须同时带 INPUT_ATTACHMENT（见 getTextureUsage）。
+    // 上游 GraphiteNativeVulkanWindowContext 同样按 supportedUsageFlags 叠加。
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
+        usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+    }
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) {
+        usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    if ((caps.supportedUsageFlags & usage) != usage) {
+        vkLog("vk: surface usage unsupported want=0x%x have=0x%x",
+              static_cast<unsigned>(usage),
+              static_cast<unsigned>(caps.supportedUsageFlags));
+        return false;
+    }
 
     VkSwapchainCreateInfoKHR sci{};
     sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -602,7 +616,10 @@ bool createSwapchain(ComposeKNVkContext* ctx, int width, int height) {
     } else {
         sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     }
-    sci.preTransform = caps.currentTransform;
+    // 上游固定 IDENTITY；用 currentTransform 在部分旋转屏上会让 extent 语义对不上。
+    sci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                               ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                               : caps.currentTransform;
     sci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
                                  ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                                  : VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
@@ -652,13 +669,30 @@ bool createSwapchain(ComposeKNVkContext* ctx, int width, int height) {
                 ctx->presentQueueFamily,
                 ctx->images[i].image,
                 skgpu::VulkanAlloc());
+        if (!backendTex.isValid()) {
+            vkLog("vk: MakeVulkan backendTex invalid for image %u fmt=%u usage=0x%x %dx%d",
+                  i,
+                  static_cast<unsigned>(ctx->swapchainFormat),
+                  static_cast<unsigned>(ctx->swapchainUsage),
+                  ctx->width,
+                  ctx->height);
+            resetSwapchainImages(ctx);
+            return false;
+        }
         ctx->images[i].surface = SkSurfaces::WrapBackendTexture(
                 ctx->recorder.get(),
                 backendTex,
                 SkColorSpace::MakeSRGB(),
                 &props);
         if (!ctx->images[i].surface) {
-            vkLog("vk: WrapBackendTexture failed for swapchain image %u", i);
+            vkLog("vk: WrapBackendTexture failed for swapchain image %u "
+                  "fmt=%u usage=0x%x share=%u %dx%d (need INPUT_ATTACHMENT for Graphite render)",
+                  i,
+                  static_cast<unsigned>(ctx->swapchainFormat),
+                  static_cast<unsigned>(ctx->swapchainUsage),
+                  static_cast<unsigned>(ctx->swapchainSharing),
+                  ctx->width,
+                  ctx->height);
             resetSwapchainImages(ctx);
             return false;
         }

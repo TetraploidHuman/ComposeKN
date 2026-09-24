@@ -1276,7 +1276,7 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.32：修 Vulkan getProc + 关窗 Close 后勿再派事件",
+                    "v0.5.33：swapchain INPUT_ATTACHMENT + 关窗先 close 场景",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {
