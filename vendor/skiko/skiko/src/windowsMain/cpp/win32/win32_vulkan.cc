@@ -4,7 +4,9 @@
  * 对照上游 tools/window/GraphiteNativeVulkanWindowContext.cpp，但：
  *   - 不依赖 tools/（自建 VkInstance/Device + Win32 surface/swapchain）；
  *   - C API 暴露给 Kotlin（begin_frame → SkCanvas*，end_frame → present）；
- *   - 动态 LoadLibrary("vulkan-1.dll")，不链 libvulkan。
+ *   - 动态 LoadLibrary("vulkan-1.dll")，不链 libvulkan；
+ *   - process-wide 共享 VkInstance/Device/Graphite Context（refcount）；
+ *     每窗只持有 surface/swapchain/recorder/blit 等。
  *
  * 未定义 SK_VULKAN+SK_GRAPHITE 时全部 stub 失败（链纯 GL Skia 包时仍能编过）。
  */
@@ -75,7 +77,10 @@ struct SwapchainImage {
     sk_sp<SkSurface> surface;
 };
 
-struct ComposeKNVkContext {
+// Process-wide Vulkan/Graphite device (refcount). Per-window state stays on ComposeKNVkContext.
+struct ComposeKNVkShared {
+    int refcount = 0;
+    // First window's HWND (for any surface-dependent present checks during device create).
     HWND hwnd = nullptr;
 
     HMODULE vulkanLib = nullptr;
@@ -97,6 +102,71 @@ struct ComposeKNVkContext {
     sk_sp<skgpu::VulkanMemoryAllocator> memoryAllocator;
 
     std::unique_ptr<skgpu::graphite::Context> graphite;
+
+    PFN_vkDestroyInstance DestroyInstance = nullptr;
+    PFN_vkDestroyDevice DestroyDevice = nullptr;
+    PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
+    PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
+    PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
+    PFN_vkQueueSubmit QueueSubmit = nullptr;
+    PFN_vkDestroySurfaceKHR DestroySurfaceKHR = nullptr;
+    PFN_vkCreateWin32SurfaceKHR CreateWin32SurfaceKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR GetPhysicalDeviceSurfaceSupportKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR GetPhysicalDeviceSurfaceFormatsKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR GetPhysicalDeviceSurfacePresentModesKHR = nullptr;
+    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
+    PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
+    PFN_vkDestroySwapchainKHR DestroySwapchainKHR = nullptr;
+    PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR = nullptr;
+    PFN_vkAcquireNextImageKHR AcquireNextImageKHR = nullptr;
+    PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
+    PFN_vkCreateSemaphore CreateSemaphore = nullptr;
+    PFN_vkDestroySemaphore DestroySemaphore = nullptr;
+    PFN_vkCreateImage CreateImage = nullptr;
+    PFN_vkDestroyImage DestroyImage = nullptr;
+    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
+    PFN_vkAllocateMemory AllocateMemory = nullptr;
+    PFN_vkFreeMemory FreeMemory = nullptr;
+    PFN_vkBindImageMemory BindImageMemory = nullptr;
+    PFN_vkCreateCommandPool CreateCommandPool = nullptr;
+    PFN_vkDestroyCommandPool DestroyCommandPool = nullptr;
+    PFN_vkAllocateCommandBuffers AllocateCommandBuffers = nullptr;
+    PFN_vkBeginCommandBuffer BeginCommandBuffer = nullptr;
+    PFN_vkEndCommandBuffer EndCommandBuffer = nullptr;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
+    PFN_vkCmdCopyImage CmdCopyImage = nullptr;
+    PFN_vkCreateFence CreateFence = nullptr;
+    PFN_vkDestroyFence DestroyFence = nullptr;
+    PFN_vkWaitForFences WaitForFences = nullptr;
+    PFN_vkResetFences ResetFences = nullptr;
+    PFN_vkResetCommandBuffer ResetCommandBuffer = nullptr;
+};
+
+ComposeKNVkShared* g_vkShared = nullptr;
+
+struct ComposeKNVkContext {
+    HWND hwnd = nullptr;
+
+    ComposeKNVkShared* shared = nullptr;
+
+    // Mirrored from shared for minimal call-site churn (non-owning).
+    HMODULE vulkanLib = nullptr;
+    PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
+    PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    VkQueue presentQueue = VK_NULL_HANDLE;
+    uint32_t graphicsQueueFamily = 0;
+    uint32_t presentQueueFamily = 0;
+    uint32_t apiVersion = VK_API_VERSION_1_1;
+
+    // Non-owning; owned by ComposeKNVkShared.
+    skgpu::graphite::Context* graphite = nullptr;
+    // Per-window recorder from shared graphite->makeRecorder().
     std::unique_ptr<skgpu::graphite::Recorder> recorder;
 
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -120,7 +190,7 @@ struct ComposeKNVkContext {
     VkCommandBuffer blitCmd = VK_NULL_HANDLE;
     VkFence blitFence = VK_NULL_HANDLE;
 
-    // Cached procs
+    // Cached procs (mirrored from shared)
     PFN_vkDestroyInstance DestroyInstance = nullptr;
     PFN_vkDestroyDevice DestroyDevice = nullptr;
     PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
@@ -169,71 +239,181 @@ ComposeKNVkContext* vkOf(ComposeKNWin32Window* window) {
     return it == g_vkByWindow.end() ? nullptr : it->second;
 }
 
-PFN_vkVoidFunction getProc(ComposeKNVkContext* ctx,
+void bindSharedToCtx(ComposeKNVkContext* ctx, ComposeKNVkShared* s) {
+    if (!ctx || !s) return;
+    ctx->shared = s;
+    ctx->vulkanLib = s->vulkanLib;
+    ctx->getInstanceProcAddr = s->getInstanceProcAddr;
+    ctx->getDeviceProcAddr = s->getDeviceProcAddr;
+    ctx->instance = s->instance;
+    ctx->physicalDevice = s->physicalDevice;
+    ctx->device = s->device;
+    ctx->graphicsQueue = s->graphicsQueue;
+    ctx->presentQueue = s->presentQueue;
+    ctx->graphicsQueueFamily = s->graphicsQueueFamily;
+    ctx->presentQueueFamily = s->presentQueueFamily;
+    ctx->apiVersion = s->apiVersion;
+    ctx->graphite = s->graphite.get();
+    ctx->DestroyInstance = s->DestroyInstance;
+    ctx->DestroyDevice = s->DestroyDevice;
+    ctx->DeviceWaitIdle = s->DeviceWaitIdle;
+    ctx->QueueWaitIdle = s->QueueWaitIdle;
+    ctx->GetDeviceQueue = s->GetDeviceQueue;
+    ctx->QueueSubmit = s->QueueSubmit;
+    ctx->DestroySurfaceKHR = s->DestroySurfaceKHR;
+    ctx->CreateWin32SurfaceKHR = s->CreateWin32SurfaceKHR;
+    ctx->GetPhysicalDeviceSurfaceSupportKHR = s->GetPhysicalDeviceSurfaceSupportKHR;
+    ctx->GetPhysicalDeviceSurfaceCapabilitiesKHR = s->GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    ctx->GetPhysicalDeviceSurfaceFormatsKHR = s->GetPhysicalDeviceSurfaceFormatsKHR;
+    ctx->GetPhysicalDeviceSurfacePresentModesKHR = s->GetPhysicalDeviceSurfacePresentModesKHR;
+    ctx->GetPhysicalDeviceMemoryProperties = s->GetPhysicalDeviceMemoryProperties;
+    ctx->CreateSwapchainKHR = s->CreateSwapchainKHR;
+    ctx->DestroySwapchainKHR = s->DestroySwapchainKHR;
+    ctx->GetSwapchainImagesKHR = s->GetSwapchainImagesKHR;
+    ctx->AcquireNextImageKHR = s->AcquireNextImageKHR;
+    ctx->QueuePresentKHR = s->QueuePresentKHR;
+    ctx->CreateSemaphore = s->CreateSemaphore;
+    ctx->DestroySemaphore = s->DestroySemaphore;
+    ctx->CreateImage = s->CreateImage;
+    ctx->DestroyImage = s->DestroyImage;
+    ctx->GetImageMemoryRequirements = s->GetImageMemoryRequirements;
+    ctx->AllocateMemory = s->AllocateMemory;
+    ctx->FreeMemory = s->FreeMemory;
+    ctx->BindImageMemory = s->BindImageMemory;
+    ctx->CreateCommandPool = s->CreateCommandPool;
+    ctx->DestroyCommandPool = s->DestroyCommandPool;
+    ctx->AllocateCommandBuffers = s->AllocateCommandBuffers;
+    ctx->BeginCommandBuffer = s->BeginCommandBuffer;
+    ctx->EndCommandBuffer = s->EndCommandBuffer;
+    ctx->CmdPipelineBarrier = s->CmdPipelineBarrier;
+    ctx->CmdCopyImage = s->CmdCopyImage;
+    ctx->CreateFence = s->CreateFence;
+    ctx->DestroyFence = s->DestroyFence;
+    ctx->WaitForFences = s->WaitForFences;
+    ctx->ResetFences = s->ResetFences;
+    ctx->ResetCommandBuffer = s->ResetCommandBuffer;
+}
+
+void clearSharedMirrors(ComposeKNVkContext* ctx) {
+    if (!ctx) return;
+    ctx->shared = nullptr;
+    ctx->vulkanLib = nullptr;
+    ctx->getInstanceProcAddr = nullptr;
+    ctx->getDeviceProcAddr = nullptr;
+    ctx->instance = VK_NULL_HANDLE;
+    ctx->physicalDevice = VK_NULL_HANDLE;
+    ctx->device = VK_NULL_HANDLE;
+    ctx->graphicsQueue = VK_NULL_HANDLE;
+    ctx->presentQueue = VK_NULL_HANDLE;
+    ctx->graphicsQueueFamily = 0;
+    ctx->presentQueueFamily = 0;
+    ctx->apiVersion = VK_API_VERSION_1_1;
+    ctx->graphite = nullptr;
+    ctx->DestroyInstance = nullptr;
+    ctx->DestroyDevice = nullptr;
+    ctx->DeviceWaitIdle = nullptr;
+    ctx->QueueWaitIdle = nullptr;
+    ctx->GetDeviceQueue = nullptr;
+    ctx->QueueSubmit = nullptr;
+    ctx->DestroySurfaceKHR = nullptr;
+    ctx->CreateWin32SurfaceKHR = nullptr;
+    ctx->GetPhysicalDeviceSurfaceSupportKHR = nullptr;
+    ctx->GetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
+    ctx->GetPhysicalDeviceSurfaceFormatsKHR = nullptr;
+    ctx->GetPhysicalDeviceSurfacePresentModesKHR = nullptr;
+    ctx->GetPhysicalDeviceMemoryProperties = nullptr;
+    ctx->CreateSwapchainKHR = nullptr;
+    ctx->DestroySwapchainKHR = nullptr;
+    ctx->GetSwapchainImagesKHR = nullptr;
+    ctx->AcquireNextImageKHR = nullptr;
+    ctx->QueuePresentKHR = nullptr;
+    ctx->CreateSemaphore = nullptr;
+    ctx->DestroySemaphore = nullptr;
+    ctx->CreateImage = nullptr;
+    ctx->DestroyImage = nullptr;
+    ctx->GetImageMemoryRequirements = nullptr;
+    ctx->AllocateMemory = nullptr;
+    ctx->FreeMemory = nullptr;
+    ctx->BindImageMemory = nullptr;
+    ctx->CreateCommandPool = nullptr;
+    ctx->DestroyCommandPool = nullptr;
+    ctx->AllocateCommandBuffers = nullptr;
+    ctx->BeginCommandBuffer = nullptr;
+    ctx->EndCommandBuffer = nullptr;
+    ctx->CmdPipelineBarrier = nullptr;
+    ctx->CmdCopyImage = nullptr;
+    ctx->CreateFence = nullptr;
+    ctx->DestroyFence = nullptr;
+    ctx->WaitForFences = nullptr;
+    ctx->ResetFences = nullptr;
+    ctx->ResetCommandBuffer = nullptr;
+}
+
+PFN_vkVoidFunction getProc(ComposeKNVkShared* shared,
                            const char* name,
                            VkInstance instance,
                            VkDevice device) {
-    if (!ctx || !name) return nullptr;
+    if (!shared || !name) return nullptr;
 
     // Device-level：必须走 vkGetDeviceProcAddr（不能靠 gipa(instance, …)）。
     if (device != VK_NULL_HANDLE) {
-        if (!ctx->getDeviceProcAddr) {
+        if (!shared->getDeviceProcAddr) {
             VkInstance instForGdpa =
-                    (instance != VK_NULL_HANDLE) ? instance : ctx->instance;
-            if (ctx->getInstanceProcAddr && instForGdpa != VK_NULL_HANDLE) {
-                ctx->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                        ctx->getInstanceProcAddr(instForGdpa, "vkGetDeviceProcAddr"));
+                    (instance != VK_NULL_HANDLE) ? instance : shared->instance;
+            if (shared->getInstanceProcAddr && instForGdpa != VK_NULL_HANDLE) {
+                shared->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                        shared->getInstanceProcAddr(instForGdpa, "vkGetDeviceProcAddr"));
             }
-            if (!ctx->getDeviceProcAddr && ctx->getInstanceProcAddr) {
-                ctx->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                        ctx->getInstanceProcAddr(VK_NULL_HANDLE, "vkGetDeviceProcAddr"));
+            if (!shared->getDeviceProcAddr && shared->getInstanceProcAddr) {
+                shared->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                        shared->getInstanceProcAddr(VK_NULL_HANDLE, "vkGetDeviceProcAddr"));
             }
-            if (!ctx->getDeviceProcAddr && ctx->vulkanLib) {
-                ctx->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                        GetProcAddress(ctx->vulkanLib, "vkGetDeviceProcAddr"));
+            if (!shared->getDeviceProcAddr && shared->vulkanLib) {
+                shared->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                        GetProcAddress(shared->vulkanLib, "vkGetDeviceProcAddr"));
             }
         }
-        if (ctx->getDeviceProcAddr) {
-            if (PFN_vkVoidFunction p = ctx->getDeviceProcAddr(device, name)) {
+        if (shared->getDeviceProcAddr) {
+            if (PFN_vkVoidFunction p = shared->getDeviceProcAddr(device, name)) {
                 return p;
             }
         }
     }
 
     // Instance-level
-    if (instance != VK_NULL_HANDLE && ctx->getInstanceProcAddr) {
-        if (PFN_vkVoidFunction p = ctx->getInstanceProcAddr(instance, name)) {
+    if (instance != VK_NULL_HANDLE && shared->getInstanceProcAddr) {
+        if (PFN_vkVoidFunction p = shared->getInstanceProcAddr(instance, name)) {
             return p;
         }
     }
 
     // Global（CreateInstance 之前 / MakeInterface 校验 CreateInstance 等）：
     // Windows 加载器对 gipa(NULL, "vkCreateInstance") 常返回 NULL，必须先 GetProcAddress。
-    if (ctx->vulkanLib) {
+    if (shared->vulkanLib) {
         if (PFN_vkVoidFunction p = reinterpret_cast<PFN_vkVoidFunction>(
-                    GetProcAddress(ctx->vulkanLib, name))) {
+                    GetProcAddress(shared->vulkanLib, name))) {
             return p;
         }
     }
-    if (ctx->getInstanceProcAddr) {
-        return ctx->getInstanceProcAddr(VK_NULL_HANDLE, name);
+    if (shared->getInstanceProcAddr) {
+        return shared->getInstanceProcAddr(VK_NULL_HANDLE, name);
     }
     return nullptr;
 }
 
-bool loadVulkan(ComposeKNVkContext* ctx) {
-    ctx->vulkanLib = LoadLibraryA("vulkan-1.dll");
-    if (!ctx->vulkanLib) {
+bool loadVulkan(ComposeKNVkShared* shared) {
+    shared->vulkanLib = LoadLibraryA("vulkan-1.dll");
+    if (!shared->vulkanLib) {
         vkLog("vk: LoadLibrary(vulkan-1.dll) failed (%lu)", GetLastError());
         return false;
     }
     char modPath[MAX_PATH] = {};
-    if (GetModuleFileNameA(ctx->vulkanLib, modPath, MAX_PATH) > 0) {
+    if (GetModuleFileNameA(shared->vulkanLib, modPath, MAX_PATH) > 0) {
         vkLog("vk: loaded %s", modPath);
     }
-    ctx->getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-            GetProcAddress(ctx->vulkanLib, "vkGetInstanceProcAddr"));
-    if (!ctx->getInstanceProcAddr) {
+    shared->getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+            GetProcAddress(shared->vulkanLib, "vkGetInstanceProcAddr"));
+    if (!shared->getInstanceProcAddr) {
         vkLog("vk: vkGetInstanceProcAddr missing");
         return false;
     }
@@ -244,26 +424,26 @@ bool loadVulkan(ComposeKNVkContext* ctx) {
 // vkGetInstanceProcAddr(NULL, "vkCreateInstance") 返回 NULL，但 DLL 导出表有这些符号。
 // GLFW / SDL / Skia tools 都是优先 GetProcAddress，再回退 gipa(NULL)。
 template <typename T>
-T loadGlobalProc(ComposeKNVkContext* ctx, const char* name) {
-    T viaDll = reinterpret_cast<T>(GetProcAddress(ctx->vulkanLib, name));
+T loadGlobalProc(ComposeKNVkShared* shared, const char* name) {
+    T viaDll = reinterpret_cast<T>(GetProcAddress(shared->vulkanLib, name));
     if (viaDll) return viaDll;
-    if (ctx->getInstanceProcAddr) {
-        return reinterpret_cast<T>(ctx->getInstanceProcAddr(VK_NULL_HANDLE, name));
+    if (shared->getInstanceProcAddr) {
+        return reinterpret_cast<T>(shared->getInstanceProcAddr(VK_NULL_HANDLE, name));
     }
     return nullptr;
 }
 
-bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
-    auto gipa = ctx->getInstanceProcAddr;
+bool createInstanceAndDevice(ComposeKNVkShared* shared) {
+    auto gipa = shared->getInstanceProcAddr;
     auto enumerateInstanceExt =
             loadGlobalProc<PFN_vkEnumerateInstanceExtensionProperties>(
-                    ctx, "vkEnumerateInstanceExtensionProperties");
+                    shared, "vkEnumerateInstanceExtensionProperties");
     auto createInstance =
-            loadGlobalProc<PFN_vkCreateInstance>(ctx, "vkCreateInstance");
+            loadGlobalProc<PFN_vkCreateInstance>(shared, "vkCreateInstance");
     auto enumeratePhys =
-            loadGlobalProc<PFN_vkEnumeratePhysicalDevices>(ctx, "vkEnumeratePhysicalDevices");
+            loadGlobalProc<PFN_vkEnumeratePhysicalDevices>(shared, "vkEnumeratePhysicalDevices");
     auto enumerateInstanceVersion =
-            loadGlobalProc<PFN_vkEnumerateInstanceVersion>(ctx, "vkEnumerateInstanceVersion");
+            loadGlobalProc<PFN_vkEnumerateInstanceVersion>(shared, "vkEnumerateInstanceVersion");
     if (!enumerateInstanceExt || !createInstance || !enumeratePhys) {
         vkLog("vk: missing global procs (ext=%p create=%p phys=%p gipa=%p)",
               (void*)enumerateInstanceExt,
@@ -282,8 +462,8 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
         }
     }
 
-    ctx->apiVersion = VK_API_VERSION_1_1;
-    ctx->preferredFeatures.init(ctx->apiVersion);
+    shared->apiVersion = VK_API_VERSION_1_1;
+    shared->preferredFeatures.init(shared->apiVersion);
 
     uint32_t extCount = 0;
     enumerateInstanceExt(nullptr, &extCount, nullptr);
@@ -296,64 +476,66 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
             VK_KHR_SURFACE_EXTENSION_NAME,
             VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
     };
-    ctx->preferredFeatures.addToInstanceExtensions(
+    shared->preferredFeatures.addToInstanceExtensions(
             availableExts.data(), availableExts.size(), instanceExts);
 
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "ComposeKN";
-    appInfo.apiVersion = ctx->apiVersion;
+    appInfo.apiVersion = shared->apiVersion;
 
     VkInstanceCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &appInfo;
     ici.enabledExtensionCount = static_cast<uint32_t>(instanceExts.size());
     ici.ppEnabledExtensionNames = instanceExts.data();
-    if (createInstance(&ici, nullptr, &ctx->instance) != VK_SUCCESS) {
+    if (createInstance(&ici, nullptr, &shared->instance) != VK_SUCCESS) {
         vkLog("vk: vkCreateInstance failed");
         return false;
     }
 
-    ctx->DestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
-            gipa(ctx->instance, "vkDestroyInstance"));
-    ctx->CreateWin32SurfaceKHR = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
-            gipa(ctx->instance, "vkCreateWin32SurfaceKHR"));
-    ctx->DestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
-            gipa(ctx->instance, "vkDestroySurfaceKHR"));
-    ctx->GetPhysicalDeviceSurfaceSupportKHR =
+    shared->DestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
+            gipa(shared->instance, "vkDestroyInstance"));
+    shared->CreateWin32SurfaceKHR = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+            gipa(shared->instance, "vkCreateWin32SurfaceKHR"));
+    shared->DestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
+            gipa(shared->instance, "vkDestroySurfaceKHR"));
+    shared->GetPhysicalDeviceSurfaceSupportKHR =
             reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(
-                    gipa(ctx->instance, "vkGetPhysicalDeviceSurfaceSupportKHR"));
-    ctx->GetPhysicalDeviceSurfaceCapabilitiesKHR =
+                    gipa(shared->instance, "vkGetPhysicalDeviceSurfaceSupportKHR"));
+    shared->GetPhysicalDeviceSurfaceCapabilitiesKHR =
             reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
-                    gipa(ctx->instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
-    ctx->GetPhysicalDeviceSurfaceFormatsKHR =
+                    gipa(shared->instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+    shared->GetPhysicalDeviceSurfaceFormatsKHR =
             reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
-                    gipa(ctx->instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
-    ctx->GetPhysicalDeviceSurfacePresentModesKHR =
+                    gipa(shared->instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+    shared->GetPhysicalDeviceSurfacePresentModesKHR =
             reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
-                    gipa(ctx->instance, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
+                    gipa(shared->instance, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
 
     auto enumQueueFamilies = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-            gipa(ctx->instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+            gipa(shared->instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
     auto enumDeviceExt = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
-            gipa(ctx->instance, "vkEnumerateDeviceExtensionProperties"));
+            gipa(shared->instance, "vkEnumerateDeviceExtensionProperties"));
     auto createDevice = reinterpret_cast<PFN_vkCreateDevice>(
-            gipa(ctx->instance, "vkCreateDevice"));
+            gipa(shared->instance, "vkCreateDevice"));
     auto getPhysProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-            gipa(ctx->instance, "vkGetPhysicalDeviceProperties"));
+            gipa(shared->instance, "vkGetPhysicalDeviceProperties"));
     auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
-            gipa(ctx->instance, "vkGetPhysicalDeviceFeatures2"));
+            gipa(shared->instance, "vkGetPhysicalDeviceFeatures2"));
 
     uint32_t physCount = 0;
-    enumeratePhys(ctx->instance, &physCount, nullptr);
+    enumeratePhys(shared->instance, &physCount, nullptr);
     if (physCount == 0) {
         vkLog("vk: no physical devices");
         return false;
     }
     std::vector<VkPhysicalDevice> devices(physCount);
-    enumeratePhys(ctx->instance, &physCount, devices.data());
+    enumeratePhys(shared->instance, &physCount, devices.data());
 
     // Prefer discrete GPU with graphics + present.
+    // Present: GetPhysicalDeviceWin32PresentationSupportKHR (no surface needed).
+    // shared->hwnd is retained for any future surface-dependent checks.
     int bestScore = -1;
     for (VkPhysicalDevice pd : devices) {
         uint32_t qCount = 0;
@@ -369,7 +551,8 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
             }
             auto getPresentSupport =
                     reinterpret_cast<PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR>(
-                            gipa(ctx->instance, "vkGetPhysicalDeviceWin32PresentationSupportKHR"));
+                            gipa(shared->instance,
+                                 "vkGetPhysicalDeviceWin32PresentationSupportKHR"));
             if (getPresentSupport && getPresentSupport(pd, i)) {
                 present = static_cast<int>(i);
             }
@@ -381,19 +564,19 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
         int score = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) ? 100 : 10;
         if (score > bestScore) {
             bestScore = score;
-            ctx->physicalDevice = pd;
-            ctx->graphicsQueueFamily = static_cast<uint32_t>(gfx);
-            ctx->presentQueueFamily = static_cast<uint32_t>(present);
+            shared->physicalDevice = pd;
+            shared->graphicsQueueFamily = static_cast<uint32_t>(gfx);
+            shared->presentQueueFamily = static_cast<uint32_t>(present);
         }
     }
-    if (ctx->physicalDevice == VK_NULL_HANDLE) {
+    if (shared->physicalDevice == VK_NULL_HANDLE) {
         vkLog("vk: no suitable GPU with Win32 present");
         return false;
     }
 
     if (getPhysProps) {
         VkPhysicalDeviceProperties props{};
-        getPhysProps(ctx->physicalDevice, &props);
+        getPhysProps(shared->physicalDevice, &props);
         vkLog("vk: device=%s type=%u api=%u.%u.%u",
               props.deviceName,
               static_cast<unsigned>(props.deviceType),
@@ -403,40 +586,40 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
     }
 
     uint32_t devExtCount = 0;
-    enumDeviceExt(ctx->physicalDevice, nullptr, &devExtCount, nullptr);
+    enumDeviceExt(shared->physicalDevice, nullptr, &devExtCount, nullptr);
     std::vector<VkExtensionProperties> availableDevExts(devExtCount);
     if (devExtCount) {
-        enumDeviceExt(ctx->physicalDevice, nullptr, &devExtCount, availableDevExts.data());
+        enumDeviceExt(shared->physicalDevice, nullptr, &devExtCount, availableDevExts.data());
     }
 
-    ctx->deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    ctx->preferredFeatures.addFeaturesToQuery(availableDevExts.data(),
-                                              availableDevExts.size(),
-                                              ctx->deviceFeatures2);
+    shared->deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    shared->preferredFeatures.addFeaturesToQuery(availableDevExts.data(),
+                                                 availableDevExts.size(),
+                                                 shared->deviceFeatures2);
     if (getFeatures2) {
-        getFeatures2(ctx->physicalDevice, &ctx->deviceFeatures2);
+        getFeatures2(shared->physicalDevice, &shared->deviceFeatures2);
     }
 
     std::vector<const char*> deviceExts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    ctx->preferredFeatures.addFeaturesToEnable(deviceExts, ctx->deviceFeatures2);
+    shared->preferredFeatures.addFeaturesToEnable(deviceExts, shared->deviceFeatures2);
 
     float queuePriority = 1.0f;
     std::vector<VkDeviceQueueCreateInfo> queueCis;
     VkDeviceQueueCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    qci.queueFamilyIndex = ctx->graphicsQueueFamily;
+    qci.queueFamilyIndex = shared->graphicsQueueFamily;
     qci.queueCount = 1;
     qci.pQueuePriorities = &queuePriority;
     queueCis.push_back(qci);
-    if (ctx->presentQueueFamily != ctx->graphicsQueueFamily) {
+    if (shared->presentQueueFamily != shared->graphicsQueueFamily) {
         VkDeviceQueueCreateInfo pqci = qci;
-        pqci.queueFamilyIndex = ctx->presentQueueFamily;
+        pqci.queueFamilyIndex = shared->presentQueueFamily;
         queueCis.push_back(pqci);
     }
 
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    dci.pNext = &ctx->deviceFeatures2;
+    dci.pNext = &shared->deviceFeatures2;
     dci.queueCreateInfoCount = static_cast<uint32_t>(queueCis.size());
     dci.pQueueCreateInfos = queueCis.data();
     dci.enabledExtensionCount = static_cast<uint32_t>(deviceExts.size());
@@ -444,86 +627,86 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
     // pEnabledFeatures must be null when using Features2 in pNext
     dci.pEnabledFeatures = nullptr;
 
-    if (createDevice(ctx->physicalDevice, &dci, nullptr, &ctx->device) != VK_SUCCESS) {
+    if (createDevice(shared->physicalDevice, &dci, nullptr, &shared->device) != VK_SUCCESS) {
         vkLog("vk: vkCreateDevice failed");
         return false;
     }
 
-    ctx->DestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(
-            getProc(ctx, "vkDestroyDevice", ctx->instance, ctx->device));
-    ctx->DeviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(
-            getProc(ctx, "vkDeviceWaitIdle", ctx->instance, ctx->device));
-    ctx->QueueWaitIdle = reinterpret_cast<PFN_vkQueueWaitIdle>(
-            getProc(ctx, "vkQueueWaitIdle", ctx->instance, ctx->device));
-    ctx->GetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(
-            getProc(ctx, "vkGetDeviceQueue", ctx->instance, ctx->device));
-    ctx->CreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(
-            getProc(ctx, "vkCreateSwapchainKHR", ctx->instance, ctx->device));
-    ctx->DestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(
-            getProc(ctx, "vkDestroySwapchainKHR", ctx->instance, ctx->device));
-    ctx->GetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(
-            getProc(ctx, "vkGetSwapchainImagesKHR", ctx->instance, ctx->device));
-    ctx->AcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(
-            getProc(ctx, "vkAcquireNextImageKHR", ctx->instance, ctx->device));
-    ctx->QueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(
-            getProc(ctx, "vkQueuePresentKHR", ctx->instance, ctx->device));
-    ctx->CreateSemaphore = reinterpret_cast<PFN_vkCreateSemaphore>(
-            getProc(ctx, "vkCreateSemaphore", ctx->instance, ctx->device));
-    ctx->DestroySemaphore = reinterpret_cast<PFN_vkDestroySemaphore>(
-            getProc(ctx, "vkDestroySemaphore", ctx->instance, ctx->device));
-    ctx->QueueSubmit = reinterpret_cast<PFN_vkQueueSubmit>(
-            getProc(ctx, "vkQueueSubmit", ctx->instance, ctx->device));
-    ctx->GetPhysicalDeviceMemoryProperties =
+    shared->DestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(
+            getProc(shared, "vkDestroyDevice", shared->instance, shared->device));
+    shared->DeviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(
+            getProc(shared, "vkDeviceWaitIdle", shared->instance, shared->device));
+    shared->QueueWaitIdle = reinterpret_cast<PFN_vkQueueWaitIdle>(
+            getProc(shared, "vkQueueWaitIdle", shared->instance, shared->device));
+    shared->GetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(
+            getProc(shared, "vkGetDeviceQueue", shared->instance, shared->device));
+    shared->CreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(
+            getProc(shared, "vkCreateSwapchainKHR", shared->instance, shared->device));
+    shared->DestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(
+            getProc(shared, "vkDestroySwapchainKHR", shared->instance, shared->device));
+    shared->GetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(
+            getProc(shared, "vkGetSwapchainImagesKHR", shared->instance, shared->device));
+    shared->AcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(
+            getProc(shared, "vkAcquireNextImageKHR", shared->instance, shared->device));
+    shared->QueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(
+            getProc(shared, "vkQueuePresentKHR", shared->instance, shared->device));
+    shared->CreateSemaphore = reinterpret_cast<PFN_vkCreateSemaphore>(
+            getProc(shared, "vkCreateSemaphore", shared->instance, shared->device));
+    shared->DestroySemaphore = reinterpret_cast<PFN_vkDestroySemaphore>(
+            getProc(shared, "vkDestroySemaphore", shared->instance, shared->device));
+    shared->QueueSubmit = reinterpret_cast<PFN_vkQueueSubmit>(
+            getProc(shared, "vkQueueSubmit", shared->instance, shared->device));
+    shared->GetPhysicalDeviceMemoryProperties =
             reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
-                    gipa(ctx->instance, "vkGetPhysicalDeviceMemoryProperties"));
-    ctx->CreateImage = reinterpret_cast<PFN_vkCreateImage>(
-            getProc(ctx, "vkCreateImage", ctx->instance, ctx->device));
-    ctx->DestroyImage = reinterpret_cast<PFN_vkDestroyImage>(
-            getProc(ctx, "vkDestroyImage", ctx->instance, ctx->device));
-    ctx->GetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
-            getProc(ctx, "vkGetImageMemoryRequirements", ctx->instance, ctx->device));
-    ctx->AllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(
-            getProc(ctx, "vkAllocateMemory", ctx->instance, ctx->device));
-    ctx->FreeMemory = reinterpret_cast<PFN_vkFreeMemory>(
-            getProc(ctx, "vkFreeMemory", ctx->instance, ctx->device));
-    ctx->BindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(
-            getProc(ctx, "vkBindImageMemory", ctx->instance, ctx->device));
-    ctx->CreateCommandPool = reinterpret_cast<PFN_vkCreateCommandPool>(
-            getProc(ctx, "vkCreateCommandPool", ctx->instance, ctx->device));
-    ctx->DestroyCommandPool = reinterpret_cast<PFN_vkDestroyCommandPool>(
-            getProc(ctx, "vkDestroyCommandPool", ctx->instance, ctx->device));
-    ctx->AllocateCommandBuffers = reinterpret_cast<PFN_vkAllocateCommandBuffers>(
-            getProc(ctx, "vkAllocateCommandBuffers", ctx->instance, ctx->device));
-    ctx->BeginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(
-            getProc(ctx, "vkBeginCommandBuffer", ctx->instance, ctx->device));
-    ctx->EndCommandBuffer = reinterpret_cast<PFN_vkEndCommandBuffer>(
-            getProc(ctx, "vkEndCommandBuffer", ctx->instance, ctx->device));
-    ctx->CmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
-            getProc(ctx, "vkCmdPipelineBarrier", ctx->instance, ctx->device));
-    ctx->CmdCopyImage = reinterpret_cast<PFN_vkCmdCopyImage>(
-            getProc(ctx, "vkCmdCopyImage", ctx->instance, ctx->device));
-    ctx->CreateFence = reinterpret_cast<PFN_vkCreateFence>(
-            getProc(ctx, "vkCreateFence", ctx->instance, ctx->device));
-    ctx->DestroyFence = reinterpret_cast<PFN_vkDestroyFence>(
-            getProc(ctx, "vkDestroyFence", ctx->instance, ctx->device));
-    ctx->WaitForFences = reinterpret_cast<PFN_vkWaitForFences>(
-            getProc(ctx, "vkWaitForFences", ctx->instance, ctx->device));
-    ctx->ResetFences = reinterpret_cast<PFN_vkResetFences>(
-            getProc(ctx, "vkResetFences", ctx->instance, ctx->device));
-    ctx->ResetCommandBuffer = reinterpret_cast<PFN_vkResetCommandBuffer>(
-            getProc(ctx, "vkResetCommandBuffer", ctx->instance, ctx->device));
+                    gipa(shared->instance, "vkGetPhysicalDeviceMemoryProperties"));
+    shared->CreateImage = reinterpret_cast<PFN_vkCreateImage>(
+            getProc(shared, "vkCreateImage", shared->instance, shared->device));
+    shared->DestroyImage = reinterpret_cast<PFN_vkDestroyImage>(
+            getProc(shared, "vkDestroyImage", shared->instance, shared->device));
+    shared->GetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(
+            getProc(shared, "vkGetImageMemoryRequirements", shared->instance, shared->device));
+    shared->AllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(
+            getProc(shared, "vkAllocateMemory", shared->instance, shared->device));
+    shared->FreeMemory = reinterpret_cast<PFN_vkFreeMemory>(
+            getProc(shared, "vkFreeMemory", shared->instance, shared->device));
+    shared->BindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(
+            getProc(shared, "vkBindImageMemory", shared->instance, shared->device));
+    shared->CreateCommandPool = reinterpret_cast<PFN_vkCreateCommandPool>(
+            getProc(shared, "vkCreateCommandPool", shared->instance, shared->device));
+    shared->DestroyCommandPool = reinterpret_cast<PFN_vkDestroyCommandPool>(
+            getProc(shared, "vkDestroyCommandPool", shared->instance, shared->device));
+    shared->AllocateCommandBuffers = reinterpret_cast<PFN_vkAllocateCommandBuffers>(
+            getProc(shared, "vkAllocateCommandBuffers", shared->instance, shared->device));
+    shared->BeginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(
+            getProc(shared, "vkBeginCommandBuffer", shared->instance, shared->device));
+    shared->EndCommandBuffer = reinterpret_cast<PFN_vkEndCommandBuffer>(
+            getProc(shared, "vkEndCommandBuffer", shared->instance, shared->device));
+    shared->CmdPipelineBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
+            getProc(shared, "vkCmdPipelineBarrier", shared->instance, shared->device));
+    shared->CmdCopyImage = reinterpret_cast<PFN_vkCmdCopyImage>(
+            getProc(shared, "vkCmdCopyImage", shared->instance, shared->device));
+    shared->CreateFence = reinterpret_cast<PFN_vkCreateFence>(
+            getProc(shared, "vkCreateFence", shared->instance, shared->device));
+    shared->DestroyFence = reinterpret_cast<PFN_vkDestroyFence>(
+            getProc(shared, "vkDestroyFence", shared->instance, shared->device));
+    shared->WaitForFences = reinterpret_cast<PFN_vkWaitForFences>(
+            getProc(shared, "vkWaitForFences", shared->instance, shared->device));
+    shared->ResetFences = reinterpret_cast<PFN_vkResetFences>(
+            getProc(shared, "vkResetFences", shared->instance, shared->device));
+    shared->ResetCommandBuffer = reinterpret_cast<PFN_vkResetCommandBuffer>(
+            getProc(shared, "vkResetCommandBuffer", shared->instance, shared->device));
 
-    ctx->GetDeviceQueue(ctx->device, ctx->graphicsQueueFamily, 0, &ctx->graphicsQueue);
-    ctx->GetDeviceQueue(ctx->device, ctx->presentQueueFamily, 0, &ctx->presentQueue);
+    shared->GetDeviceQueue(shared->device, shared->graphicsQueueFamily, 0, &shared->graphicsQueue);
+    shared->GetDeviceQueue(shared->device, shared->presentQueueFamily, 0, &shared->presentQueue);
 
     std::vector<const char*> instExtNames = instanceExts;
     std::vector<const char*> devExtNames = deviceExts;
-    ctx->extensions.init(
-            [ctx](const char* name, VkInstance i, VkDevice d) {
-                return getProc(ctx, name, i, d);
+    shared->extensions.init(
+            [shared](const char* name, VkInstance i, VkDevice d) {
+                return getProc(shared, name, i, d);
             },
-            ctx->instance,
-            ctx->physicalDevice,
+            shared->instance,
+            shared->physicalDevice,
             static_cast<uint32_t>(instExtNames.size()),
             instExtNames.data(),
             static_cast<uint32_t>(devExtNames.size()),
@@ -532,18 +715,19 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
     return true;
 }
 
-bool createGraphite(ComposeKNVkContext* ctx) {
+// Creates shared Graphite Context only; per-window Recorder is made in acquireSharedDevice.
+bool createGraphite(ComposeKNVkShared* shared) {
     skgpu::VulkanBackendContext backend{};
-    backend.fInstance = ctx->instance;
-    backend.fPhysicalDevice = ctx->physicalDevice;
-    backend.fDevice = ctx->device;
-    backend.fQueue = ctx->graphicsQueue;
-    backend.fGraphicsQueueIndex = ctx->graphicsQueueFamily;
-    backend.fMaxAPIVersion = ctx->apiVersion;
-    backend.fVkExtensions = &ctx->extensions;
-    backend.fDeviceFeatures2 = &ctx->deviceFeatures2;
-    backend.fGetProc = [ctx](const char* name, VkInstance i, VkDevice d) {
-        return getProc(ctx, name, i, d);
+    backend.fInstance = shared->instance;
+    backend.fPhysicalDevice = shared->physicalDevice;
+    backend.fDevice = shared->device;
+    backend.fQueue = shared->graphicsQueue;
+    backend.fGraphicsQueueIndex = shared->graphicsQueueFamily;
+    backend.fMaxAPIVersion = shared->apiVersion;
+    backend.fVkExtensions = &shared->extensions;
+    backend.fDeviceFeatures2 = &shared->deviceFeatures2;
+    backend.fGetProc = [shared](const char* name, VkInstance i, VkDevice d) {
+        return getProc(shared, name, i, d);
     };
     backend.fMemoryAllocator =
             skgpu::VulkanMemoryAllocators::Make(backend, skgpu::ThreadSafe::kNo);
@@ -551,23 +735,94 @@ bool createGraphite(ComposeKNVkContext* ctx) {
         // 常见根因：fGetProc 对全局入口返回 NULL → MakeInterface/validate 失败。
         vkLog("vk: VulkanMemoryAllocators::Make failed "
               "(check getProc globals; device=%p queue=%p)",
-              (void*)ctx->device,
-              (void*)ctx->graphicsQueue);
+              (void*)shared->device,
+              (void*)shared->graphicsQueue);
         return false;
     }
-    ctx->memoryAllocator = backend.fMemoryAllocator;
+    shared->memoryAllocator = backend.fMemoryAllocator;
 
     skgpu::graphite::ContextOptions options;
-    ctx->graphite = skgpu::graphite::ContextFactory::MakeVulkan(backend, options);
-    if (!ctx->graphite) {
+    shared->graphite = skgpu::graphite::ContextFactory::MakeVulkan(backend, options);
+    if (!shared->graphite) {
         vkLog("vk: ContextFactory::MakeVulkan failed");
         return false;
     }
-    ctx->recorder = ctx->graphite->makeRecorder();
-    if (!ctx->recorder) {
-        vkLog("vk: makeRecorder failed");
+    return true;
+}
+
+void destroySharedResources(ComposeKNVkShared* shared) {
+    if (!shared) return;
+    if (shared->graphite) {
+        shared->graphite->submit(skgpu::graphite::SyncToCpu::kYes);
+    }
+    if (shared->device != VK_NULL_HANDLE && shared->DeviceWaitIdle) {
+        shared->DeviceWaitIdle(shared->device);
+    }
+    shared->graphite.reset();
+    shared->memoryAllocator.reset();
+    if (shared->device != VK_NULL_HANDLE && shared->DestroyDevice) {
+        shared->DestroyDevice(shared->device, nullptr);
+        shared->device = VK_NULL_HANDLE;
+    }
+    if (shared->instance != VK_NULL_HANDLE && shared->DestroyInstance) {
+        shared->DestroyInstance(shared->instance, nullptr);
+        shared->instance = VK_NULL_HANDLE;
+    }
+    if (shared->vulkanLib) {
+        FreeLibrary(shared->vulkanLib);
+        shared->vulkanLib = nullptr;
+    }
+}
+
+void releaseSharedDevice(ComposeKNVkContext* ctx) {
+    if (!ctx || !ctx->shared) return;
+    ComposeKNVkShared* shared = ctx->shared;
+    clearSharedMirrors(ctx);
+    --shared->refcount;
+    if (shared->refcount > 0) {
+        return;
+    }
+    if (g_vkShared == shared) {
+        g_vkShared = nullptr;
+    }
+    destroySharedResources(shared);
+    delete shared;
+    vkLog("vk: shared device destroyed");
+}
+
+bool acquireSharedDevice(ComposeKNVkContext* ctx) {
+    if (!ctx || !ctx->hwnd) return false;
+
+    if (g_vkShared) {
+        ++g_vkShared->refcount;
+        bindSharedToCtx(ctx, g_vkShared);
+        ctx->recorder = g_vkShared->graphite->makeRecorder();
+        if (!ctx->recorder) {
+            vkLog("vk: makeRecorder failed");
+            releaseSharedDevice(ctx);
+            return false;
+        }
+        vkLog("vk: shared device acquired (refcount=%d)", g_vkShared->refcount);
+        return true;
+    }
+
+    auto* shared = new ComposeKNVkShared();
+    shared->refcount = 1;
+    shared->hwnd = ctx->hwnd;
+    if (!loadVulkan(shared) || !createInstanceAndDevice(shared) || !createGraphite(shared)) {
+        destroySharedResources(shared);
+        delete shared;
         return false;
     }
+    g_vkShared = shared;
+    bindSharedToCtx(ctx, shared);
+    ctx->recorder = shared->graphite->makeRecorder();
+    if (!ctx->recorder) {
+        vkLog("vk: makeRecorder failed");
+        releaseSharedDevice(ctx);
+        return false;
+    }
+    vkLog("vk: shared device acquired (refcount=%d)", shared->refcount);
     return true;
 }
 
@@ -1067,7 +1322,7 @@ bool createSwapchain(ComposeKNVkContext* ctx, int width, int height) {
 
 void destroyVk(ComposeKNVkContext* ctx) {
     if (!ctx) return;
-    // 先让 Graphite 把未完成的 Recording 刷完，finished-proc 才能安全销毁 acquire sem。
+    // Per-window teardown may still submit on shared graphite / DeviceWaitIdle.
     if (ctx->graphite) {
         ctx->graphite->submit(skgpu::graphite::SyncToCpu::kYes);
     }
@@ -1099,20 +1354,8 @@ void destroyVk(ComposeKNVkContext* ctx) {
         ctx->surface = VK_NULL_HANDLE;
     }
     ctx->recorder.reset();
-    ctx->graphite.reset();
-    ctx->memoryAllocator.reset();
-    if (ctx->device != VK_NULL_HANDLE && ctx->DestroyDevice) {
-        ctx->DestroyDevice(ctx->device, nullptr);
-        ctx->device = VK_NULL_HANDLE;
-    }
-    if (ctx->instance != VK_NULL_HANDLE && ctx->DestroyInstance) {
-        ctx->DestroyInstance(ctx->instance, nullptr);
-        ctx->instance = VK_NULL_HANDLE;
-    }
-    if (ctx->vulkanLib) {
-        FreeLibrary(ctx->vulkanLib);
-        ctx->vulkanLib = nullptr;
-    }
+    // Shared instance/device/graphite/lib live until last window releases.
+    releaseSharedDevice(ctx);
 }
 
 }  // namespace
@@ -1126,8 +1369,9 @@ extern "C" bool composekn_win32_vk_create(ComposeKNWin32Window* window) {
 
     auto* ctx = new ComposeKNVkContext();
     ctx->hwnd = hwnd;
-    if (!loadVulkan(ctx) || !createInstanceAndDevice(ctx) || !createGraphite(ctx) ||
-        !createWin32Surface(ctx)) {
+    // acquireSharedDevice: first window creates shared device; later windows reuse it.
+    // On surface/swapchain failure, destroyVk releases the shared ref we took.
+    if (!acquireSharedDevice(ctx) || !createWin32Surface(ctx)) {
         destroyVk(ctx);
         delete ctx;
         return false;

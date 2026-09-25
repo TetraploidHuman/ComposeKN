@@ -3,7 +3,7 @@
 Kotlin/Native **windowsX64** 宿主：Win32 + Skia（Graphite/Vulkan 优先，可回退 GL）上的
 Compose Multiplatform。
 
-当前文档基线：**v0.5.40**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.42**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
@@ -13,6 +13,7 @@ Compose Multiplatform。
 
 - [x] Win32 窗口创建 / 消息泵 / 多窗共享 Host
 - [x] Skia 呈现（Graphite/Vulkan；Intel 无 `INPUT_ATTACHMENT` 时 offscreen+blit）
+- [x] **多窗共享 VkDevice/Graphite Context**（refcount；每窗 surface/swapchain/Recorder）
 - [x] 键盘 / 鼠标 / 滚轮 / 多点触摸（WM_POINTER）
 - [x] IME（IMM32：组字、候选、DOCUMENTFEED、重转换等）
 - [x] 系统标题栏 / 可选 CSD；MenuBar（HMENU）

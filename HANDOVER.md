@@ -3,8 +3,8 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.41**（Linux Graphite/Vulkan + 共享 wl_display；
-> Windows Vulkan/Tray 真机绿；见文末「Linux Graphite/Vulkan（v0.5.41）」；
+> **当前平台宿主基线：v0.5.42**（Windows/Linux 多窗共享 VkDevice；
+> Linux Graphite/Vulkan + CI selftest；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 
 ## 0. 一句话背景
@@ -3991,14 +3991,14 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.41 后）
+##### 已知仍缺（v0.5.42 后）
 
 * 拖出自定义装饰图 / CSD MOVE 语义（Win/Linux）
 * Wayland Absolute / Aligned 定位；always-on-top
 * ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
   `scripts/test-linux-native.sh`（headless weston；FRAME 超时回退；CI 跳过 maximize）
-* ~~Vulkan 多窗共享 VkDevice~~ → `wayland_vulkan.cc`：`ComposeKNVkShared` refcount；
-  每窗 surface/swapchain/Recorder；日志 `vk: shared device acquired (refcount=N)`
+* ~~Vulkan 多窗共享 VkDevice~~ → Linux `wayland_vulkan.cc` + Windows `win32_vulkan.cc`
+  （`ComposeKNVkShared` refcount；日志 `vk: shared device acquired (refcount=N)`）
 * Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
 
 #### Linux Graphite / Vulkan（v0.5.41）
@@ -4026,4 +4026,14 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
    * `COMPOSEKN_RENDER_API=gl`：GLES 路径仍 PASS。
 6. **多窗共享 VkDevice** ✅ — `ComposeKNVkShared` refcount；第二扇窗
    `vk: shared device acquired (refcount=2)`，末窗 `shared device destroyed`。
+
+#### Windows 多窗共享 VkDevice（v0.5.42）
+
+对齐 Linux：`win32_vulkan.cc` 进程级 `ComposeKNVkShared`。
+
+* 首窗：`LoadLibrary(vulkan-1.dll)` + Instance/Device + Graphite Context；
+* 后窗：只建 Win32 surface/swapchain/Recorder，日志
+  `vk: shared device acquired (refcount=N)`（不应再打 `loaded … vulkan-1.dll`）；
+* 关末窗：`vk: shared device destroyed`。
+* 交叉链已绿：`build-windows-native-demo.sh` → `windows-demo.exe`。
 
