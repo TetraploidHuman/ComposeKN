@@ -3997,7 +3997,8 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 * Wayland Absolute / Aligned 定位；always-on-top
 * ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
   `scripts/test-linux-native.sh`（headless weston；FRAME 超时回退；CI 跳过 maximize）
-* Vulkan 多窗共享 VkDevice（每窗独立 instance/device → 对齐 GLES 共享 DC）
+* ~~Vulkan 多窗共享 VkDevice~~ → `wayland_vulkan.cc`：`ComposeKNVkShared` refcount；
+  每窗 surface/swapchain/Recorder；日志 `vk: shared device acquired (refcount=N)`
 * Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
 
 #### Linux Graphite / Vulkan（v0.5.41）
@@ -4023,4 +4024,6 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
      `SELFTEST: PASS`；
    * RADV BONAIRE：同上；
    * `COMPOSEKN_RENDER_API=gl`：GLES 路径仍 PASS。
+6. **多窗共享 VkDevice** ✅ — `ComposeKNVkShared` refcount；第二扇窗
+   `vk: shared device acquired (refcount=2)`，末窗 `shared device destroyed`。
 

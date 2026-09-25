@@ -89,7 +89,8 @@ COMPOSEKN_VK_HARDWARE=1 nix-shell ./shell.nix --run './scripts/run-linux-native.
 
 - Wayland 无法通用绝对/对齐定位；always-on-top 仅记账
 - 无 SNI watcher 的会话：Tray 菜单不可用，通知仍可走 `notify-send`
-- 每窗独立 VkDevice（未共享）；多窗时内存占用高于 GLES 共享 DC
+- 每窗独立 VkSurface/swapchain/Recorder；**VkDevice/Graphite Context 进程级共享**
+  （`vk: shared device acquired (refcount=N)`）
 
 ## License
 
