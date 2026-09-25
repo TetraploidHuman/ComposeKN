@@ -87,7 +87,8 @@ object WindowsApplicationHost {
      * Desktop 对齐的 [WindowPosition.PlatformDefault] 初始坐标。
      *
      * 相对最近焦点/活跃**兄弟窗**的当前屏幕位置做 +48dp cascade；
-     * 若会溢出主显示器工作区则回到工作区左上 +48。
+     * 若会溢出**该锚点窗所在显示器**工作区则回到该屏左上 +48
+     * （不能用主屏 SPI_GETWORKAREA，否则副屏负坐标会被误判打回主屏）。
      * 没有可参考的兄弟窗时返回 `null`（调用方应 [WindowsComposeWindow.centerOnScreen]）。
      */
     fun cascadePositionFor(
@@ -105,11 +106,13 @@ object WindowsApplicationHost {
         var x = last.x + CASCADE_OFFSET_DP
         var y = last.y + CASCADE_OFFSET_DP
 
-        val work = window.nativeWindow?.primaryMonitorWorkAreaDp()
+        // 必须用锚点窗所在屏；新窗尚未 show，MonitorFromWindow 可能落在错误显示器。
+        val work = anchor.nativeWindow?.monitorWorkAreaDp()
             ?: anchor.nativeWindow?.primaryMonitorWorkAreaDp()
         if (work != null) {
             val workRight = work[0] + work[2]
             val workBottom = work[1] + work[3]
+            // 对齐 Desktop：仅右/下溢出时折回该屏左上 + offset
             if (x + widthDp > workRight || y + heightDp > workBottom) {
                 x = work[0] + CASCADE_OFFSET_DP
                 y = work[1] + CASCADE_OFFSET_DP

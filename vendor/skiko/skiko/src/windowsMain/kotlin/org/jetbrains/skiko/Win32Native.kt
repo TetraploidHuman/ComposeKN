@@ -246,6 +246,9 @@ internal external fun composekn_win32_set_client_size(window: COpaquePointer?, w
 @SymbolName("composekn_win32_primary_work_area")
 internal external fun composekn_win32_primary_work_area(window: COpaquePointer?, out: CPointer<IntVar>)
 
+@SymbolName("composekn_win32_monitor_work_area")
+internal external fun composekn_win32_monitor_work_area(window: COpaquePointer?, out: CPointer<IntVar>)
+
 @SymbolName("composekn_win32_taskbar_supported")
 internal external fun composekn_win32_taskbar_supported(window: COpaquePointer?): Boolean
 
@@ -785,6 +788,16 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     fun primaryMonitorWorkAreaDp(): IntArray? = memScoped {
         val out = allocArray<IntVar>(4)
         composekn_win32_primary_work_area(native, out)
+        if (out[2] <= 0 || out[3] <= 0) null else intArrayOf(out[0], out[1], out[2], out[3])
+    }
+
+    /**
+     * 本窗口所在显示器的工作区（排除任务栏），dp：`[x, y, w, h]`。
+     * 多显示器 cascade 溢出钳位用；拿不到时 null。
+     */
+    fun monitorWorkAreaDp(): IntArray? = memScoped {
+        val out = allocArray<IntVar>(4)
+        composekn_win32_monitor_work_area(native, out)
         if (out[2] <= 0 || out[3] <= 0) null else intArrayOf(out[0], out[1], out[2], out[3])
     }
 

@@ -2999,6 +2999,39 @@ extern "C" void composekn_win32_primary_work_area(ComposeKNWin32Window* window, 
 }
 
 /**
+ * 窗口所在显示器的工作区（多显示器 cascade / 溢出钳位用）。
+ *
+ * `SPI_GETWORKAREA` 只覆盖**主**显示器；副屏上的负坐标会被误判溢出并打回主屏。
+ * 这里用 `MonitorFromWindow` + `rcWork`，与 Desktop `WindowLocationTracker` 按
+ * GraphicsDevice 取 bounds/insets 对齐。
+ */
+extern "C" void composekn_win32_monitor_work_area(ComposeKNWin32Window* window, int32_t* out) {
+    if (out == nullptr) return;
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    if (window == nullptr || window->hwnd == nullptr) return;
+    HMONITOR monitor = MonitorFromWindow(window->hwnd, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr) return;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi)) {
+        composeknLog("window: GetMonitorInfo 失败（monitor work area）");
+        return;
+    }
+    const RECT& work = mi.rcWork;
+    const double scale = dpiScaleOf(window);
+    auto pxToDp = [scale](LONG px) -> int32_t {
+        return static_cast<int32_t>(px / scale >= 0 ? px / scale + 0.5 : px / scale - 0.5);
+    };
+    out[0] = pxToDp(work.left);
+    out[1] = pxToDp(work.top);
+    out[2] = pxToDp(work.right - work.left);
+    out[3] = pxToDp(work.bottom - work.top);
+}
+
+/**
  * 自检用：直接对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码。
  *
  * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心（都是 1~2 物理像素的偏移，

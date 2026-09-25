@@ -3,7 +3,7 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.43**（PlatformDefault cascade；Windows/Linux 共享 VkDevice；
+> **当前平台宿主基线：v0.5.44**（PlatformDefault cascade 按锚点屏钳位；共享 VkDevice；
 > Linux Graphite/Vulkan + CI selftest；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 
@@ -3991,7 +3991,7 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.43 后）
+##### 已知仍缺（v0.5.44 后）
 
 * 拖出自定义装饰图 / CSD MOVE 语义（Win/Linux）
 * Wayland Absolute / Aligned 定位；always-on-top；PlatformDefault cascade（无通用绝对定位）
@@ -3999,7 +3999,7 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
   `scripts/test-linux-native.sh`（headless weston；FRAME 超时回退；CI 跳过 maximize）
 * ~~Vulkan 多窗共享 VkDevice~~ → Linux `wayland_vulkan.cc` + Windows `win32_vulkan.cc`
   （`ComposeKNVkShared` refcount；日志 `vk: shared device acquired (refcount=N)`）
-* ~~Windows `PlatformDefault` 总居中~~ → v0.5.43 cascade（见下）
+* ~~Windows `PlatformDefault` 总居中~~ → v0.5.43 cascade；~~副屏被 SPI 打回主屏~~ → v0.5.44
 * Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
 
 #### Linux Graphite / Vulkan（v0.5.41）
@@ -4048,4 +4048,10 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
   首扇窗无锚点仍居中。
 * `WindowsApplicationHost.register` 不再抢 `lastActive`（新窗要等获得焦点才入序），
   否则 cascade 会锚到自己。
+
+#### Cascade 按锚点显示器钳位（v0.5.44）
+
+v0.5.43 溢出检测用 `SPI_GETWORKAREA`（**仅主屏**）→ 副屏负坐标被误判溢出，
+DialogWindow 等打回主屏。改为 `MonitorFromWindow` + `GetMonitorInfo.rcWork`
+（`composekn_win32_monitor_work_area` / `monitorWorkAreaDp()`），相对锚点窗所在屏钳位。
 

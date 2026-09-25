@@ -458,6 +458,13 @@ void composekn_win32_set_client_size(ComposeKNWin32Window* window, int32_t w_dp,
 void composekn_win32_primary_work_area(ComposeKNWin32Window* window, int32_t* out);
 
 /**
+ * 窗口所在显示器的工作区（排除任务栏），dp：`out = {x, y, w, h}`。
+ * 用 `MonitorFromWindow` + `GetMonitorInfo.rcWork`（多显示器 cascade 用）。
+ * 拿不到时全 0。
+ */
+void composekn_win32_monitor_work_area(ComposeKNWin32Window* window, int32_t* out);
+
+/**
  * 自检用：对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码。
  *
  * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心。返回 HTLEFT(10)…HTBORDER(18)、
