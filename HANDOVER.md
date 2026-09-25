@@ -3991,11 +3991,13 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.40 后）
+##### 已知仍缺（v0.5.41 后）
 
 * 拖出自定义装饰图 / CSD MOVE 语义（Win/Linux）
 * Wayland Absolute / Aligned 定位；always-on-top
-* CI 自动跑 Linux `--selftest`
+* ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
+  `scripts/test-linux-native.sh`（headless weston；FRAME 超时回退；CI 跳过 maximize）
+* Vulkan 多窗共享 VkDevice（每窗独立 instance/device → 对齐 GLES 共享 DC）
 * Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
 
 #### Linux Graphite / Vulkan（v0.5.41）

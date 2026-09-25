@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <poll.h>
 #include <errno.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -108,6 +109,8 @@ struct ComposeKNWindow {
     wl_callback* frame_callback = nullptr;
     bool frame_pending = false;
     bool frame_requested = false;
+    /** CLOCK_MONOTONIC ns when frame_callback was armed; 0 if idle. */
+    int64_t frame_armed_ns = 0;
     bool in_dispatch = false;
 
     std::deque<ComposeKNEvent> events;
@@ -1649,8 +1652,37 @@ static const wl_seat_listener seat_listener = {
     seat_name,
 };
 
+static int64_t monotonic_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
 static void composekn_request_frame_internal(ComposeKNWindow* window);
 static void composekn_process_deferred_selection(ComposeKNWindow* window);
+
+/**
+ * Headless / 慢 WSI：wl_surface_frame 可能永不回调（空 commit 无 buffer）。
+ * 超时后合成 FRAME，避免 FrameRecomposer 卡死、selftest 挂住。
+ */
+static void composekn_kick_stale_frame(ComposeKNWindow* window, int timeout_ms) {
+    if (window == nullptr || !window->frame_pending || window->frame_armed_ns == 0) {
+        return;
+    }
+    const int64_t limit = static_cast<int64_t>(timeout_ms) * 1000000LL;
+    if (monotonic_ns() - window->frame_armed_ns < limit) {
+        return;
+    }
+    if (window->frame_callback != nullptr) {
+        wl_callback_destroy(window->frame_callback);
+        window->frame_callback = nullptr;
+    }
+    window->frame_pending = false;
+    window->frame_armed_ns = 0;
+    ComposeKNEvent event{};
+    event.type = COMPOSEKN_EVENT_FRAME;
+    push_event(window, event);
+}
 
 static void frame_done(void* data, wl_callback* callback, uint32_t time) {
     (void)time;
@@ -1660,6 +1692,7 @@ static void frame_done(void* data, wl_callback* callback, uint32_t time) {
     }
     wl_callback_destroy(callback);
     window->frame_pending = false;
+    window->frame_armed_ns = 0;
     ComposeKNEvent event{};
     event.type = COMPOSEKN_EVENT_FRAME;
     push_event(window, event);
@@ -2128,6 +2161,8 @@ extern "C" bool composekn_window_poll(ComposeKNWindow* window) {
 
     w->in_dispatch = false;
     composekn_flush_deferred_frame(w);
+    // Headless weston 等：空 commit 的 frame callback 可能永不回来。
+    composekn_kick_stale_frame(w, 32);
     composekn_process_deferred_selection(w);
     // Single-window / direct poll paths never call begin_poll_cycle; clear so the
     // next poll can prepare_read again. Multi-window host clears via begin_poll_cycle.
@@ -2208,10 +2243,12 @@ static void composekn_flush_deferred_frame(ComposeKNWindow* window) {
     }
     window->frame_requested = false;
     window->frame_pending = true;
+    window->frame_armed_ns = monotonic_ns();
     window->frame_callback = wl_surface_frame(window->surface);
     if (window->frame_callback == nullptr) {
         std::fprintf(stderr, "composekn: wl_surface_frame returned null\n");
         window->frame_pending = false;
+        window->frame_armed_ns = 0;
         window->frame_requested = true;
         return;
     }

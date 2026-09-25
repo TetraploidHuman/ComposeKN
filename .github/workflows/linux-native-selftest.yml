@@ -1,0 +1,109 @@
+name: linux-native-selftest
+
+# 在 ubuntu runner 上链接 wayland-demo，并用 headless weston 跑 --selftest。
+# 默认 lavapipe / llvmpipe；CI 下 tray/portal 为 soft check（见 COMPOSEKN_SELFTEST_RELAX）。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/linux-native-selftest.yml"
+      - "scripts/test-linux-native.sh"
+      - "compose-kn-linux/**"
+      - "samples/wayland-demo/**"
+      - "vendor/skiko/**"
+      - "vendor/compose-core/**"
+      - "vendor/compose-core.local/**"
+      - "build-logic/**"
+      - "shell.nix"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+  pull_request:
+    paths:
+      - "compose-kn-linux/**"
+      - "samples/wayland-demo/**"
+      - "vendor/skiko/**"
+      - "scripts/test-linux-native.sh"
+      - ".github/workflows/linux-native-selftest.yml"
+
+concurrency:
+  group: linux-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wayland-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Wayland / EGL / Vulkan / weston
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev libwayland-client0 libwayland-cursor0 libwayland-egl1 \
+            libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libcrypt-dev \
+            mesa-vulkan-drivers libvulkan1 \
+            weston \
+            libnotify-bin
+
+      - name: Locate lavapipe ICD
+        run: |
+          ls -la /usr/share/vulkan/icd.d/ || true
+          ICD="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)"
+          if [[ -n "$ICD" ]]; then
+            echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+            echo "VK_DRIVER_FILES=$ICD" >> "$GITHUB_ENV"
+            echo "Using ICD $ICD"
+          else
+            echo "WARNING: lavapipe ICD not found; Vulkan may fall back to GLES"
+          fi
+
+      - name: Build wayland-demo
+        env:
+          COMPOSEKN_LIBCRYPT_LIB: /lib/x86_64-linux-gnu
+        run: |
+          chmod +x scripts/test-linux-native.sh
+          ./scripts/test-linux-native.sh --build-only
+
+      - name: Selftest Graphite/Vulkan
+        env:
+          COMPOSEKN_LIBCRYPT_LIB: /lib/x86_64-linux-gnu
+          COMPOSEKN_SELFTEST_RELAX: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GALLIUM_DRIVER: llvmpipe
+        run: ./scripts/test-linux-native.sh --skip-build --api=vulkan
+
+      - name: Selftest GLES fallback
+        env:
+          COMPOSEKN_LIBCRYPT_LIB: /lib/x86_64-linux-gnu
+          COMPOSEKN_SELFTEST_RELAX: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GALLIUM_DRIVER: llvmpipe
+        run: ./scripts/test-linux-native.sh --skip-build --api=gl
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-selftest-logs
+          path: |
+            /tmp/composekn-xdg-*/weston.log
+            samples/wayland-demo/build/reports/**
+          if-no-files-found: ignore

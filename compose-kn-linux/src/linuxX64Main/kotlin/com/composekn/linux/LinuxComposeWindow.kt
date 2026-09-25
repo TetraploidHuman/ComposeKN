@@ -117,6 +117,8 @@ class LinuxComposeWindow(
         }
         LinuxApplicationHost.register(this)
         layer.needRender()
+        // 首帧不依赖 compositor FRAME（headless / 首 commit 无 buffer 时回调可能永不来）。
+        renderFrameGuarded()
         println("composekn: attachToHost ready ${window.width}x${window.height}")
     }
 
