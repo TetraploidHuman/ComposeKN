@@ -1,5 +1,6 @@
 package com.composekn.windows
 
+import androidx.compose.ui.unit.IntOffset
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.WindowsImeDocument
 import org.jetbrains.skiko.currentNanoTime
@@ -18,6 +19,12 @@ import platform.posix.usleep
 private const val HOST_MINIMIZED_POLL_MS = 200
 
 /**
+ * Desktop [WindowLocationTracker] 的 cascade 偏移（逻辑像素 / dp）。
+ * 见 compose-core `ui/.../WindowLocationTracker.desktop.kt`。
+ */
+private const val CASCADE_OFFSET_DP = 48
+
+/**
  * 进程级多窗口宿主：一条 PeekMessage 循环服务所有 [WindowsComposeWindow]。
  *
  * Desktop 语义对齐：
@@ -25,6 +32,7 @@ private const val HOST_MINIMIZED_POLL_MS = 200
  * - 真正销毁发生在离开 composition / [unregister] 时
  * - 泵在 [shouldContinue] 变 false 时退出（通常是 application isOpen=false
  *   且 recomposer 收尾，或命令式单窗 Close 后 unregister）
+ * - [WindowPosition.PlatformDefault]：相对最近焦点窗 cascade（见 [cascadePositionFor]）
  *
  * ## IME / wake 路由（全局回调，多窗口必须分流）
  *
@@ -43,7 +51,7 @@ object WindowsApplicationHost {
     var focusedSession: WindowsComposeWindow? = null
         private set
 
-    /** 最近一次焦点或成功 attach 的会话（剪贴板 / wake 回退）。 */
+    /** 最近一次焦点或成功 attach 的会话（剪贴板 / wake 回退 / cascade 锚点）。 */
     @Volatile
     var lastActiveSession: WindowsComposeWindow? = null
         private set
@@ -64,11 +72,50 @@ object WindowsApplicationHost {
     fun register(window: WindowsComposeWindow) {
         if (sessions.contains(window)) return
         sessions.add(window)
-        lastActiveSession = window
+        // 不抢 lastActive：对齐 Desktop WindowLocationTracker（新窗要等获得焦点才入序），
+        // 否则 PlatformDefault cascade 会锚到自己而不是父窗当前坐标。
+        if (lastActiveSession == null) {
+            lastActiveSession = window
+        }
         refreshWakeHandler()
         refreshImeProviders()
         refreshDialogModality()
         win32Log("host: register window count=${sessions.size}")
+    }
+
+    /**
+     * Desktop 对齐的 [WindowPosition.PlatformDefault] 初始坐标。
+     *
+     * 相对最近焦点/活跃**兄弟窗**的当前屏幕位置做 +48dp cascade；
+     * 若会溢出主显示器工作区则回到工作区左上 +48。
+     * 没有可参考的兄弟窗时返回 `null`（调用方应 [WindowsComposeWindow.centerOnScreen]）。
+     */
+    fun cascadePositionFor(
+        window: WindowsComposeWindow,
+        widthDp: Int,
+        heightDp: Int,
+    ): IntOffset? {
+        val anchor = when {
+            focusedSession != null && focusedSession !== window -> focusedSession
+            lastActiveSession != null && lastActiveSession !== window -> lastActiveSession
+            else -> sessions.lastOrNull { it !== window }
+        } ?: return null
+
+        val last = anchor.windowPosition
+        var x = last.x + CASCADE_OFFSET_DP
+        var y = last.y + CASCADE_OFFSET_DP
+
+        val work = window.nativeWindow?.primaryMonitorWorkAreaDp()
+            ?: anchor.nativeWindow?.primaryMonitorWorkAreaDp()
+        if (work != null) {
+            val workRight = work[0] + work[2]
+            val workBottom = work[1] + work[3]
+            if (x + widthDp > workRight || y + heightDp > workBottom) {
+                x = work[0] + CASCADE_OFFSET_DP
+                y = work[1] + CASCADE_OFFSET_DP
+            }
+        }
+        return IntOffset(x, y)
     }
 
     fun unregister(window: WindowsComposeWindow) {

@@ -67,7 +67,7 @@ private object WindowsComposeNativeBackend : ComposeNativeWindowBackend {
             show = false,
             content = null,
         )
-        // 先尺寸后位置：centerOnScreen 依赖当前客户区尺寸
+        // 先尺寸后位置：cascade / centerOnScreen 依赖当前客户区尺寸
         if (params.size.width.isSpecified && params.size.height.isSpecified) {
             handle.applySize(params.size)
         }
@@ -75,7 +75,18 @@ private object WindowsComposeNativeBackend : ComposeNativeWindowBackend {
             is WindowPosition.Absolute -> handle.applyPosition(pos)
             is WindowPosition.Aligned -> handle.applyPosition(pos)
             WindowPosition.PlatformDefault -> {
-                app.window.centerOnScreen()
+                // Desktop WindowLocationTracker：相对最近焦点窗 cascade；
+                // 首扇窗无锚点时仍居中（比 Desktop 的工作区左上+48 更合适作主窗默认）。
+                val cascade = WindowsApplicationHost.cascadePositionFor(
+                    app.window,
+                    widthDp = width,
+                    heightDp = height,
+                )
+                if (cascade != null) {
+                    app.window.setWindowPosition(cascade.x, cascade.y)
+                } else {
+                    app.window.centerOnScreen()
+                }
             }
         }
         app.window.show()

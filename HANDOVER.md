@@ -3,7 +3,7 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.42**（Windows/Linux 多窗共享 VkDevice；
+> **当前平台宿主基线：v0.5.43**（PlatformDefault cascade；Windows/Linux 共享 VkDevice；
 > Linux Graphite/Vulkan + CI selftest；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 
@@ -3991,14 +3991,15 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.42 后）
+##### 已知仍缺（v0.5.43 后）
 
 * 拖出自定义装饰图 / CSD MOVE 语义（Win/Linux）
-* Wayland Absolute / Aligned 定位；always-on-top
+* Wayland Absolute / Aligned 定位；always-on-top；PlatformDefault cascade（无通用绝对定位）
 * ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
   `scripts/test-linux-native.sh`（headless weston；FRAME 超时回退；CI 跳过 maximize）
 * ~~Vulkan 多窗共享 VkDevice~~ → Linux `wayland_vulkan.cc` + Windows `win32_vulkan.cc`
   （`ComposeKNVkShared` refcount；日志 `vk: shared device acquired (refcount=N)`）
+* ~~Windows `PlatformDefault` 总居中~~ → v0.5.43 cascade（见下）
 * Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
 
 #### Linux Graphite / Vulkan（v0.5.41）
@@ -4036,4 +4037,15 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
   `vk: shared device acquired (refcount=N)`（不应再打 `loaded … vulkan-1.dll`）；
 * 关末窗：`vk: shared device destroyed`。
 * 交叉链已绿：`build-windows-native-demo.sh` → `windows-demo.exe`。
+
+#### Windows `PlatformDefault` cascade（v0.5.43）
+
+对齐 Desktop `WindowLocationTracker`：
+
+* `WindowPosition.PlatformDefault` 原先每次 `centerOnScreen()` → 第二扇窗 / DialogWindow
+  总落在主窗**初始**居中点，父窗挪走后仍去旧位置。
+* 现：相对最近焦点/活跃兄弟窗**当前**屏幕坐标 +48dp；溢出工作区则回左上 +48；
+  首扇窗无锚点仍居中。
+* `WindowsApplicationHost.register` 不再抢 `lastActive`（新窗要等获得焦点才入序），
+  否则 cascade 会锚到自己。
 

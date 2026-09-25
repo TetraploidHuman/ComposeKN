@@ -3,7 +3,7 @@
 Kotlin/Native **windowsX64** 宿主：Win32 + Skia（Graphite/Vulkan 优先，可回退 GL）上的
 Compose Multiplatform。
 
-当前文档基线：**v0.5.42**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.43**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
