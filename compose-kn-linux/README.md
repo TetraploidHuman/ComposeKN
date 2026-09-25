@@ -12,7 +12,7 @@ Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES�
 ## Features
 
 - [x] Wayland 窗口（xdg-shell）；多窗 **共享一条 `wl_display`**（refcount + surface 路由）
-- [x] **Graphite + Vulkan**（默认；`VK_KHR_wayland_surface`）；失败回退 GLES
+- [x] **Graphite + Vulkan**（默认；进程级共享 VkDevice/Graphite；失败回退 GLES）
 - [x] Skia OpenGL ES 回退（单线程共用一份 EGLContext + `GrDirectContext`）
 - [x] 指针 / 键盘（xkbcommon）/ 触摸；IME（zwp_text_input_v3）
 - [x] SSD/CSD；Fullscreen；`setResizable`（min=max 锁尺寸）
@@ -89,8 +89,7 @@ COMPOSEKN_VK_HARDWARE=1 nix-shell ./shell.nix --run './scripts/run-linux-native.
 
 - Wayland 无法通用绝对/对齐定位；always-on-top 仅记账
 - 无 SNI watcher 的会话：Tray 菜单不可用，通知仍可走 `notify-send`
-- 每窗独立 VkSurface/swapchain/Recorder；**VkDevice/Graphite Context 进程级共享**
-  （`vk: shared device acquired (refcount=N)`）
+- weston headless 对 maximized geometry 较严（CI selftest 在 RELAX 下跳过 maximize）
 
 ## License
 
