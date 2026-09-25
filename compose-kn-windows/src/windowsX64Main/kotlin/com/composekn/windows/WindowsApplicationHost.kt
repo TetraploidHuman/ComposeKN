@@ -82,14 +82,56 @@ object WindowsApplicationHost {
         widthDp: Int,
         heightDp: Int,
     ): Boolean {
-        val anchor = when {
-            focusedSession != null && focusedSession !== window -> focusedSession
-            lastActiveSession != null && lastActiveSession !== window -> lastActiveSession
-            else -> sessions.lastOrNull { it !== window }
-        } ?: return false
+        val anchor = placementAnchor(window) ?: return false
         val dest = window.nativeWindow ?: return false
         val src = anchor.nativeWindow ?: return false
         return dest.placeCascadedFrom(src, widthDp, heightDp)
+    }
+
+    /**
+     * [androidx.compose.ui.window.WindowPosition.Aligned]：相对锚点窗所在屏对齐。
+     * Dialog 默认 `Alignment.Center` 走这里（不能再用主屏 SPI）。
+     */
+    fun placeAligned(
+        window: WindowsComposeWindow,
+        alignment: androidx.compose.ui.Alignment,
+        widthDp: Int,
+        heightDp: Int,
+    ): Boolean {
+        val dest = window.nativeWindow ?: return false
+        val anchor = placementAnchor(window)?.nativeWindow
+        val (ax, ay) = alignmentToBias(alignment)
+        return dest.placeAlignedFrom(anchor, ax, ay, widthDp, heightDp)
+    }
+
+    private fun placementAnchor(window: WindowsComposeWindow): WindowsComposeWindow? = when {
+        focusedSession != null && focusedSession !== window -> focusedSession
+        lastActiveSession != null && lastActiveSession !== window -> lastActiveSession
+        else -> sessions.lastOrNull { it !== window }
+    }
+
+    private fun alignmentToBias(alignment: androidx.compose.ui.Alignment): Pair<Int, Int> {
+        // Compose Alignment 是对象相等；未识别的退回居中。
+        val a = alignment
+        val x = when {
+            a === androidx.compose.ui.Alignment.TopStart ||
+                a === androidx.compose.ui.Alignment.CenterStart ||
+                a === androidx.compose.ui.Alignment.BottomStart -> -1
+            a === androidx.compose.ui.Alignment.TopEnd ||
+                a === androidx.compose.ui.Alignment.CenterEnd ||
+                a === androidx.compose.ui.Alignment.BottomEnd -> 1
+            else -> 0
+        }
+        val y = when {
+            a === androidx.compose.ui.Alignment.TopStart ||
+                a === androidx.compose.ui.Alignment.TopCenter ||
+                a === androidx.compose.ui.Alignment.TopEnd -> -1
+            a === androidx.compose.ui.Alignment.BottomStart ||
+                a === androidx.compose.ui.Alignment.BottomCenter ||
+                a === androidx.compose.ui.Alignment.BottomEnd -> 1
+            else -> 0
+        }
+        return x to y
     }
 
     fun unregister(window: WindowsComposeWindow) {

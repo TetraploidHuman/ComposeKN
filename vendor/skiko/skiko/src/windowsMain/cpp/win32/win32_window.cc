@@ -210,6 +210,13 @@ struct ComposeKNWin32Window {
     // false = 系统标题栏（Compose JVM 桌面 Window() 的默认形态：NC 全归 OS 管）；
     // true = 无边框自绘 CSD（对应 JVM 的 undecorated = true）。
     bool undecorated = false;
+    /**
+     * place_cascaded / place_aligned 刚用物理像素定好位置后置 true：
+     * 紧随的 WM_DPICHANGED 只吃建议尺寸、保留我们的坐标。
+     * 用户拖窗跨屏时必须为 false，否则会拒绝系统建议点（v0.5.45 真机：
+     * suggested=652,-803 被错误改成 applied=301,-1044）。
+     */
+    bool keepPlacementOnDpiChange = false;
     // 光标形状（0=箭头 1=手 2=文本I型 3=十字），由 Compose 的 PointerIcon 驱动。
     int cursorKind = 0;
 
@@ -1030,11 +1037,10 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             return hit;
         }
         case WM_DPICHANGED: {
-            // 跨显示器（缩放不同）时 Windows 会发这条：我们必须
-            //   1) 更新自己的 dpi —— 否则 dp/密度一直是旧屏的（真机日志：拖到另一块屏后
-            //      PERF-BANNER 仍然 dpi=2.0，UI 按错误缩放画）；
-            //   2) 应用建议尺寸；位置优先保留当前，避免 cascade 误乘 DPI 后 suggestion
-            //      把窗甩到屏外（v0.5.44：rect=1124,-1720）。
+            // 跨显示器（缩放不同）时 Windows 会发这条：
+            //   1) 更新 dpi；2) 应用建议矩形（用户拖窗跨屏必须整份照做）。
+            // 仅当 keepPlacementOnDpiChange（刚程序化 cascade/align）时保留当前坐标、
+            // 只吃建议尺寸，避免 suggestion 把刚摆好的窗甩飞。
             const int newDpi = HIWORD(wParam);
             if (newDpi > 0) window->dpi = newDpi;
             auto* suggested = reinterpret_cast<RECT*>(lParam);
@@ -1045,27 +1051,26 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 const int sugH = static_cast<int>(suggested->bottom - suggested->top);
                 int x = static_cast<int>(suggested->left);
                 int y = static_cast<int>(suggested->top);
-                // 建议点相对当前位置跳太远 → 信任我们刚设的 cascade 物理坐标，只吃尺寸
-                const int jumpX = x - static_cast<int>(cur.left);
-                const int jumpY = y - static_cast<int>(cur.top);
-                if (jumpX > 200 || jumpX < -200 || jumpY > 200 || jumpY < -200) {
+                const bool keep = window->keepPlacementOnDpiChange;
+                window->keepPlacementOnDpiChange = false;
+                if (keep) {
                     x = static_cast<int>(cur.left);
                     y = static_cast<int>(cur.top);
-                }
-                HMONITOR monitor = MonitorFromRect(&cur, MONITOR_DEFAULTTONEAREST);
-                MONITORINFO mi = {};
-                mi.cbSize = sizeof(mi);
-                if (monitor != nullptr && GetMonitorInfoW(monitor, &mi)) {
-                    if (x + sugW > mi.rcWork.right) x = mi.rcWork.right - sugW;
-                    if (y + sugH > mi.rcWork.bottom) y = mi.rcWork.bottom - sugH;
-                    if (x < mi.rcWork.left) x = mi.rcWork.left;
-                    if (y < mi.rcWork.top) y = mi.rcWork.top;
+                    HMONITOR monitor = MonitorFromRect(&cur, MONITOR_DEFAULTTONEAREST);
+                    MONITORINFO mi = {};
+                    mi.cbSize = sizeof(mi);
+                    if (monitor != nullptr && GetMonitorInfoW(monitor, &mi)) {
+                        if (x + sugW > mi.rcWork.right) x = mi.rcWork.right - sugW;
+                        if (y + sugH > mi.rcWork.bottom) y = mi.rcWork.bottom - sugH;
+                        if (x < mi.rcWork.left) x = mi.rcWork.left;
+                        if (y < mi.rcWork.top) y = mi.rcWork.top;
+                    }
                 }
                 composeknLog(
-                    "win32: WM_DPICHANGED -> dpi=%d suggested=%d,%d %dx%d applied=%d,%d %dx%d",
+                    "win32: WM_DPICHANGED -> dpi=%d suggested=%d,%d %dx%d applied=%d,%d %dx%d keep=%d",
                     newDpi,
                     static_cast<int>(suggested->left), static_cast<int>(suggested->top),
-                    sugW, sugH, x, y, sugW, sugH);
+                    sugW, sugH, x, y, sugW, sugH, keep ? 1 : 0);
                 SetWindowPos(hwnd, nullptr, x, y, sugW, sugH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -3102,6 +3107,7 @@ extern "C" bool composekn_win32_place_cascaded(
     if (x < work.left) x = work.left;
     if (y < work.top) y = work.top;
 
+    window->keepPlacementOnDpiChange = true;
     SetWindowPos(
         window->hwnd, nullptr, x, y, 0, 0,
         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
@@ -3112,6 +3118,72 @@ extern "C" bool composekn_win32_place_cascaded(
         static_cast<int>(work.left), static_cast<int>(work.top),
         static_cast<int>(work.right - work.left),
         static_cast<int>(work.bottom - work.top));
+    return true;
+}
+
+/**
+ * 相对锚点所在屏 Aligned（物理像素）。Dialog 默认 Alignment.Center 走这条。
+ */
+extern "C" bool composekn_win32_place_aligned(
+    ComposeKNWin32Window* window,
+    ComposeKNWin32Window* anchor,
+    int32_t align_x,
+    int32_t align_y,
+    int32_t width_dp,
+    int32_t height_dp
+) {
+    if (window == nullptr || window->hwnd == nullptr) return false;
+    HWND ref = (anchor != nullptr && anchor->hwnd != nullptr) ? anchor->hwnd : window->hwnd;
+    const int refDpi = (anchor != nullptr && anchor->dpi > 0) ? anchor->dpi
+                      : (window->dpi > 0 ? window->dpi : 96);
+
+    HMONITOR monitor = MonitorFromWindow(ref, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr) return false;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi)) return false;
+
+    int clientW = MulDiv(width_dp > 0 ? width_dp : 1, refDpi, 96);
+    int clientH = MulDiv(height_dp > 0 ? height_dp : 1, refDpi, 96);
+    int winW = clientW;
+    int winH = clientH;
+    if (!window->undecorated) {
+        RECT adj = {0, 0, clientW, clientH};
+        const LONG_PTR style = GetWindowLongPtrW(window->hwnd, GWL_STYLE);
+        const LONG_PTR exStyle = GetWindowLongPtrW(window->hwnd, GWL_EXSTYLE);
+        const BOOL hasMenu = GetMenu(window->hwnd) != nullptr ? TRUE : FALSE;
+        if (AdjustWindowRectEx(&adj, static_cast<DWORD>(style), hasMenu, static_cast<DWORD>(exStyle))) {
+            winW = adj.right - adj.left;
+            winH = adj.bottom - adj.top;
+        }
+    }
+
+    const RECT& work = mi.rcWork;
+    const int workW = static_cast<int>(work.right - work.left);
+    const int workH = static_cast<int>(work.bottom - work.top);
+    // align -1/0/1 → 分位 0 / 0.5 / 1
+    auto axis = [](int bias, int workOrigin, int workSpan, int winSpan) -> int {
+        const int b = bias < 0 ? -1 : (bias > 0 ? 1 : 0);
+        const int slack = workSpan - winSpan;
+        const int offset = (slack * (b + 1)) / 2;
+        return workOrigin + offset;
+    };
+    int x = axis(align_x, static_cast<int>(work.left), workW, winW);
+    int y = axis(align_y, static_cast<int>(work.top), workH, winH);
+    if (x + winW > work.right) x = work.right - winW;
+    if (y + winH > work.bottom) y = work.bottom - winH;
+    if (x < work.left) x = work.left;
+    if (y < work.top) y = work.top;
+
+    window->keepPlacementOnDpiChange = true;
+    SetWindowPos(
+        window->hwnd, nullptr, x, y, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    );
+    composeknLog(
+        "window: align(%d,%d) on monitor -> %d,%d (work=%d,%d %dx%d)",
+        align_x, align_y, x, y,
+        static_cast<int>(work.left), static_cast<int>(work.top), workW, workH);
     return true;
 }
 

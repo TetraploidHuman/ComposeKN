@@ -73,7 +73,15 @@ private object WindowsComposeNativeBackend : ComposeNativeWindowBackend {
         }
         when (val pos = params.position) {
             is WindowPosition.Absolute -> handle.applyPosition(pos)
-            is WindowPosition.Aligned -> handle.applyPosition(pos)
+            is WindowPosition.Aligned -> {
+                // Dialog 默认 Aligned(Center)：相对最近焦点窗所在屏居中（物理像素）
+                if (!WindowsApplicationHost.placeAligned(
+                        app.window, pos.alignment, width, height,
+                    )
+                ) {
+                    handle.applyPosition(pos)
+                }
+            }
             WindowPosition.PlatformDefault -> {
                 // 物理像素 cascade（跨 DPI）；首扇无锚点仍居中。
                 if (!WindowsApplicationHost.placeCascaded(app.window, width, height)) {
@@ -149,7 +157,13 @@ class WindowsNativeWindowHandle(
                 app.window.setWindowPosition(position.x.value.toInt(), position.y.value.toInt())
             }
             is WindowPosition.Aligned -> {
-                app.window.alignOnScreen(position.alignment)
+                val size = app.window.windowSize
+                if (!WindowsApplicationHost.placeAligned(
+                        app.window, position.alignment, size.width, size.height,
+                    )
+                ) {
+                    app.window.alignOnScreen(position.alignment)
+                }
             }
             WindowPosition.PlatformDefault -> Unit
         }

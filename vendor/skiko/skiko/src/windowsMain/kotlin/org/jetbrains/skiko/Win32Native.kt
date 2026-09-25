@@ -257,6 +257,16 @@ internal external fun composekn_win32_place_cascaded(
     heightDp: Int,
 ): Boolean
 
+@SymbolName("composekn_win32_place_aligned")
+internal external fun composekn_win32_place_aligned(
+    window: COpaquePointer?,
+    anchor: COpaquePointer?,
+    alignX: Int,
+    alignY: Int,
+    widthDp: Int,
+    heightDp: Int,
+): Boolean
+
 @SymbolName("composekn_win32_taskbar_supported")
 internal external fun composekn_win32_taskbar_supported(window: COpaquePointer?): Boolean
 
@@ -815,6 +825,25 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
      */
     fun placeCascadedFrom(anchor: Win32Window, widthDp: Int, heightDp: Int): Boolean =
         composekn_win32_place_cascaded(native, anchor.native, widthDp, heightDp)
+
+    /**
+     * 相对 [anchor] 所在屏做 Aligned（物理像素）。
+     * alignX/Y：-1 靠左/上，0 居中，1 靠右/下。
+     */
+    fun placeAlignedFrom(
+        anchor: Win32Window?,
+        alignX: Int,
+        alignY: Int,
+        widthDp: Int,
+        heightDp: Int,
+    ): Boolean = composekn_win32_place_aligned(
+        native,
+        anchor?.native,
+        alignX,
+        alignY,
+        widthDp,
+        heightDp,
+    )
 
     /** 任务栏进度能不能用（Wine/无 shell 时为 false）。 */
     val taskbarSupported: Boolean get() = composekn_win32_taskbar_supported(native)

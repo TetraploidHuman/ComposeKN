@@ -479,6 +479,22 @@ bool composekn_win32_place_cascaded(
     int32_t height_dp);
 
 /**
+ * 相对 [anchor] 所在显示器工作区做 Aligned 落点（物理像素）。
+ *
+ * DialogState 默认 `WindowPosition(Alignment.Center)`（不是 PlatformDefault），
+ * 旧实现走主屏 SPI_GETWORKAREA → Dialog 总回主屏。
+ *
+ * align_x/align_y：-1=靠左/上，0=居中，1=靠右/下。
+ */
+bool composekn_win32_place_aligned(
+    ComposeKNWin32Window* window,
+    ComposeKNWin32Window* anchor,
+    int32_t align_x,
+    int32_t align_y,
+    int32_t width_dp,
+    int32_t height_dp);
+
+/**
  * 自检用：对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码。
  *
  * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心。返回 HTLEFT(10)…HTBORDER(18)、
