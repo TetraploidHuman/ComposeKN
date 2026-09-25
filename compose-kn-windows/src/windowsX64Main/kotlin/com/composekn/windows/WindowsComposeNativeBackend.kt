@@ -75,16 +75,8 @@ private object WindowsComposeNativeBackend : ComposeNativeWindowBackend {
             is WindowPosition.Absolute -> handle.applyPosition(pos)
             is WindowPosition.Aligned -> handle.applyPosition(pos)
             WindowPosition.PlatformDefault -> {
-                // Desktop WindowLocationTracker：相对最近焦点窗 cascade；
-                // 首扇窗无锚点时仍居中（比 Desktop 的工作区左上+48 更合适作主窗默认）。
-                val cascade = WindowsApplicationHost.cascadePositionFor(
-                    app.window,
-                    widthDp = width,
-                    heightDp = height,
-                )
-                if (cascade != null) {
-                    app.window.setWindowPosition(cascade.x, cascade.y)
-                } else {
+                // 物理像素 cascade（跨 DPI）；首扇无锚点仍居中。
+                if (!WindowsApplicationHost.placeCascaded(app.window, width, height)) {
                     app.window.centerOnScreen()
                 }
             }

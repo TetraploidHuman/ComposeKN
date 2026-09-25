@@ -249,6 +249,14 @@ internal external fun composekn_win32_primary_work_area(window: COpaquePointer?,
 @SymbolName("composekn_win32_monitor_work_area")
 internal external fun composekn_win32_monitor_work_area(window: COpaquePointer?, out: CPointer<IntVar>)
 
+@SymbolName("composekn_win32_place_cascaded")
+internal external fun composekn_win32_place_cascaded(
+    window: COpaquePointer?,
+    anchor: COpaquePointer?,
+    widthDp: Int,
+    heightDp: Int,
+): Boolean
+
 @SymbolName("composekn_win32_taskbar_supported")
 internal external fun composekn_win32_taskbar_supported(window: COpaquePointer?): Boolean
 
@@ -800,6 +808,13 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
         composekn_win32_monitor_work_area(native, out)
         if (out[2] <= 0 || out[3] <= 0) null else intArrayOf(out[0], out[1], out[2], out[3])
     }
+
+    /**
+     * 相对 [anchor] 做物理像素 cascade 落点（跨 DPI 安全）。
+     * @see composekn_win32_place_cascaded
+     */
+    fun placeCascadedFrom(anchor: Win32Window, widthDp: Int, heightDp: Int): Boolean =
+        composekn_win32_place_cascaded(native, anchor.native, widthDp, heightDp)
 
     /** 任务栏进度能不能用（Wine/无 shell 时为 false）。 */
     val taskbarSupported: Boolean get() = composekn_win32_taskbar_supported(native)

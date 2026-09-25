@@ -465,6 +465,20 @@ void composekn_win32_primary_work_area(ComposeKNWin32Window* window, int32_t* ou
 void composekn_win32_monitor_work_area(ComposeKNWin32Window* window, int32_t* out);
 
 /**
+ * 相对 [anchor] 做 Desktop 对齐的 cascade 落点（**物理像素**），并 SetWindowPos。
+ *
+ * 不能用 dp×新窗当前 DPI：新窗常在主屏 200% 下创建，锚点已在副屏 125%，
+ * dp 坐标乘错 scale 会把窗口甩到屏外（真机 v0.5.44：第二扇半截出界、Dialog 回主屏）。
+ *
+ * @return true = 已放置；false = 参数无效（调用方应 centerOnScreen）
+ */
+bool composekn_win32_place_cascaded(
+    ComposeKNWin32Window* window,
+    ComposeKNWin32Window* anchor,
+    int32_t width_dp,
+    int32_t height_dp);
+
+/**
  * 自检用：对窗口发一条**真实**的 `WM_NCHITTEST`，返回命中码。
  *
  * `where`：0=左中 1=右中 2=上中 3=下中 4=客户区中心。返回 HTLEFT(10)…HTBORDER(18)、

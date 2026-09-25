@@ -1,6 +1,5 @@
 package com.composekn.windows
 
-import androidx.compose.ui.unit.IntOffset
 import org.jetbrains.skiko.Win32Window
 import org.jetbrains.skiko.WindowsImeDocument
 import org.jetbrains.skiko.currentNanoTime
@@ -19,29 +18,19 @@ import platform.posix.usleep
 private const val HOST_MINIMIZED_POLL_MS = 200
 
 /**
- * Desktop [WindowLocationTracker] 的 cascade 偏移（逻辑像素 / dp）。
- * 见 compose-core `ui/.../WindowLocationTracker.desktop.kt`。
- */
-private const val CASCADE_OFFSET_DP = 48
-
-/**
  * 进程级多窗口宿主：一条 PeekMessage 循环服务所有 [WindowsComposeWindow]。
  *
  * Desktop 语义对齐：
  * - 系统关窗 → 只回调 onCloseRequest（DO_NOTHING），不拆 HWND
  * - 真正销毁发生在离开 composition / [unregister] 时
- * - 泵在 [shouldContinue] 变 false 时退出（通常是 application isOpen=false
- *   且 recomposer 收尾，或命令式单窗 Close 后 unregister）
- * - [WindowPosition.PlatformDefault]：相对最近焦点窗 cascade（见 [cascadePositionFor]）
+ * - 泵在 [shouldContinue] 变 false 时退出
+ * - [WindowPosition.PlatformDefault]：物理像素 cascade（[placeCascaded]）
  *
  * ## IME / wake 路由（全局回调，多窗口必须分流）
  *
- * C 侧 `setWindowsImeCaretProvider` / Text / Reconvert 与
- * `setMainUIDispatcherWakeUpHandler` 都是**进程唯一**的函数指针：
- * - **IME**：优先 [focusedSession]（键盘焦点窗），否则 [lastActiveSession]
- * - **wake**：PostMessage 到 [lastActiveSession] 的 HWND（线程队列共享，任一存活窗即可）
- *
- * 各窗口会话通过 [installImeProviders] 把自身的 textInput 钩子挂到上述全局入口。
+ * C 侧 IME / wake provider 都是进程唯一的函数指针：
+ * - **IME**：优先 [focusedSession]，否则 [lastActiveSession]
+ * - **wake**：PostMessage 到 [lastActiveSession] 的 HWND
  */
 object WindowsApplicationHost {
     private val sessions = mutableListOf<WindowsComposeWindow>()
@@ -84,41 +73,23 @@ object WindowsApplicationHost {
     }
 
     /**
-     * Desktop 对齐的 [WindowPosition.PlatformDefault] 初始坐标。
-     *
-     * 相对最近焦点/活跃**兄弟窗**的当前屏幕位置做 +48dp cascade；
-     * 若会溢出**该锚点窗所在显示器**工作区则回到该屏左上 +48
-     * （不能用主屏 SPI_GETWORKAREA，否则副屏负坐标会被误判打回主屏）。
-     * 没有可参考的兄弟窗时返回 `null`（调用方应 [WindowsComposeWindow.centerOnScreen]）。
+     * Desktop 对齐的 [androidx.compose.ui.window.WindowPosition.PlatformDefault]：
+     * 相对最近焦点兄弟窗做**物理像素** cascade（跨 DPI 安全）。
+     * 无锚点时返回 false（调用方 [WindowsComposeWindow.centerOnScreen]）。
      */
-    fun cascadePositionFor(
+    fun placeCascaded(
         window: WindowsComposeWindow,
         widthDp: Int,
         heightDp: Int,
-    ): IntOffset? {
+    ): Boolean {
         val anchor = when {
             focusedSession != null && focusedSession !== window -> focusedSession
             lastActiveSession != null && lastActiveSession !== window -> lastActiveSession
             else -> sessions.lastOrNull { it !== window }
-        } ?: return null
-
-        val last = anchor.windowPosition
-        var x = last.x + CASCADE_OFFSET_DP
-        var y = last.y + CASCADE_OFFSET_DP
-
-        // 必须用锚点窗所在屏；新窗尚未 show，MonitorFromWindow 可能落在错误显示器。
-        val work = anchor.nativeWindow?.monitorWorkAreaDp()
-            ?: anchor.nativeWindow?.primaryMonitorWorkAreaDp()
-        if (work != null) {
-            val workRight = work[0] + work[2]
-            val workBottom = work[1] + work[3]
-            // 对齐 Desktop：仅右/下溢出时折回该屏左上 + offset
-            if (x + widthDp > workRight || y + heightDp > workBottom) {
-                x = work[0] + CASCADE_OFFSET_DP
-                y = work[1] + CASCADE_OFFSET_DP
-            }
-        }
-        return IntOffset(x, y)
+        } ?: return false
+        val dest = window.nativeWindow ?: return false
+        val src = anchor.nativeWindow ?: return false
+        return dest.placeCascadedFrom(src, widthDp, heightDp)
     }
 
     fun unregister(window: WindowsComposeWindow) {

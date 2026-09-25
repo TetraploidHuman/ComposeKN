@@ -1033,23 +1033,40 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             // 跨显示器（缩放不同）时 Windows 会发这条：我们必须
             //   1) 更新自己的 dpi —— 否则 dp/密度一直是旧屏的（真机日志：拖到另一块屏后
             //      PERF-BANNER 仍然 dpi=2.0，UI 按错误缩放画）；
-            //   2) 应用 lParam 给出的**建议矩形** —— 它保证「逻辑尺寸不变、物理尺寸随新
-            //      缩放重算」。不照做的话窗口会保持旧物理尺寸，在分辨率更低/缩放更小的屏上
-            //      就显得几乎占满全屏（用户反馈的现象）。
+            //   2) 应用建议尺寸；位置优先保留当前，避免 cascade 误乘 DPI 后 suggestion
+            //      把窗甩到屏外（v0.5.44：rect=1124,-1720）。
             const int newDpi = HIWORD(wParam);
             if (newDpi > 0) window->dpi = newDpi;
             auto* suggested = reinterpret_cast<RECT*>(lParam);
             if (suggested != nullptr) {
+                RECT cur = {};
+                GetWindowRect(hwnd, &cur);
+                const int sugW = static_cast<int>(suggested->right - suggested->left);
+                const int sugH = static_cast<int>(suggested->bottom - suggested->top);
+                int x = static_cast<int>(suggested->left);
+                int y = static_cast<int>(suggested->top);
+                // 建议点相对当前位置跳太远 → 信任我们刚设的 cascade 物理坐标，只吃尺寸
+                const int jumpX = x - static_cast<int>(cur.left);
+                const int jumpY = y - static_cast<int>(cur.top);
+                if (jumpX > 200 || jumpX < -200 || jumpY > 200 || jumpY < -200) {
+                    x = static_cast<int>(cur.left);
+                    y = static_cast<int>(cur.top);
+                }
+                HMONITOR monitor = MonitorFromRect(&cur, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi = {};
+                mi.cbSize = sizeof(mi);
+                if (monitor != nullptr && GetMonitorInfoW(monitor, &mi)) {
+                    if (x + sugW > mi.rcWork.right) x = mi.rcWork.right - sugW;
+                    if (y + sugH > mi.rcWork.bottom) y = mi.rcWork.bottom - sugH;
+                    if (x < mi.rcWork.left) x = mi.rcWork.left;
+                    if (y < mi.rcWork.top) y = mi.rcWork.top;
+                }
                 composeknLog(
-                    "win32: WM_DPICHANGED -> dpi=%d rect=%d,%d %dx%d",
+                    "win32: WM_DPICHANGED -> dpi=%d suggested=%d,%d %dx%d applied=%d,%d %dx%d",
                     newDpi,
                     static_cast<int>(suggested->left), static_cast<int>(suggested->top),
-                    static_cast<int>(suggested->right - suggested->left),
-                    static_cast<int>(suggested->bottom - suggested->top));
-                SetWindowPos(hwnd, nullptr,
-                             suggested->left, suggested->top,
-                             suggested->right - suggested->left,
-                             suggested->bottom - suggested->top,
+                    sugW, sugH, x, y, sugW, sugH);
+                SetWindowPos(hwnd, nullptr, x, y, sugW, sugH,
                              SWP_NOZORDER | SWP_NOACTIVATE);
             }
             break;
@@ -3029,6 +3046,73 @@ extern "C" void composekn_win32_monitor_work_area(ComposeKNWin32Window* window, 
     out[1] = pxToDp(work.top);
     out[2] = pxToDp(work.right - work.left);
     out[3] = pxToDp(work.bottom - work.top);
+}
+
+/**
+ * 相对锚点窗 cascade（物理像素）。见 bridge 注释。
+ */
+extern "C" bool composekn_win32_place_cascaded(
+    ComposeKNWin32Window* window,
+    ComposeKNWin32Window* anchor,
+    int32_t width_dp,
+    int32_t height_dp
+) {
+    if (window == nullptr || window->hwnd == nullptr ||
+        anchor == nullptr || anchor->hwnd == nullptr) {
+        return false;
+    }
+    RECT ar = {};
+    if (!GetWindowRect(anchor->hwnd, &ar)) return false;
+
+    HMONITOR monitor = MonitorFromWindow(anchor->hwnd, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr) return false;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi)) return false;
+
+    // Desktop WindowLocationTracker：Point(48, 48) 屏幕像素；按锚点 DPI 换算逻辑 48dp
+    const int offsetPx = MulDiv(48, anchor->dpi > 0 ? anchor->dpi : 96, 96);
+    int x = static_cast<int>(ar.left) + offsetPx;
+    int y = static_cast<int>(ar.top) + offsetPx;
+
+    // 新窗外框尺寸按**锚点屏 DPI**估（落点屏）；系统装饰用 AdjustWindowRectEx
+    int clientW = MulDiv(width_dp > 0 ? width_dp : 1, anchor->dpi > 0 ? anchor->dpi : 96, 96);
+    int clientH = MulDiv(height_dp > 0 ? height_dp : 1, anchor->dpi > 0 ? anchor->dpi : 96, 96);
+    int winW = clientW;
+    int winH = clientH;
+    if (!window->undecorated) {
+        RECT adj = {0, 0, clientW, clientH};
+        const LONG_PTR style = GetWindowLongPtrW(window->hwnd, GWL_STYLE);
+        const LONG_PTR exStyle = GetWindowLongPtrW(window->hwnd, GWL_EXSTYLE);
+        const BOOL hasMenu = GetMenu(window->hwnd) != nullptr ? TRUE : FALSE;
+        if (AdjustWindowRectEx(&adj, static_cast<DWORD>(style), hasMenu, static_cast<DWORD>(exStyle))) {
+            winW = adj.right - adj.left;
+            winH = adj.bottom - adj.top;
+        }
+    }
+
+    const RECT& work = mi.rcWork;
+    if (x + winW > work.right || y + winH > work.bottom) {
+        x = static_cast<int>(work.left) + offsetPx;
+        y = static_cast<int>(work.top) + offsetPx;
+    }
+    // 仍出界则贴进工作区（半截出屏兜底）
+    if (x + winW > work.right) x = work.right - winW;
+    if (y + winH > work.bottom) y = work.bottom - winH;
+    if (x < work.left) x = work.left;
+    if (y < work.top) y = work.top;
+
+    SetWindowPos(
+        window->hwnd, nullptr, x, y, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    );
+    composeknLog(
+        "window: cascade from anchor px=%d,%d -> %d,%d (offset=%d work=%d,%d %dx%d)",
+        static_cast<int>(ar.left), static_cast<int>(ar.top), x, y, offsetPx,
+        static_cast<int>(work.left), static_cast<int>(work.top),
+        static_cast<int>(work.right - work.left),
+        static_cast<int>(work.bottom - work.top));
+    return true;
 }
 
 /**
