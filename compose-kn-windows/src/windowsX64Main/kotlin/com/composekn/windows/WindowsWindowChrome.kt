@@ -34,6 +34,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.semantics.Role
 
 /**
  * Client-side title bar with minimize / maximize / close buttons.
@@ -108,7 +110,15 @@ private fun WindowControlButton(kind: WindowButton, onClick: () -> Unit) {
             .height(32.dp)
             .background(if (hovered) Color(0xFF3F3F46) else Color.Transparent)
             .hoverable(interactionSource)
-            .clickable(onClick = onClick),
+            // 标题栏按钮不应可获焦：clickable 默认会在鼠标按下时 requestFocus，
+            // 未聚焦时第一次点击只抢焦点、第二次才触发 onClick（真机「要先点一下」）。
+            .focusProperties { canFocus = false }
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Button,
+                onClick = onClick,
+            ),
         contentAlignment = Alignment.Center,
     ) {
         Canvas(Modifier.size(10.dp)) {

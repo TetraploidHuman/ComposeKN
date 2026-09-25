@@ -279,37 +279,39 @@ fun main(args: Array<String>) {
         }
 
         if (openCsdMove) {
+            // undecorated=true 时宿主会套 WindowsWindowChrome（自绘标题栏 + 最小化/最大化/关闭）。
+            // 内容里再用 WindowDraggableArea 演示「应用自绘拖区」API（不只靠 chrome 标题文字）。
             Window(
                 onCloseRequest = { openCsdMove = false },
-                state = rememberWindowState(size = DpSize(420.dp, 240.dp)),
+                state = rememberWindowState(size = DpSize(420.dp, 280.dp)),
                 title = "ComposeKN · WindowDraggableArea",
                 undecorated = true,
             ) {
                 Surface(Modifier.fillMaxSize()) {
-                    Column(Modifier.fillMaxSize()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            "上方 CSD 标题栏可拖；也可点最小化 / 最大化 / 关闭。",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                         WindowDraggableArea(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(40.dp)
-                                .background(Color(0xFF2D2D30)),
+                                .height(48.dp)
+                                .background(Color(0xFF1B6AC9)),
                         ) {
                             Text(
-                                "拖这里移动窗口（WindowDraggableArea → beginMove）",
+                                "额外拖区（WindowDraggableArea → beginMove）",
                                 color = Color.White,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 14.dp),
                             )
                         }
-                        Column(
-                            modifier = Modifier.padding(24.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                        ) {
-                            Text(
-                                "无边框窗 + 应用自绘拖区；对齐 Desktop WindowDraggableArea。",
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                            Button(onClick = { openCsdMove = false }) {
-                                Text("关闭")
-                            }
+                        Button(onClick = { openCsdMove = false }) {
+                            Text("关闭本窗")
                         }
                     }
                 }

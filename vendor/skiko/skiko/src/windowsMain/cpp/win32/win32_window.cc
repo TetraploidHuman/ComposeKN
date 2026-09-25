@@ -1091,8 +1091,11 @@ static LRESULT CALLBACK composeknWndProc(HWND hwnd, UINT message, WPARAM wParam,
             ZeroMemory(&mi, sizeof(mi));
             mi.cbSize = sizeof(mi);
             if (GetMonitorInfoW(monitor, &mi)) {
-                mmi->ptMaxPosition.x = mi.rcWork.left;
-                mmi->ptMaxPosition.y = mi.rcWork.top;
+                // ptMaxPosition 是相对**该显示器原点**的偏移，不是屏幕绝对坐标。
+                // 若写成 rcWork.left/top（屏幕坐标），副屏会再叠一次显示器原点：
+                //   work.top=-1440 → 实际 y=-2880，窗口飞出屏幕（真机「最大化消失」）。
+                mmi->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+                mmi->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
                 mmi->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
                 mmi->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
             }
