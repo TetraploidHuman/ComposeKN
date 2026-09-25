@@ -173,6 +173,10 @@ class LinuxNativeWindowHandle(
         }
     }
 
+    override fun beginMove() {
+        app.composeWindow.window.beginMove()
+    }
+
     private fun notifyGeometryFromNative() {
         if (disposed) return
         val listener = geometryListener ?: return

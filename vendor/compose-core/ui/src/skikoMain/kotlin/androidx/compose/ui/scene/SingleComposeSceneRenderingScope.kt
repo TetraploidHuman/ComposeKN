@@ -46,9 +46,7 @@ class SingleComposeSceneRenderingScope(
     private var isRendering = false
 
     private inline fun postponingSceneInvalidations(crossinline block: () -> Unit) {
-        // 关窗 Hide / WM_SIZE fireRenderTick 可能在上一帧尚未结束时同步重入。
-        // 丢弃嵌套帧，避免 IllegalStateException: Check failed 崩进程。
-        if (isRendering) return
+        check(!isRendering)
         isRendering = true
         try {
             block()

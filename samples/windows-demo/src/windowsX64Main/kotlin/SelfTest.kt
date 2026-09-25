@@ -2236,6 +2236,13 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                 clipboardValue = native.clipboard
                 report.checkEquals("window/clipboard-roundtrip", SELFTEST_CLIPBOARD, clipboardValue)
             }
+            // CSD MOVE：原生 beginMove（HTCAPTION）不抛、可调用——完整拖移靠画廊手测。
+            try {
+                w.beginMove()
+                report.check("window/beginMove", true)
+            } catch (t: Throwable) {
+                report.check("window/beginMove", false, t.message ?: t.toString())
+            }
             // 合成点击（逻辑坐标 -> 物理坐标）：确定性界面的按钮位于 (40..200, 128..176)dp
             val scale = w.dpiScale
             clickedAt = Pair((120 * scale).toInt(), (152 * scale).toInt())

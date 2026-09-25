@@ -36,6 +36,14 @@ interface ComposeNativeWindowHandle {
      */
     fun setMenuBar(model: NativeMenuBarModel?) {}
 
+    /**
+     * 开始原生交互式拖窗（CSD / [androidx.compose.foundation.window.WindowDraggableArea]）。
+     *
+     * Win32 = `WM_NCLBUTTONDOWN`/`HTCAPTION`；Wayland = `xdg_toplevel_move`。
+     * 须在指针按下的同一事件路径里调用（Wayland 需要有效 seat serial）。
+     */
+    fun beginMove() {}
+
     fun dispose()
 }
 

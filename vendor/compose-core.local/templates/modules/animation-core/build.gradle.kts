@@ -28,5 +28,9 @@ kotlin {
             dependsOn(nonJvmMain)
             kotlin.srcDir("src/linuxX64Main/kotlin")
         }
+        val mingwX64Main by getting {
+            dependsOn(nonJvmMain)
+            kotlin.srcDir("src/linuxX64Main/kotlin")
+        }
     }
 }

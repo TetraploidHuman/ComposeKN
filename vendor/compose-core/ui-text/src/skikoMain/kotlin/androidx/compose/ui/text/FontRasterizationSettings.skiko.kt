@@ -78,10 +78,10 @@ class FontRasterizationSettings(
             when (currentPlatform()) {
                 Platform.Windows -> FontRasterizationSettings(
                     subpixelPositioning = true,
-                    // ClearType：与系统 SPI + SkiaLayer.pixelGeometry（RGB_H/BGR_H）对齐。
-                    // 以前因 PixelGeometry 固定 UNKNOWN 而被迫关掉 SubpixelAntiAlias，
-                    // DirectWrite 仍可能出 ClearType 位图 → 灰度解读成「笔画断成点」。
-                    smoothing = FontSmoothing.SubpixelAntiAlias,
+                    // Most UIs still use ClearType on Windows, so we should match this
+                    // We temporarily disabled `SubpixelAntiAlias` until we figure out
+                    // how to properly retrieve default OS settings
+                    smoothing = FontSmoothing.AntiAlias,
                     hinting = FontHinting.Normal, // None would trigger some potentially unwanted behavior, but everything else is forced into Normal on Windows
                     autoHintingForced = false,
                 )

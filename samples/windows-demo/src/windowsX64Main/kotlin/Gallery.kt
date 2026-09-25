@@ -232,6 +232,8 @@ fun ComponentGallery(
     onOpenSecondWindow: (() -> Unit)? = null,
     /** 打开 DialogWindow（软模态对话框）。 */
     onOpenDialogWindow: (() -> Unit)? = null,
+    /** 打开无边框窗，验证 WindowDraggableArea → beginMove。 */
+    onOpenCsdMoveWindow: (() -> Unit)? = null,
     /** application 层 Tray 的状态（画廊按钮发通知）。 */
     trayState: TrayState? = null,
     traySupported: Boolean = false,
@@ -290,6 +292,7 @@ fun ComponentGallery(
                     window,
                     onOpenSecondWindow,
                     onOpenDialogWindow,
+                    onOpenCsdMoveWindow,
                     trayState,
                     traySupported,
                 )
@@ -336,6 +339,7 @@ private fun LazyListScope.gallerySections(
     window: WindowsComposeWindow,
     onOpenSecondWindow: (() -> Unit)?,
     onOpenDialogWindow: (() -> Unit)?,
+    onOpenCsdMoveWindow: (() -> Unit)?,
     trayState: TrayState?,
     traySupported: Boolean,
 ) {
@@ -373,7 +377,7 @@ private fun LazyListScope.gallerySections(
         }
     }
 
-    if (onOpenSecondWindow != null || onOpenDialogWindow != null) {
+    if (onOpenSecondWindow != null || onOpenDialogWindow != null || onOpenCsdMoveWindow != null) {
         section("多窗口 / Multi-window") {
             if (onOpenSecondWindow != null) {
                 Button(onClick = onOpenSecondWindow) {
@@ -385,10 +389,16 @@ private fun LazyListScope.gallerySections(
                     Text("打开 DialogWindow")
                 }
             }
+            if (onOpenCsdMoveWindow != null) {
+                Button(onClick = onOpenCsdMoveWindow) {
+                    Text("打开无边框窗（WindowDraggableArea）")
+                }
+            }
             Text(
                 "Desktop 对齐：application { if (open) Window/DialogWindow(...) }。" +
                     "关副窗/对话框只拆那一扇；DialogWindow 打开时会软禁用其它窗输入；" +
-                    "关主窗 exitApplication 退整应用。",
+                    "关主窗 exitApplication 退整应用。" +
+                    "无边框窗用 WindowDraggableArea → beginMove（HTCAPTION）拖移。",
                 style = MaterialTheme.typography.bodySmall,
             )
         }

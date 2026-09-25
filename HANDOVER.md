@@ -3,9 +3,13 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.46**（Dialog Aligned 跟锚点屏；cascade 物理像素；
-> 共享 VkDevice；Linux Graphite/Vulkan + CI selftest；见文末；
+> **当前平台宿主基线：v0.5.47**（CSD `WindowDraggableArea`/`beginMove`；compose-core
+> `v1.12.1`；Dialog Aligned 跟锚点屏；cascade 物理像素；共享 VkDevice；
+> Linux Graphite/Vulkan + CI selftest；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
+> **compose-core 源码基线：`v1.12.1`**（见 `vendor/compose-core.local/VERSIONS`；
+> Maven `compose_deps` 仍为 `1.11.1`）。
+> **本轮已补**：CSD `WindowDraggableArea` → `beginMove`（Win HTCAPTION / Wayland xdg_toplevel_move）。
 
 ## 0. 一句话背景
 
@@ -22,9 +26,11 @@
   `6d473fc44b`，实际 commit `fca104ce5d4d3bb1e88a04414ffa382894800797`）。
   方法：对 3 个候选 tag 做全量 blob-hash 三向 diff，diff 最小的胜出。
   ⚠️ 源码基线**不是** v1.11.1 —— `1.11.1` 只是 Maven 依赖（runtime 等）的版本号。
-  > **当前基线已推进**：2026-09 由 P1 同步到 `v1.12.0-rc01+dev4619`
-  > （commit `265534f9`，比 dev4339 新约 280 commits），编译 + 链接 + 运行全部通过，
-  > 已定为新基线（见 `vendor/compose-core.local/VERSIONS` 与 §2-P1）。dev4339 仍可随时回退。
+  > **当前基线已推进**：2026-09 再同步到 `v1.12.1`（commit `a1a7f353`；
+  > 上一站 `v1.12.0-rc01+dev4619`）。Maven `compose_deps` 仍钉 `1.11.1`
+  >（`collection-internal:1.12.x` 尚未发布）。见 `vendor/compose-core.local/VERSIONS`。
+  > 同步时 templates 必须带 `mingwX64()` + 各模块 `mingwX64Main`（复用 linuxX64Main），
+  > 否则 Windows 交叉编会丢 target。
 - 本地改动全集（相对该基线，13 个上游模块目录内）：
   - **7 个上游文件被修改**（见 `vendor/compose-core.local/patches/`，全部已导出为 patch）
   - **40 个新增 src 文件**：39 个 `linuxX64Main` actual + 1 个 `ui-text` skikoMain actual
@@ -3717,7 +3723,8 @@ COMPOSEKN_SELFTEST=window   # / all / logic
 * ~~Wayland / linux 尚未登记 `ComposeNativeWindowBackend`~~ → v0.5.26 已登记（见上）。
 * ~~无 Tray~~ → v0.5.38 Tray + Notification（见下）。MenuBar / FileDialog / Aligned 见 v0.5.27。
 * ~~声明式路径下 state→原生窗的双向同步~~ → v0.5.25 已双向。
-* 拖出自定义装饰图 / MOVE 语义未做。
+* ~~拖出自定义装饰图 / MOVE 语义未做~~ → `WindowDraggableArea` → `beginMove`
+  （Win HTCAPTION / Wayland xdg_toplevel_move）；装饰图拖出仍未做。
 * ~~Linux：每窗独立 `wl_display`~~ → v0.5.40 进程级共享 display（见下）。
 * Linux：绝对定位 / `WindowPosition.Aligned` 仍为 no-op（无通用协议；layer-shell 未接）；
   always-on-top 无标准 API（仅记账）。
@@ -3991,16 +3998,32 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.46 后）
+##### 已知仍缺（v0.5.47 后）
 
-* 拖出自定义装饰图 / CSD MOVE 语义（Win/Linux）
+* ~~CSD MOVE / `WindowDraggableArea`~~ → `ComposeNativeWindowHandle.beginMove` +
+  foundation `WindowDraggableArea.linux.kt`（Win/Linux）；画廊「无边框窗」；
+  自检 `window/beginMove`
+* 自定义装饰图拖出（仍未做）
 * Wayland Absolute / Aligned 定位；always-on-top；PlatformDefault cascade（无通用绝对定位）
 * ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
   `scripts/test-linux-native.sh`（headless weston；FRAME 超时回退；CI 跳过 maximize）
+* ~~Windows CI `--selftest`~~ → `.github/workflows/windows-native-selftest.yml` +
+  `scripts/test-windows-native.sh`（Wine + Xvfb；预编译 mingw-Skia）。
+  **注意**：若 Actions 因账户 billing/spending limit 无法调度 runner，需在
+  GitHub → Settings → Billing 恢复额度后才会真正跑绿。
 * ~~Vulkan 多窗共享 VkDevice~~ → Linux `wayland_vulkan.cc` + Windows `win32_vulkan.cc`
 * ~~Windows `PlatformDefault` / 跨 DPI cascade~~ → v0.5.43–45；
   ~~Dialog `Aligned(Center)` 总回主屏~~ → v0.5.46
+* ~~上游 Compose 再同步~~ → `v1.12.1`（`compose-core.local/VERSIONS`；linux 编译绿）
 * Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
+
+#### CSD MOVE + compose-core v1.12.1（v0.5.47）
+
+1. **`WindowDraggableArea`**（foundation linuxX64/mingw 共享）→
+   `ComposeNativeWindowHandle.beginMove()`（Win `HTCAPTION` / Wayland `xdg_toplevel_move`）
+2. **上游同步**：`v1.12.0-rc01+dev4619` → `v1.12.1`；templates 固化 `mingwX64()` +
+   各模块 `mingwX64Main`（复用 linuxX64Main），避免 sync 丢掉 Windows target
+3. 画廊：「打开无边框窗（WindowDraggableArea）」；自检 `window/beginMove` 冒烟
 
 #### Linux Graphite / Vulkan（v0.5.41）
 

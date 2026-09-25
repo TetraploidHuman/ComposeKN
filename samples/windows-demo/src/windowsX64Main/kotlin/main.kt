@@ -2,16 +2,14 @@
 
 package main
 
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.painter.ColorPainter
-import androidx.compose.ui.unit.DpSize
-import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.background
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.window.DialogWindow
 import androidx.compose.ui.window.MenuBar
 import androidx.compose.ui.window.Notification
@@ -23,6 +21,21 @@ import androidx.compose.ui.window.rememberDialogState
 import androidx.compose.ui.window.rememberNotification
 import androidx.compose.ui.window.rememberTrayState
 import androidx.compose.ui.window.rememberWindowState
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.painter.ColorPainter
+import androidx.compose.foundation.window.WindowDraggableArea
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -70,6 +83,7 @@ fun main(args: Array<String>) {
         val probe = remember { GalleryProbe() }
         var openSecond by remember { mutableStateOf(false) }
         var openDialog by remember { mutableStateOf(false) }
+        var openCsdMove by remember { mutableStateOf(false) }
         val mainState = rememberWindowState(size = DpSize(1100.dp, 760.dp))
         val trayState = rememberTrayState()
         val trayNotifyInfo = rememberNotification(
@@ -237,6 +251,7 @@ fun main(args: Array<String>) {
                     animate = animate,
                     onOpenSecondWindow = { openSecond = true },
                     onOpenDialogWindow = { openDialog = true },
+                    onOpenCsdMoveWindow = { openCsdMove = true },
                     trayState = trayState,
                     traySupported = isTraySupported,
                 )
@@ -260,6 +275,44 @@ fun main(args: Array<String>) {
                 title = "ComposeKN · DialogWindow",
             ) {
                 DialogWindowContent(onClose = { openDialog = false })
+            }
+        }
+
+        if (openCsdMove) {
+            Window(
+                onCloseRequest = { openCsdMove = false },
+                state = rememberWindowState(size = DpSize(420.dp, 240.dp)),
+                title = "ComposeKN · WindowDraggableArea",
+                undecorated = true,
+            ) {
+                Surface(Modifier.fillMaxSize()) {
+                    Column(Modifier.fillMaxSize()) {
+                        WindowDraggableArea(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp)
+                                .background(Color(0xFF2D2D30)),
+                        ) {
+                            Text(
+                                "拖这里移动窗口（WindowDraggableArea → beginMove）",
+                                color = Color.White,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Text(
+                                "无边框窗 + 应用自绘拖区；对齐 Desktop WindowDraggableArea。",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Button(onClick = { openCsdMove = false }) {
+                                Text("关闭")
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -23,5 +23,8 @@ kotlin {
         val linuxX64Main by getting {
             dependsOn(jbMain)
         }
+        val mingwX64Main by getting {
+            dependsOn(jbMain)
+        }
     }
 }

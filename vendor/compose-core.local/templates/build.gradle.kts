@@ -10,6 +10,7 @@ subprojects {
     plugins.withId("org.jetbrains.kotlin.multiplatform") {
         extensions.configure<KotlinMultiplatformExtension> {
             linuxX64()
+            mingwX64()
             compilerOptions {
                 freeCompilerArgs.addAll(
                     "-Xexpect-actual-classes",

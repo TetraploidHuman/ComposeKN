@@ -23,5 +23,8 @@ kotlin {
         val linuxX64Main by getting {
             dependsOn(nonAndroidMain)
         }
+        val mingwX64Main by getting {
+            dependsOn(nonAndroidMain)
+        }
     }
 }

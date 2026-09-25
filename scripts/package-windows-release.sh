@@ -102,6 +102,8 @@ Kotlin/Native (mingwX64) + Compose Multiplatform + 自编译 GNU-ABI Skia，
   · 多窗口：Desktop 对齐的 `application { Window(...) }`；第二扇窗关窗只清自己的
     `open` 状态，不会把整线程 `PostQuitMessage` 掉（共享消息泵）。
     `WindowPosition.PlatformDefault`：相对最近焦点窗 cascade（+48dp），首扇仍居中。
+    DialogWindow `Aligned(Center)` 相对锚点窗所在屏居中。
+  · **无边框拖窗**：`WindowDraggableArea` → `beginMove`（HTCAPTION）；画廊「打开无边框窗」。
   · **原生菜单栏（MenuBar）**：标题栏下方系统 HMENU（文件/编辑）；画廊「菜单栏 /
     MenuBar」一节会显示最近点选。无边框窗不显示。
   · **文件对话框（FileDialog）**：画廊「文件对话框」一节可点命令式 / Composable 打开与保存。

@@ -192,6 +192,10 @@ class WindowsNativeWindowHandle(
         app.window.setMenuBar(model)
     }
 
+    override fun beginMove() {
+        app.window.beginMove()
+    }
+
     private fun notifyGeometryFromNative() {
         if (disposed) return
         val listener = geometryListener ?: return

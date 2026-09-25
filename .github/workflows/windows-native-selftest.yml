@@ -2,6 +2,13 @@ name: windows-native-selftest
 
 # 在 ubuntu runner 上「构建 HEAD 的 Windows 原生 exe，然后跑 exe 内置的自检」。
 #
+# 门禁脚本：scripts/test-windows-native.sh（COMPOSEKN_SELFTEST=logic|window +
+# 外部 xdotool/截图阶段）。与 linux-native-selftest.yml 对称。
+#
+# 若 job 在数秒内就被标失败且 annotation 写
+# 「recent account payments have failed / spending limit」——那是 GitHub Actions
+# 账单/额度问题，不是本仓库代码；恢复 Billing 后重新 workflow_dispatch 即可。
+#
 # 为什么 Linux 上能跑 Windows exe：
 #   * mingwX64 本来就是交叉编译目标 —— konan 的 Windows 工具链就是「在 Linux/macOS
 #     上跑的 msys2 版 clang + lld」，所以整条构建链路在 Linux 上是原生的；

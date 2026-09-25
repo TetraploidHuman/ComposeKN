@@ -2,7 +2,7 @@
 
 Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES）+ Skia 上的 Compose Multiplatform。
 
-当前文档基线：**v0.5.41**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.47**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
@@ -21,7 +21,7 @@ Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES�
 - [x] FileDialog：xdg-desktop-portal FileChooser
 - [x] Dialog 软模态；eventfd 唤醒共享泵
 - [ ] Absolute / Aligned 定位；always-on-top（无标准协议）
-- [ ] 自定义装饰拖移语义
+- [x] 自定义装饰拖移：`WindowDraggableArea` → `beginMove`（xdg_toplevel_move）
 
 ## Requirements
 

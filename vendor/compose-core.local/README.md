@@ -19,9 +19,10 @@ vendor/compose-core.local/
 
 ## 上游基线
 
-- **tag**: `v1.12.0-beta01+dev4339`（sha `6d473fc44b`）
-- ⚠️ 不是 `v1.11.1`：`1.11.1` 只是从 Maven 拉的 runtime/collection-internal 等**依赖**的版本号，
-  源码基线比它新（在 1.12.0 开发线上）。
+- **tag**: `v1.12.1`（commit `a1a7f353`；见 `VERSIONS`）
+- ⚠️ Maven `compose_deps` 仍钉 `1.11.1`：`collection-internal:1.12.x` 尚未上 Maven Central。
+- **templates 必须同时声明 `linuxX64()` + `mingwX64()`**，各模块 `mingwX64Main` 复用
+  `src/linuxX64Main/kotlin`（Windows 交叉编依赖此 wiring；sync 脚本会覆盖 vendor）。
 - `lifecycle-viewmodel-compose` 与 `ui-backhandler` 不来自该 tag 的仓库布局（见 overlay 说明）。
 
 ## 本地改动清单（相对基线）
