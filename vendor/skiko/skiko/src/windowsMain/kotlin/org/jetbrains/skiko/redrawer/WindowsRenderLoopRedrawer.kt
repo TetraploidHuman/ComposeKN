@@ -28,6 +28,7 @@ internal abstract class WindowsRenderLoopRedrawer(
     protected val window: Win32Window,
 ) : Redrawer {
     private var disposed = false
+    private var backendDisposed = false
 
     /** 「内容变了，需要重绘一帧」。 */
     @Volatile
@@ -89,13 +90,23 @@ internal abstract class WindowsRenderLoopRedrawer(
     }
 
     override fun dispose() {
-        if (disposed) return
-        disposed = true
+        quiesce()
+        if (!backendDisposed) {
+            backendDisposed = true
+            disposeBackend()
+        }
+    }
+
+    /**
+     * 停渲染但不拆后端：关窗时先 [quiesce] → scene.close（GPU 仍可用）→ 再 [dispose]。
+     */
+    fun quiesce() {
         if (resizeTickInstalled) {
             removeWindowsRenderTick(resizeTick)
             resizeTickInstalled = false
         }
-        disposeBackend()
+        onRenderRequest = null
+        disposed = true
     }
 
     /** 释放后端资源（GL 上下文 / raster surface）。已在 renderTick 摘掉之后调用。 */
@@ -159,6 +170,9 @@ internal abstract class WindowsRenderLoopRedrawer(
         try {
             val t0 = currentNanoTime()
             update(t0)
+            // update() 可能同步触发关窗/dispose（application onCloseRequest），
+            // 此时 GPU 已拆；再 renderOneFrame 会 vk_begin_frame null（v0.5.36）。
+            if (disposed) return
             val t1 = currentNanoTime()
             val presentNanos = renderOneFrame()
             val t2 = currentNanoTime()
@@ -183,6 +197,7 @@ internal abstract class WindowsRenderLoopRedrawer(
                 profilePresentNanos = 0
             }
         } catch (t: Throwable) {
+            if (disposed) return
             // GPU 丢上下文 / Skia 抛 RenderException / Compose 布局断言：若不拦，
             // K/N 顶层会变成 !!! UNHANDLED EXCEPTION code=0x20474343。
             win32Log(

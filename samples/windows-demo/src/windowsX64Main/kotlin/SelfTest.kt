@@ -2684,6 +2684,11 @@ private fun runWindowTests(report: SelfTestReport, perfContractChecks: Boolean =
                 org.jetbrains.skiko.ComposeKNFileDialog.available(),
                 "comdlg32 已链接；CI 不弹交互对话框，只断言 available",
             )
+            report.check(
+                "window/tray-available",
+                org.jetbrains.skiko.ComposeKNTray.available(),
+                "Shell_NotifyIcon 已链接；CI 不弹气泡，只断言 available",
+            )
             // 只收文件的框：位置要落在它**自己**的矩形里（onMoved/onEntered 是按
             // positionInRoot 做命中测试的 —— 位置错一点就会发给别的框）。
             simulateDrag(app, 0, DRAG_FILE_X_DP + DRAG_W_DP / 2, DRAG_FILE_Y_DP + DRAG_H_DP / 2, kind = 0)

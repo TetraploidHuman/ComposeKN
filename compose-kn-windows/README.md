@@ -1,111 +1,71 @@
 # ComposeKN Windows
 
-Kotlin/Native Windows (Win32) platform support for Compose Multiplatform.
+Kotlin/Native **windowsX64** 宿主：Win32 + Skia（Graphite/Vulkan 优先，可回退 GL）上的
+Compose Multiplatform。
+
+当前文档基线：**v0.5.40**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
-🚧 **Work in Progress** - This module is under active development.
-
-## Overview
-
-This module provides Windows x64 support for ComposeKN, enabling Compose UI applications to run natively on Windows using Kotlin/Native and Win32 API.
+可用（画廊 + 自检）。持续对齐 Desktop `androidx.compose.ui.window` API。
 
 ## Features
 
-- [ ] Win32 window creation and management
-- [ ] Skia rendering integration
-- [ ] Keyboard input handling
-- [ ] Mouse input handling
-- [ ] Text input (IME support)
-- [ ] Window chrome (title bar, controls)
-- [ ] Clipboard support
-- [ ] High DPI support
-- [ ] Drag and drop
+- [x] Win32 窗口创建 / 消息泵 / 多窗共享 Host
+- [x] Skia 呈现（Graphite/Vulkan；Intel 无 `INPUT_ATTACHMENT` 时 offscreen+blit）
+- [x] 键盘 / 鼠标 / 滚轮 / 多点触摸（WM_POINTER）
+- [x] IME（IMM32：组字、候选、DOCUMENTFEED、重转换等）
+- [x] 系统标题栏 / 可选 CSD；MenuBar（HMENU）
+- [x] 剪贴板；OLE 拖入 / 拖出
+- [x] Per-Monitor DPI；任务栏进度（ITaskbarList3）
+- [x] Tray + Notification（Shell_NotifyIcon；Painter→16×16 HICON）
+- [x] FileDialog（comdlg32）；WindowPlacement / Aligned / always-on-top
+- [ ] 自定义装饰图拖出 / CSD MOVE 语义（未做）
 
 ## Requirements
 
-- Windows 10 or later (x64)
-- Kotlin/Native compiler
-- Visual Studio Build Tools with Windows SDK
-- MinGW or similar cross-compilation toolchain (for building on Linux)
+- Windows 10+ x64
+- 交叉编：见 `vendor/skiko/skia-mingw/` 与 `shell.nix`
+- 真机 Vulkan：系统 `vulkan-1.dll`（Intel/AMD/NVIDIA 均可；路径因机器而异）
 
 ## Building
 
-### On Windows
-
 ```bash
-# Build the windows-demo sample
-./gradlew :samples:windows-demo:linkReleaseExecutableWindowsX64
-
-# Or use the convenience task
-./gradlew linkWindowsX64Stable
+# Linux 交叉链（推荐）
+nix-shell ./shell.nix --run ./vendor/skiko/skia-mingw/build-windows-native-demo.sh
+# 或
+./scripts/test-windows-native.sh
 ```
 
-### Cross-compilation from Linux
+产物：
 
-```bash
-# Note: Cross-compilation requires additional setup
-# See Kotlin/Native documentation for Windows target
-```
-
-## Running
-
-After building, the executable will be located at:
 ```
 samples/windows-demo/build/bin/windowsX64/releaseExecutable/windows-demo.exe
 ```
 
-## Architecture
+日志默认写在 **exe 同目录** `composekn-startup.log`。
 
-The module follows the same architecture as `compose-kn-linux`:
+## Running / 自检
 
-- `WindowsComposeWindow` - Win32 window management
-- `WindowsComposeApplication` - Compose UI host
-- `WindowsPlatformContext` - Platform services
-- `WindowsInputMapper` - Input event handling
-- `WindowsKeyMapper` - Keyboard mapping
-- `WindowsTextInputService` - Text input
-- `WindowsWindowChrome` - Window decorations
+```bash
+COMPOSEKN_SELFTEST=window   # 或 all / logic
+# 交互画廊：直接运行 exe；托盘 / 第二扇窗 / FileDialog / MenuBar 均在画廊内
+```
 
-## Implementation Details
+## Architecture（与 Linux 对称）
 
-### Win32 API Integration
+| 类型 | 职责 |
+|---|---|
+| `WindowsComposeNativeBackend` | 登记 `ComposeNativeWindowBackend` |
+| `WindowsApplicationHost` | 多窗共享消息泵 + wake |
+| `WindowsComposeWindow` / `Application` | 窗 + Compose scene |
+| skiko `win32_*.cc` | HWND / GL·Vulkan / Tray / OLE / IME |
 
-The module uses Kotlin/Native's cinterop to interface with Win32 APIs:
+## Known gaps
 
-- `CreateWindowExW` - Window creation
-- `DefWindowProcW` - Default message handling
-- `GetMessageW` / `PeekMessageW` - Message loop
-- `TranslateMessage` / `DispatchMessageW` - Message dispatch
-
-### Rendering
-
-Rendering is handled through SkiaLayer, which provides:
-
-- Hardware-accelerated rendering via Direct3D or OpenGL
-- Automatic DPI scaling
-- Double buffering
-
-### Input Handling
-
-Input events are mapped from Win32 messages to Compose events:
-
-- `WM_KEYDOWN` / `WM_KEYUP` → Key events
-- `WM_MOUSEMOVE` → Pointer move events
-- `WM_LBUTTONDOWN` / `WM_LBUTTONUP` → Pointer click events
-- `WM_MOUSEWHEEL` → Scroll events
-
-## Known Issues
-
-- Window chrome is simplified (no native title bar)
-- IME support is basic
-- No touch/pen input yet
-- Limited DPI awareness
-
-## Contributing
-
-Contributions are welcome! Please see the main project README for guidelines.
+- 自定义装饰拖移 / 装饰图拖出未做
+- Wine 下退出期偶发 AV（真机关窗路径已收口；见 HANDOVER Vulkan 节）
 
 ## License
 
-Same as the main ComposeKN project.
+与 ComposeKN 主项目相同。

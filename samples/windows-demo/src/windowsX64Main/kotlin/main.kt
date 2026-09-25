@@ -8,13 +8,20 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogWindow
 import androidx.compose.ui.window.MenuBar
+import androidx.compose.ui.window.Notification
+import androidx.compose.ui.window.Tray
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.isTraySupported
 import androidx.compose.ui.window.rememberDialogState
+import androidx.compose.ui.window.rememberNotification
+import androidx.compose.ui.window.rememberTrayState
 import androidx.compose.ui.window.rememberWindowState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -64,8 +71,46 @@ fun main(args: Array<String>) {
         var openSecond by remember { mutableStateOf(false) }
         var openDialog by remember { mutableStateOf(false) }
         val mainState = rememberWindowState(size = DpSize(1100.dp, 760.dp))
+        val trayState = rememberTrayState()
+        val trayNotifyInfo = rememberNotification(
+            title = "ComposeKN",
+            message = "托盘通知（Info）——右键图标也可发",
+            type = Notification.Type.Info,
+        )
+        val trayNotifyWarn = rememberNotification(
+            title = "ComposeKN",
+            message = "托盘通知（Warning）",
+            type = Notification.Type.Warning,
+        )
 
         val cores = win32ProcessorCount
+
+        // 系统托盘：Shell_NotifyIcon；双击 = onAction，右键 = 菜单。
+        if (isTraySupported) {
+            Tray(
+                icon = ColorPainter(Color(0xFF1B6AC9)),
+                state = trayState,
+                tooltip = "ComposeKN Windows Demo",
+                onAction = {
+                    probe.trayAction = "dblclick"
+                    winlog("tray: onAction (double-click)")
+                },
+            ) {
+                Item("通知 · Info") {
+                    probe.trayAction = "notify-info"
+                    trayState.sendNotification(trayNotifyInfo)
+                }
+                Item("通知 · Warning") {
+                    probe.trayAction = "notify-warn"
+                    trayState.sendNotification(trayNotifyWarn)
+                }
+                Separator()
+                Item("退出") {
+                    probe.trayAction = "exit"
+                    exitApplication()
+                }
+            }
+        }
 
         Window(
             onCloseRequest = ::exitApplication,
@@ -192,6 +237,8 @@ fun main(args: Array<String>) {
                     animate = animate,
                     onOpenSecondWindow = { openSecond = true },
                     onOpenDialogWindow = { openDialog = true },
+                    trayState = trayState,
+                    traySupported = isTraySupported,
                 )
             }
         }

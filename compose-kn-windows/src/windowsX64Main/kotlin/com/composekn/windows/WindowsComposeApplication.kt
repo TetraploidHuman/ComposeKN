@@ -1,4 +1,8 @@
-@file:OptIn(androidx.compose.ui.InternalComposeUiApi::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
+@file:OptIn(
+    androidx.compose.ui.InternalComposeUiApi::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
+    kotlin.native.runtime.NativeRuntimeApi::class,
+)
 
 package com.composekn.windows
 
@@ -327,10 +331,29 @@ class WindowsComposeApplication(
     /** 从共享宿主摘掉并释放场景（声明式 Window 离开 composition 时）。 */
     fun detachFromSharedHost() {
         WindowsApplicationHost.installImeProviders(window, null, null, null)
-        // 先关 Compose 场景（可能仍碰 SkiaLayer），再拆 HWND/WGL。
-        // 反过来时 scene.close()/recomposer 会打到已 delete 的 native → 真机 AV @0xc。
+        // 1) 停宿主渲染 / tick（GPU 仍在）
+        // 2) scene.close（可能仍碰 Skia/Graphite）
+        // 3) GC.collect 排空 Skia Managed Cleaner（否则 Context 拆掉后 Cleaner
+        //    再跑 → 真机 AV read @0xc）
+        // 4) 再 detach 拆 GPU + HWND
+        window.prepareDetachFromHost()
         close()
+        drainSkiaCleaners()
         window.detachFromHost()
+    }
+
+    /**
+     * 强制跑一轮 GC，让 [org.jetbrains.skia.impl.Managed] 的 createCleaner
+     * 在 Graphite/GL Context 仍存活时释放原生 Skia 对象。
+     */
+    private fun drainSkiaCleaners() {
+        try {
+            win32Log("gc: collect (drain Skia cleaners before GPU teardown)")
+            kotlin.native.runtime.GC.collect()
+            win32Log("gc: collect done")
+        } catch (t: Throwable) {
+            win32Log("gc: collect EXCEPTION ${t::class.simpleName}: ${t.message}")
+        }
     }
 
     /** 独占泵路径：直接挂全局 IME（单窗，无 Host 路由）。 */

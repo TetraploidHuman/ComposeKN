@@ -191,8 +191,7 @@ class LinuxComposeApplication(
 
     /** 从共享宿主摘掉并释放场景（声明式 Window 离开 composition 时）。 */
     fun detachFromSharedHost() {
-        composeWindow.detachFromHost()
-        close()
+        composeWindow.detachFromHost(afterNativeDestroyed = { close() })
     }
 
     private fun handleEvent(event: WaylandEvent) {

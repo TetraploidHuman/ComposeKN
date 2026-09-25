@@ -58,10 +58,13 @@ internal class LinuxWaylandOpenGLRedrawer(
             skiaLayer.needRender()
         }
         composekn_window_make_current(window.nativeHandle)
+        if (disposed) return
         update(currentNanoTime())
+        if (disposed) return
         skiaLayer.inDrawScope {
             contextHandler.draw()
         }
+        if (disposed) return
         composekn_window_swap_buffers(window.nativeHandle)
     }
 

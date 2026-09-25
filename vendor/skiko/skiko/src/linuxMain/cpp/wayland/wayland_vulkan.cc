@@ -1,22 +1,23 @@
 /**
- * ComposeKN Windows Graphite + Vulkan 桥。
+ * ComposeKN Linux Wayland Graphite + Vulkan 桥。
  *
- * 对照上游 tools/window/GraphiteNativeVulkanWindowContext.cpp，但：
- *   - 不依赖 tools/（自建 VkInstance/Device + Win32 surface/swapchain）；
+ * 对照 win32_vulkan.cc / 上游 GraphiteNativeVulkanWindowContext，但：
+ *   - 不依赖 tools/（自建 VkInstance/Device + Wayland surface/swapchain）；
  *   - C API 暴露给 Kotlin（begin_frame → SkCanvas*，end_frame → present）；
- *   - 动态 LoadLibrary("vulkan-1.dll")，不链 libvulkan。
+ *   - 动态 dlopen("libvulkan.so.1")，不链 libvulkan；
+ *   - 不用 std::unordered_map（konan 链 __throw_bad_array_new_length）。
  *
  * 未定义 SK_VULKAN+SK_GRAPHITE 时全部 stub 失败（链纯 GL Skia 包时仍能编过）。
  */
-#include "win32_bridge.h"
+#include "wayland_bridge.h"
 
-#include <windows.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <unordered_map>
 #include <vector>
 
 #if defined(SK_VULKAN) && defined(SK_GRAPHITE)
@@ -44,7 +45,7 @@
 #include "include/gpu/vk/VulkanTypes.h"
 #include "include/private/gpu/vk/SkiaVulkan.h"
 
-#include <vulkan/vulkan_win32.h>
+#include <vulkan/vulkan_wayland.h>
 
 // VulkanMemoryAllocators::Make 在 libskia.a 里；声明放这里避免拉 src/ 私有头。
 namespace skgpu {
@@ -66,7 +67,8 @@ void vkLog(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
-    composekn_win32_log(buffer);
+    std::fprintf(stderr, "composekn: %s\n", buffer);
+    std::fflush(stderr);
 }
 
 struct SwapchainImage {
@@ -76,9 +78,11 @@ struct SwapchainImage {
 };
 
 struct ComposeKNVkContext {
-    HWND hwnd = nullptr;
+    ComposeKNWindow* window = nullptr;
+    struct wl_display* display = nullptr;
+    struct wl_surface* wlSurface = nullptr;
 
-    HMODULE vulkanLib = nullptr;
+    void* vulkanLib = nullptr;
     PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
     PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr;
 
@@ -110,7 +114,7 @@ struct ComposeKNVkContext {
     uint32_t currentImage = 0;
     VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
 
-    // Intel 等 Win32 surface 常不支持 INPUT_ATTACHMENT（usage 只有 0x17），
+    // Wayland/Intel 等 surface 常不支持 INPUT_ATTACHMENT（usage 只有 0x17），
     // Graphite 无法 Wrap swapchain → 画到自建 offscreen RT，再 blit/copy 呈现。
     bool useOffscreenBlit = false;
     sk_sp<SkSurface> offscreenSurface;
@@ -128,7 +132,7 @@ struct ComposeKNVkContext {
     PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
     PFN_vkQueueSubmit QueueSubmit = nullptr;
     PFN_vkDestroySurfaceKHR DestroySurfaceKHR = nullptr;
-    PFN_vkCreateWin32SurfaceKHR CreateWin32SurfaceKHR = nullptr;
+    PFN_vkCreateWaylandSurfaceKHR CreateWaylandSurfaceKHR = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR GetPhysicalDeviceSurfaceSupportKHR = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR GetPhysicalDeviceSurfaceFormatsKHR = nullptr;
@@ -161,12 +165,44 @@ struct ComposeKNVkContext {
     PFN_vkResetCommandBuffer ResetCommandBuffer = nullptr;
 };
 
-std::unordered_map<ComposeKNWin32Window*, ComposeKNVkContext*> g_vkByWindow;
+constexpr size_t kMaxVkWindows = 64;
+struct VkWindowEntry {
+    ComposeKNWindow* window = nullptr;
+    ComposeKNVkContext* ctx = nullptr;
+};
+VkWindowEntry g_vkByWindow[kMaxVkWindows] = {};
+size_t g_vkWindowCount = 0;
 
-ComposeKNVkContext* vkOf(ComposeKNWin32Window* window) {
+ComposeKNVkContext* vkOf(ComposeKNWindow* window) {
     if (window == nullptr) return nullptr;
-    auto it = g_vkByWindow.find(window);
-    return it == g_vkByWindow.end() ? nullptr : it->second;
+    for (size_t i = 0; i < g_vkWindowCount; ++i) {
+        if (g_vkByWindow[i].window == window) {
+            return g_vkByWindow[i].ctx;
+        }
+    }
+    return nullptr;
+}
+
+bool vkInsert(ComposeKNWindow* window, ComposeKNVkContext* ctx) {
+    if (window == nullptr || ctx == nullptr) return false;
+    if (vkOf(window) != nullptr) return true;
+    if (g_vkWindowCount >= kMaxVkWindows) {
+        vkLog("vk: too many vulkan windows (max %zu)", kMaxVkWindows);
+        return false;
+    }
+    g_vkByWindow[g_vkWindowCount++] = {window, ctx};
+    return true;
+}
+
+void vkErase(ComposeKNWindow* window) {
+    for (size_t i = 0; i < g_vkWindowCount; ++i) {
+        if (g_vkByWindow[i].window == window) {
+            g_vkByWindow[i] = g_vkByWindow[g_vkWindowCount - 1];
+            g_vkByWindow[g_vkWindowCount - 1] = {};
+            --g_vkWindowCount;
+            return;
+        }
+    }
 }
 
 PFN_vkVoidFunction getProc(ComposeKNVkContext* ctx,
@@ -190,7 +226,7 @@ PFN_vkVoidFunction getProc(ComposeKNVkContext* ctx,
             }
             if (!ctx->getDeviceProcAddr && ctx->vulkanLib) {
                 ctx->getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                        GetProcAddress(ctx->vulkanLib, "vkGetDeviceProcAddr"));
+                        dlsym(ctx->vulkanLib, "vkGetDeviceProcAddr"));
             }
         }
         if (ctx->getDeviceProcAddr) {
@@ -208,10 +244,10 @@ PFN_vkVoidFunction getProc(ComposeKNVkContext* ctx,
     }
 
     // Global（CreateInstance 之前 / MakeInterface 校验 CreateInstance 等）：
-    // Windows 加载器对 gipa(NULL, "vkCreateInstance") 常返回 NULL，必须先 GetProcAddress。
+    // 优先 dlsym 导出表，再回退 gipa(NULL)。
     if (ctx->vulkanLib) {
         if (PFN_vkVoidFunction p = reinterpret_cast<PFN_vkVoidFunction>(
-                    GetProcAddress(ctx->vulkanLib, name))) {
+                    dlsym(ctx->vulkanLib, name))) {
             return p;
         }
     }
@@ -222,17 +258,14 @@ PFN_vkVoidFunction getProc(ComposeKNVkContext* ctx,
 }
 
 bool loadVulkan(ComposeKNVkContext* ctx) {
-    ctx->vulkanLib = LoadLibraryA("vulkan-1.dll");
+    ctx->vulkanLib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!ctx->vulkanLib) {
-        vkLog("vk: LoadLibrary(vulkan-1.dll) failed (%lu)", GetLastError());
+        vkLog("vk: dlopen(libvulkan.so.1) failed: %s", dlerror());
         return false;
     }
-    char modPath[MAX_PATH] = {};
-    if (GetModuleFileNameA(ctx->vulkanLib, modPath, MAX_PATH) > 0) {
-        vkLog("vk: loaded %s", modPath);
-    }
+    vkLog("vk: loaded libvulkan.so.1");
     ctx->getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-            GetProcAddress(ctx->vulkanLib, "vkGetInstanceProcAddr"));
+            dlsym(ctx->vulkanLib, "vkGetInstanceProcAddr"));
     if (!ctx->getInstanceProcAddr) {
         vkLog("vk: vkGetInstanceProcAddr missing");
         return false;
@@ -240,13 +273,11 @@ bool loadVulkan(ComposeKNVkContext* ctx) {
     return true;
 }
 
-// 全局入口（CreateInstance 之前）：部分 Windows 加载器对
-// vkGetInstanceProcAddr(NULL, "vkCreateInstance") 返回 NULL，但 DLL 导出表有这些符号。
-// GLFW / SDL / Skia tools 都是优先 GetProcAddress，再回退 gipa(NULL)。
+// 全局入口（CreateInstance 之前）：优先 dlsym，再回退 gipa(NULL)。
 template <typename T>
 T loadGlobalProc(ComposeKNVkContext* ctx, const char* name) {
-    T viaDll = reinterpret_cast<T>(GetProcAddress(ctx->vulkanLib, name));
-    if (viaDll) return viaDll;
+    T viaSo = reinterpret_cast<T>(dlsym(ctx->vulkanLib, name));
+    if (viaSo) return viaSo;
     if (ctx->getInstanceProcAddr) {
         return reinterpret_cast<T>(ctx->getInstanceProcAddr(VK_NULL_HANDLE, name));
     }
@@ -294,30 +325,51 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
 
     std::vector<const char*> instanceExts = {
             VK_KHR_SURFACE_EXTENSION_NAME,
-            VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
+            VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
     };
+    // Preferred extras are optional — if CreateInstance fails with them, retry core-only.
+    std::vector<const char*> instanceExtsPreferred = instanceExts;
     ctx->preferredFeatures.addToInstanceExtensions(
-            availableExts.data(), availableExts.size(), instanceExts);
+            availableExts.data(), availableExts.size(), instanceExtsPreferred);
 
-    VkApplicationInfo appInfo{};
-    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "ComposeKN";
-    appInfo.apiVersion = ctx->apiVersion;
+    auto tryCreateInstance = [&](const std::vector<const char*>& exts) -> VkResult {
+        VkApplicationInfo appInfo{};
+        appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        appInfo.pApplicationName = "ComposeKN";
+        appInfo.apiVersion = ctx->apiVersion;
+        VkInstanceCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        ici.pApplicationInfo = &appInfo;
+        ici.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+        ici.ppEnabledExtensionNames = exts.data();
+        return createInstance(&ici, nullptr, &ctx->instance);
+    };
 
-    VkInstanceCreateInfo ici{};
-    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    ici.pApplicationInfo = &appInfo;
-    ici.enabledExtensionCount = static_cast<uint32_t>(instanceExts.size());
-    ici.ppEnabledExtensionNames = instanceExts.data();
-    if (createInstance(&ici, nullptr, &ctx->instance) != VK_SUCCESS) {
-        vkLog("vk: vkCreateInstance failed");
+    VkResult ir = tryCreateInstance(instanceExtsPreferred);
+    if (ir != VK_SUCCESS) {
+        vkLog("vk: vkCreateInstance(preferred) failed result=%d; retrying core Wayland exts",
+              (int)ir);
+        ir = tryCreateInstance(instanceExts);
+    }
+    if (ir != VK_SUCCESS) {
+        // Diagnose missing required WSI extensions.
+        bool hasSurface = false;
+        bool hasWayland = false;
+        for (const auto& e : availableExts) {
+            if (std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME) == 0) hasSurface = true;
+            if (std::strcmp(e.extensionName, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME) == 0) {
+                hasWayland = true;
+            }
+        }
+        vkLog("vk: vkCreateInstance failed result=%d has_surface=%d has_wayland_surface=%d extCount=%u",
+              (int)ir, (int)hasSurface, (int)hasWayland, extCount);
         return false;
     }
 
     ctx->DestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
             gipa(ctx->instance, "vkDestroyInstance"));
-    ctx->CreateWin32SurfaceKHR = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
-            gipa(ctx->instance, "vkCreateWin32SurfaceKHR"));
+    ctx->CreateWaylandSurfaceKHR = reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(
+            gipa(ctx->instance, "vkCreateWaylandSurfaceKHR"));
     ctx->DestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
             gipa(ctx->instance, "vkDestroySurfaceKHR"));
     ctx->GetPhysicalDeviceSurfaceSupportKHR =
@@ -363,14 +415,15 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
 
         int gfx = -1;
         int present = -1;
+        auto getPresentSupport =
+                reinterpret_cast<PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR>(
+                        gipa(ctx->instance, "vkGetPhysicalDeviceWaylandPresentationSupportKHR"));
         for (uint32_t i = 0; i < qCount; ++i) {
             if (qprops[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
                 gfx = static_cast<int>(i);
             }
-            auto getPresentSupport =
-                    reinterpret_cast<PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR>(
-                            gipa(ctx->instance, "vkGetPhysicalDeviceWin32PresentationSupportKHR"));
-            if (getPresentSupport && getPresentSupport(pd, i)) {
+            if (getPresentSupport && ctx->display &&
+                getPresentSupport(pd, i, ctx->display)) {
                 present = static_cast<int>(i);
             }
         }
@@ -387,7 +440,7 @@ bool createInstanceAndDevice(ComposeKNVkContext* ctx) {
         }
     }
     if (ctx->physicalDevice == VK_NULL_HANDLE) {
-        vkLog("vk: no suitable GPU with Win32 present");
+        vkLog("vk: no suitable GPU with Wayland present");
         return false;
     }
 
@@ -571,13 +624,13 @@ bool createGraphite(ComposeKNVkContext* ctx) {
     return true;
 }
 
-bool createWin32Surface(ComposeKNVkContext* ctx) {
-    VkWin32SurfaceCreateInfoKHR sci{};
-    sci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    sci.hinstance = GetModuleHandleW(nullptr);
-    sci.hwnd = ctx->hwnd;
-    if (ctx->CreateWin32SurfaceKHR(ctx->instance, &sci, nullptr, &ctx->surface) != VK_SUCCESS) {
-        vkLog("vk: vkCreateWin32SurfaceKHR failed");
+bool createWaylandSurface(ComposeKNVkContext* ctx) {
+    VkWaylandSurfaceCreateInfoKHR sci{};
+    sci.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+    sci.display = ctx->display;
+    sci.surface = ctx->wlSurface;
+    if (ctx->CreateWaylandSurfaceKHR(ctx->instance, &sci, nullptr, &ctx->surface) != VK_SUCCESS) {
+        vkLog("vk: vkCreateWaylandSurfaceKHR failed");
         return false;
     }
     VkBool32 supported = VK_FALSE;
@@ -1110,58 +1163,71 @@ void destroyVk(ComposeKNVkContext* ctx) {
         ctx->instance = VK_NULL_HANDLE;
     }
     if (ctx->vulkanLib) {
-        FreeLibrary(ctx->vulkanLib);
+        dlclose(ctx->vulkanLib);
         ctx->vulkanLib = nullptr;
     }
 }
 
 }  // namespace
 
-extern "C" bool composekn_win32_vk_create(ComposeKNWin32Window* window) {
+extern "C" bool composekn_window_vk_create(ComposeKNWindow* window) {
     if (window == nullptr) return false;
     if (vkOf(window) != nullptr) return true;
 
-    HWND hwnd = static_cast<HWND>(composekn_win32_hwnd(window));
-    if (hwnd == nullptr) return false;
+    auto* display = static_cast<struct wl_display*>(composekn_window_wl_display(window));
+    auto* surface = static_cast<struct wl_surface*>(composekn_window_wl_surface(window));
+    if (display == nullptr || surface == nullptr) {
+        vkLog("vk: missing wl_display/wl_surface");
+        return false;
+    }
 
     auto* ctx = new ComposeKNVkContext();
-    ctx->hwnd = hwnd;
+    ctx->window = window;
+    ctx->display = display;
+    ctx->wlSurface = surface;
     if (!loadVulkan(ctx) || !createInstanceAndDevice(ctx) || !createGraphite(ctx) ||
-        !createWin32Surface(ctx)) {
+        !createWaylandSurface(ctx)) {
         destroyVk(ctx);
         delete ctx;
         return false;
     }
 
-    RECT rc{};
-    GetClientRect(hwnd, &rc);
-    int w = std::max(1, static_cast<int>(rc.right - rc.left));
-    int h = std::max(1, static_cast<int>(rc.bottom - rc.top));
+    int w = std::max(1, composekn_window_buffer_width(window));
+    int h = std::max(1, composekn_window_buffer_height(window));
     if (!createSwapchain(ctx, w, h)) {
         destroyVk(ctx);
         delete ctx;
         return false;
     }
 
-    g_vkByWindow[window] = ctx;
+    if (!vkInsert(window, ctx)) {
+        destroyVk(ctx);
+        delete ctx;
+        return false;
+    }
+    composekn_window_set_vulkan_preferred(window, true);
+    // 对齐 EGL ready：标记需要帧，否则首帧要等 Kotlin needRender。
+    composekn_window_request_frame(window);
     vkLog("vk: Graphite/Vulkan ready (%dx%d)", ctx->width, ctx->height);
     return true;
 }
 
-extern "C" void* composekn_win32_vk_begin_frame(ComposeKNWin32Window* window,
-                                                int width,
-                                                int height) {
+extern "C" void* composekn_window_vk_begin_frame(ComposeKNWindow* window,
+                                                 int width,
+                                                 int height) {
     auto* ctx = vkOf(window);
     if (!ctx || !ctx->graphite || !ctx->recorder) return nullptr;
 
-    // 以 HWND 客户区实像素为准（Kotlin 的 dp×scale 常与 client 差 1px，
-    // 若按后者重建 swapchain 会每帧死循环，FPS≈12）。
-    RECT rc{};
-    if (ctx->hwnd) GetClientRect(ctx->hwnd, &rc);
-    int cw = std::max(1, static_cast<int>(rc.right - rc.left));
-    int ch = std::max(1, static_cast<int>(rc.bottom - rc.top));
-    (void)width;
-    (void)height;
+    // Prefer buffer pixel size from the window. Kotlin may pass 0 or a 1px-off
+    // dp×scale size; rebuilding on mismatch would thrash the swapchain.
+    int bw = std::max(1, composekn_window_buffer_width(window));
+    int bh = std::max(1, composekn_window_buffer_height(window));
+    int cw = bw;
+    int ch = bh;
+    if (width > 0 && height > 0 && width == bw && height == bh) {
+        cw = width;
+        ch = height;
+    }
 
     if (cw != ctx->width || ch != ctx->height) {
         if (!createSwapchain(ctx, cw, ch)) return nullptr;
@@ -1188,10 +1254,9 @@ extern "C" void* composekn_win32_vk_begin_frame(ComposeKNWin32Window* window,
     if (res == VK_ERROR_OUT_OF_DATE_KHR) {
         ctx->DestroySemaphore(ctx->device, ctx->acquireSemaphore, nullptr);
         ctx->acquireSemaphore = VK_NULL_HANDLE;
-        if (ctx->hwnd) GetClientRect(ctx->hwnd, &rc);
-        cw = std::max(1, static_cast<int>(rc.right - rc.left));
-        ch = std::max(1, static_cast<int>(rc.bottom - rc.top));
-        if (!createSwapchain(ctx, cw, ch)) return nullptr;
+        bw = std::max(1, composekn_window_buffer_width(window));
+        bh = std::max(1, composekn_window_buffer_height(window));
+        if (!createSwapchain(ctx, bw, bh)) return nullptr;
         if (ctx->CreateSemaphore(ctx->device, &semInfo, nullptr, &ctx->acquireSemaphore) !=
             VK_SUCCESS) {
             return nullptr;
@@ -1204,13 +1269,12 @@ extern "C" void* composekn_win32_vk_begin_frame(ComposeKNWin32Window* window,
                                        &ctx->currentImage);
     } else if (res == VK_SUBOPTIMAL_KHR) {
         // 尺寸未变时继续用当前 image，避免 SUBOPTIMAL 每帧重建。
-        if (ctx->hwnd) GetClientRect(ctx->hwnd, &rc);
-        cw = std::max(1, static_cast<int>(rc.right - rc.left));
-        ch = std::max(1, static_cast<int>(rc.bottom - rc.top));
-        if (cw != ctx->width || ch != ctx->height) {
+        bw = std::max(1, composekn_window_buffer_width(window));
+        bh = std::max(1, composekn_window_buffer_height(window));
+        if (bw != ctx->width || bh != ctx->height) {
             ctx->DestroySemaphore(ctx->device, ctx->acquireSemaphore, nullptr);
             ctx->acquireSemaphore = VK_NULL_HANDLE;
-            if (!createSwapchain(ctx, cw, ch)) return nullptr;
+            if (!createSwapchain(ctx, bw, bh)) return nullptr;
             if (ctx->CreateSemaphore(ctx->device, &semInfo, nullptr, &ctx->acquireSemaphore) !=
                 VK_SUCCESS) {
                 return nullptr;
@@ -1237,7 +1301,7 @@ extern "C" void* composekn_win32_vk_begin_frame(ComposeKNWin32Window* window,
     return surface->getCanvas();
 }
 
-extern "C" bool composekn_win32_vk_end_frame(ComposeKNWin32Window* window) {
+extern "C" bool composekn_window_vk_end_frame(ComposeKNWindow* window) {
     auto* ctx = vkOf(window);
     if (!ctx || !ctx->graphite || !ctx->recorder) return false;
     if (ctx->acquireSemaphore == VK_NULL_HANDLE) {
@@ -1343,10 +1407,13 @@ extern "C" bool composekn_win32_vk_end_frame(ComposeKNWin32Window* window) {
     return true;
 }
 
-extern "C" void composekn_win32_vk_destroy(ComposeKNWin32Window* window) {
+extern "C" void composekn_window_vk_destroy(ComposeKNWindow* window) {
     auto* ctx = vkOf(window);
     if (!ctx) return;
-    g_vkByWindow.erase(window);
+    vkErase(window);
+    if (window != nullptr) {
+        composekn_window_set_vulkan_preferred(window, false);
+    }
     destroyVk(ctx);
     delete ctx;
     vkLog("vk: destroyed");
@@ -1354,9 +1421,9 @@ extern "C" void composekn_win32_vk_destroy(ComposeKNWin32Window* window) {
 
 #else  // !SK_VULKAN || !SK_GRAPHITE
 
-extern "C" bool composekn_win32_vk_create(ComposeKNWin32Window*) { return false; }
-extern "C" void* composekn_win32_vk_begin_frame(ComposeKNWin32Window*, int, int) { return nullptr; }
-extern "C" bool composekn_win32_vk_end_frame(ComposeKNWin32Window*) { return false; }
-extern "C" void composekn_win32_vk_destroy(ComposeKNWin32Window*) {}
+extern "C" bool composekn_window_vk_create(ComposeKNWindow*) { return false; }
+extern "C" void* composekn_window_vk_begin_frame(ComposeKNWindow*, int, int) { return nullptr; }
+extern "C" bool composekn_window_vk_end_frame(ComposeKNWindow*) { return false; }
+extern "C" void composekn_window_vk_destroy(ComposeKNWindow*) {}
 
 #endif

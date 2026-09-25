@@ -58,6 +58,15 @@ internal external fun composekn_window_create(
 @SymbolName("composekn_window_destroy")
 internal external fun composekn_window_destroy(window: COpaquePointer)
 
+@SymbolName("composekn_display_begin_poll_cycle")
+internal external fun composekn_display_begin_poll_cycle_native()
+
+/**
+ * Reset the shared wl_display poll-cycle flag. Call once per host-loop iteration
+ * before polling any windows so only the first poll does prepare_read/read_events.
+ */
+fun composekn_display_begin_poll_cycle() = composekn_display_begin_poll_cycle_native()
+
 @SymbolName("composekn_window_poll")
 internal external fun composekn_window_poll(window: COpaquePointer): Boolean
 
@@ -131,6 +140,15 @@ internal external fun composekn_window_toggle_maximized(window: COpaquePointer)
 @SymbolName("composekn_window_is_maximized")
 internal external fun composekn_window_is_maximized(window: COpaquePointer): Boolean
 
+@SymbolName("composekn_window_set_fullscreen")
+internal external fun composekn_window_set_fullscreen(window: COpaquePointer, enable: Boolean)
+
+@SymbolName("composekn_window_is_fullscreen")
+internal external fun composekn_window_is_fullscreen(window: COpaquePointer): Boolean
+
+@SymbolName("composekn_window_set_resizable")
+internal external fun composekn_window_set_resizable(window: COpaquePointer, resizable: Boolean)
+
 @SymbolName("composekn_window_request_close")
 internal external fun composekn_window_request_close(window: COpaquePointer)
 
@@ -188,6 +206,29 @@ internal external fun composekn_text_input_set_content_type(
     hint: Int,
     purpose: Int,
 )
+
+// ---------------------------------------------------------------------------
+// Graphite + Vulkan
+// ---------------------------------------------------------------------------
+
+@SymbolName("composekn_window_vk_create")
+internal external fun composekn_window_vk_create(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_window_vk_begin_frame")
+internal external fun composekn_window_vk_begin_frame(
+    window: COpaquePointer?,
+    width: Int,
+    height: Int,
+): NativePointer
+
+@SymbolName("composekn_window_vk_end_frame")
+internal external fun composekn_window_vk_end_frame(window: COpaquePointer?): Boolean
+
+@SymbolName("composekn_window_vk_destroy")
+internal external fun composekn_window_vk_destroy(window: COpaquePointer?)
+
+@SymbolName("composekn_window_set_vulkan_preferred")
+internal external fun composekn_window_set_vulkan_preferred(window: COpaquePointer?, preferred: Boolean)
 
 /** Wayland wl_data_device clipboard bridge (ComposeKN window). */
 object WaylandClipboard {

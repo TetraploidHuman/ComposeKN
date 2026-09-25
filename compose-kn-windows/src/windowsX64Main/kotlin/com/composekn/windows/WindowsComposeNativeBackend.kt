@@ -201,7 +201,9 @@ class WindowsNativeWindowHandle(
         disposed = true
         geometryListener = null
         app.window.onGeometryHint = null
-        app.window.setMenuBar(null)
+        // 不要在此处 setMenuBar(null)：拆菜单会撑大客户区 → WM_SIZE → 最后一帧
+        // 重建 swapchain（真机 v0.5.35 关窗前 2200x1520）。菜单由
+        // composekn_win32_destroy 在 DestroyWindow 前销毁。
         app.detachFromSharedHost()
     }
 }

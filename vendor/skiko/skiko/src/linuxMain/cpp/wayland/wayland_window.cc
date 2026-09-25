@@ -82,11 +82,16 @@ struct ComposeKNWindow {
     int buffer_scale = 1;
     bool configured = false;
     bool egl_ready = false;
+    /** When true, skip EGL init so Vulkan can own the wl_surface. */
+    bool prefer_vulkan = false;
     bool close_requested = false;
     /** True until Kotlin [consume_close_requested] fires onCloseRequest once (DO_NOTHING). */
     bool close_event_pending = false;
     bool resized = false;
     bool maximized = false;
+    bool fullscreen = false;
+    /** App requested non-resizable：configure 后不要清掉 min=max。 */
+    bool size_locked = false;
     uint32_t configure_serial = 0;
     /** True after request_size：下一次 toplevel configure 后清掉 min/max 约束。 */
     bool clear_size_constraints_after_configure = false;
@@ -128,10 +133,198 @@ struct ComposeKNWindow {
 };
 
 static ComposeKNWindow* g_primary_window = nullptr;
+// 不用 unordered_set：会拉 std::__throw_bad_array_new_length，konan ld.lld 链不上。
+static constexpr size_t kMaxLiveWindows = 64;
+static ComposeKNWindow* g_live_windows[kMaxLiveWindows] = {};
+static size_t g_live_window_count = 0;
+
+/** Process-wide Wayland/EGL connection shared by all ComposeKNWindow instances. */
+struct ComposeKNSharedDisplay {
+    wl_display* display = nullptr;
+    wl_registry* registry = nullptr;
+    wl_compositor* compositor = nullptr;
+    xdg_wm_base* wm_base = nullptr;
+    wl_seat* seat = nullptr;
+    wl_pointer* pointer = nullptr;
+    wl_keyboard* keyboard = nullptr;
+    wl_touch* touch = nullptr;
+    wl_data_device_manager* data_device_manager = nullptr;
+    wl_data_device* data_device = nullptr;
+    zxdg_decoration_manager_v1* decoration_manager = nullptr;
+    zwp_text_input_manager_v3* text_input_manager = nullptr;
+    zwp_text_input_v3* text_input = nullptr;
+    wp_fractional_scale_manager_v1* fractional_scale_manager = nullptr;
+    EGLDisplay egl_display = EGL_NO_DISPLAY;
+    EGLConfig egl_config = nullptr;
+    /** 单线程多窗共用一个 EGLContext（多 DirectContext 抢同一 display 会在 llvmpipe 崩）。 */
+    EGLContext egl_context = EGL_NO_CONTEXT;
+    bool egl_initialized = false;
+    int egl_context_client_version = 2;
+    int refcount = 0;
+    ComposeKNWindow* pointer_focus = nullptr;
+    ComposeKNWindow* keyboard_focus = nullptr;
+};
+
+static ComposeKNSharedDisplay g_shared;
+/** True after the first window this host-loop cycle has done prepare_read/read_events. */
+static bool g_display_read_this_cycle = false;
+
+struct SurfaceMapEntry {
+    wl_surface* surface = nullptr;
+    ComposeKNWindow* window = nullptr;
+};
+static SurfaceMapEntry g_surface_map[kMaxLiveWindows] = {};
+static size_t g_surface_map_count = 0;
+
+struct TouchRouteEntry {
+    int32_t id = -1;
+    ComposeKNWindow* window = nullptr;
+};
+static constexpr size_t kMaxTouchRoutes = 16;
+static TouchRouteEntry g_touch_routes[kMaxTouchRoutes] = {};
+
+static bool live_window_contains(ComposeKNWindow* window) {
+    for (size_t i = 0; i < g_live_window_count; ++i) {
+        if (g_live_windows[i] == window) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void live_window_insert(ComposeKNWindow* window) {
+    if (window == nullptr || live_window_contains(window)) {
+        return;
+    }
+    if (g_live_window_count >= kMaxLiveWindows) {
+        std::fprintf(stderr, "composekn: live window table full (%zu)\n", kMaxLiveWindows);
+        return;
+    }
+    g_live_windows[g_live_window_count++] = window;
+}
+
+static void live_window_erase(ComposeKNWindow* window) {
+    for (size_t i = 0; i < g_live_window_count; ++i) {
+        if (g_live_windows[i] == window) {
+            g_live_windows[i] = g_live_windows[g_live_window_count - 1];
+            g_live_windows[g_live_window_count - 1] = nullptr;
+            --g_live_window_count;
+            return;
+        }
+    }
+}
+
+static ComposeKNWindow* surface_map_lookup(wl_surface* surface) {
+    if (surface == nullptr) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < g_surface_map_count; ++i) {
+        if (g_surface_map[i].surface == surface) {
+            return g_surface_map[i].window;
+        }
+    }
+    return nullptr;
+}
+
+static void surface_map_insert(wl_surface* surface, ComposeKNWindow* window) {
+    if (surface == nullptr || window == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < g_surface_map_count; ++i) {
+        if (g_surface_map[i].surface == surface) {
+            g_surface_map[i].window = window;
+            return;
+        }
+    }
+    if (g_surface_map_count >= kMaxLiveWindows) {
+        std::fprintf(stderr, "composekn: surface map full (%zu)\n", kMaxLiveWindows);
+        return;
+    }
+    g_surface_map[g_surface_map_count].surface = surface;
+    g_surface_map[g_surface_map_count].window = window;
+    ++g_surface_map_count;
+}
+
+static void surface_map_erase(ComposeKNWindow* window) {
+    if (window == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < g_surface_map_count; ) {
+        if (g_surface_map[i].window == window) {
+            g_surface_map[i] = g_surface_map[g_surface_map_count - 1];
+            g_surface_map[g_surface_map_count - 1] = {};
+            --g_surface_map_count;
+        } else {
+            ++i;
+        }
+    }
+}
+
+static void touch_route_set(int32_t id, ComposeKNWindow* window) {
+    for (size_t i = 0; i < kMaxTouchRoutes; ++i) {
+        if (g_touch_routes[i].id == id) {
+            g_touch_routes[i].window = window;
+            return;
+        }
+    }
+    for (size_t i = 0; i < kMaxTouchRoutes; ++i) {
+        if (g_touch_routes[i].id < 0 || g_touch_routes[i].window == nullptr) {
+            g_touch_routes[i].id = id;
+            g_touch_routes[i].window = window;
+            return;
+        }
+    }
+}
+
+static ComposeKNWindow* touch_route_lookup(int32_t id) {
+    for (size_t i = 0; i < kMaxTouchRoutes; ++i) {
+        if (g_touch_routes[i].id == id) {
+            return g_touch_routes[i].window;
+        }
+    }
+    return nullptr;
+}
+
+static void touch_route_clear(int32_t id) {
+    for (size_t i = 0; i < kMaxTouchRoutes; ++i) {
+        if (g_touch_routes[i].id == id) {
+            g_touch_routes[i] = {};
+            g_touch_routes[i].id = -1;
+            return;
+        }
+    }
+}
+
+static void touch_route_clear_window(ComposeKNWindow* window) {
+    if (window == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < kMaxTouchRoutes; ++i) {
+        if (g_touch_routes[i].window == window) {
+            g_touch_routes[i] = {};
+            g_touch_routes[i].id = -1;
+        }
+    }
+}
+
+static void touch_route_clear_all() {
+    for (size_t i = 0; i < kMaxTouchRoutes; ++i) {
+        g_touch_routes[i] = {};
+        g_touch_routes[i].id = -1;
+    }
+}
 
 /** Prefer the caller's window pointer; fall back to primary (clipboard / legacy single-window). */
 static ComposeKNWindow* resolve_window(ComposeKNWindow* window) {
-    return window != nullptr ? window : g_primary_window;
+    ComposeKNWindow* candidate = window != nullptr ? window : g_primary_window;
+    if (candidate == nullptr) {
+        return nullptr;
+    }
+    // destroy 后 Kotlin 仍可能持有野指针（关窗与 renderImmediately 重入）；拒绝已释放窗口。
+    if (!live_window_contains(candidate)) {
+        return nullptr;
+    }
+    return candidate;
 }
 
 /** Desktop DO_NOTHING_ON_CLOSE: mark close + pending notify; do not tear down the surface. */
@@ -143,12 +336,81 @@ static void mark_close_requested(ComposeKNWindow* window) {
     window->close_event_pending = true;
 }
 
-static void ensure_data_device(ComposeKNWindow* window);
+static void ensure_data_device();
 static void read_selection_into_cache(ComposeKNWindow* window);
 static bool init_egl(ComposeKNWindow* window);
 static void try_init_egl_if_needed(ComposeKNWindow* window);
 static void composekn_flush_deferred_frame(ComposeKNWindow* window);
-static void ensure_text_input(ComposeKNWindow* window);
+static void ensure_text_input();
+static void alias_shared_onto_window(ComposeKNWindow* window);
+static void refresh_all_window_shared_aliases();
+static bool acquire_shared_display();
+static void release_shared_display();
+static ComposeKNWindow* clipboard_target_window();
+
+static void alias_shared_onto_window(ComposeKNWindow* window) {
+    if (window == nullptr) {
+        return;
+    }
+    window->display = g_shared.display;
+    window->registry = g_shared.registry;
+    window->compositor = g_shared.compositor;
+    window->wm_base = g_shared.wm_base;
+    window->seat = g_shared.seat;
+    window->pointer = g_shared.pointer;
+    window->keyboard = g_shared.keyboard;
+    window->touch = g_shared.touch;
+    window->data_device_manager = g_shared.data_device_manager;
+    window->data_device = g_shared.data_device;
+    window->decoration_manager = g_shared.decoration_manager;
+    window->text_input_manager = g_shared.text_input_manager;
+    window->text_input = g_shared.text_input;
+    window->fractional_scale_manager = g_shared.fractional_scale_manager;
+    if (g_shared.egl_initialized) {
+        window->egl_display = g_shared.egl_display;
+        window->egl_config = g_shared.egl_config;
+        window->egl_context = g_shared.egl_context;
+    }
+}
+
+static void refresh_all_window_shared_aliases() {
+    for (size_t i = 0; i < g_live_window_count; ++i) {
+        alias_shared_onto_window(g_live_windows[i]);
+    }
+}
+
+static void clear_window_shared_aliases(ComposeKNWindow* window) {
+    if (window == nullptr) {
+        return;
+    }
+    window->display = nullptr;
+    window->registry = nullptr;
+    window->compositor = nullptr;
+    window->wm_base = nullptr;
+    window->seat = nullptr;
+    window->pointer = nullptr;
+    window->keyboard = nullptr;
+    window->touch = nullptr;
+    window->data_device_manager = nullptr;
+    window->data_device = nullptr;
+    window->decoration_manager = nullptr;
+    window->text_input_manager = nullptr;
+    window->text_input = nullptr;
+    window->fractional_scale_manager = nullptr;
+    window->egl_display = EGL_NO_DISPLAY;
+    window->egl_config = nullptr;
+    window->egl_context = EGL_NO_CONTEXT;
+}
+
+static ComposeKNWindow* clipboard_target_window() {
+    if (g_primary_window != nullptr && live_window_contains(g_primary_window)) {
+        return g_primary_window;
+    }
+    if (g_live_window_count > 0) {
+        return g_live_windows[0];
+    }
+    return nullptr;
+}
 
 static void push_event(ComposeKNWindow* window, const ComposeKNEvent& event) {
     if (window->events.size() >= kMaxEvents) {
@@ -207,19 +469,22 @@ static void registry_global(
     const char* interface,
     uint32_t version
 ) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    auto* shared = static_cast<ComposeKNSharedDisplay*>(data);
+    if (shared == nullptr) {
+        return;
+    }
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
-        window->compositor = static_cast<wl_compositor*>(
+        shared->compositor = static_cast<wl_compositor*>(
             wl_registry_bind(registry, id, &wl_compositor_interface, 4)
         );
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         const uint32_t bind_version = version < 4 ? version : 4;
-        window->wm_base = static_cast<xdg_wm_base*>(
+        shared->wm_base = static_cast<xdg_wm_base*>(
             wl_registry_bind(registry, id, &xdg_wm_base_interface, bind_version)
         );
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         const uint32_t bind_version = version < 7 ? version : 7;
-        window->seat = static_cast<wl_seat*>(
+        shared->seat = static_cast<wl_seat*>(
             wl_registry_bind(registry, id, &wl_seat_interface, bind_version)
         );
     } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
@@ -228,18 +493,18 @@ static void registry_global(
         (void)id;
         (void)registry;
     } else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
-        window->data_device_manager = static_cast<wl_data_device_manager*>(
+        shared->data_device_manager = static_cast<wl_data_device_manager*>(
             wl_registry_bind(registry, id, &wl_data_device_manager_interface, 3)
         );
-        ensure_data_device(window);
+        ensure_data_device();
     } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
         const uint32_t bind_version = version < 2 ? version : 2;
-        window->decoration_manager = static_cast<zxdg_decoration_manager_v1*>(
+        shared->decoration_manager = static_cast<zxdg_decoration_manager_v1*>(
             wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, bind_version)
         );
     } else if (strcmp(interface, zwp_text_input_manager_v3_interface.name) == 0) {
         const uint32_t bind_version = version < 2 ? version : 2;
-        window->text_input_manager = static_cast<zwp_text_input_manager_v3*>(
+        shared->text_input_manager = static_cast<zwp_text_input_manager_v3*>(
             wl_registry_bind(registry, id, &zwp_text_input_manager_v3_interface, bind_version)
         );
     }
@@ -292,10 +557,13 @@ static void xdg_toplevel_configure(
         const uint32_t* state_data = static_cast<const uint32_t*>(states->data);
         const size_t count = states->size / sizeof(uint32_t);
         window->maximized = false;
+        window->fullscreen = false;
         for (size_t i = 0; i < count; ++i) {
             if (state_data[i] == XDG_TOPLEVEL_STATE_MAXIMIZED) {
                 window->maximized = true;
-                break;
+            }
+            if (state_data[i] == XDG_TOPLEVEL_STATE_FULLSCREEN) {
+                window->fullscreen = true;
             }
         }
     }
@@ -316,11 +584,15 @@ static void xdg_toplevel_configure(
         }
     }
     // request_size 用 min=max 逼 compositor 给出目标尺寸；configure 后再放开，
-    // 以免长期锁死交互式缩放（对齐「可选清除」）。
-    if (window->clear_size_constraints_after_configure && window->toplevel != nullptr) {
+    // 以免长期锁死交互式缩放（对齐「可选清除」）。不可缩放时保持锁定。
+    if (window->clear_size_constraints_after_configure &&
+        !window->size_locked &&
+        window->toplevel != nullptr) {
         window->clear_size_constraints_after_configure = false;
         xdg_toplevel_set_min_size(window->toplevel, 0, 0);
         xdg_toplevel_set_max_size(window->toplevel, 0, 0);
+    } else if (window->clear_size_constraints_after_configure) {
+        window->clear_size_constraints_after_configure = false;
     }
     try_init_egl_if_needed(window);
     composekn_flush_deferred_frame(window);
@@ -414,13 +686,18 @@ static void pointer_enter(
     wl_fixed_t surface_x,
     wl_fixed_t surface_y
 ) {
+    (void)data;
     (void)pointer;
-    (void)surface;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        g_shared.pointer_focus = nullptr;
+        return;
+    }
     {
         const char* msg = "composekn: pointer_enter callback fired\n";
         write(2, msg, 42);
     }
+    g_shared.pointer_focus = window;
     window->last_serial = serial;
     window->pointer_inside = true;
     window->pointer_x = wl_fixed_to_double(surface_x);
@@ -434,14 +711,24 @@ static void pointer_enter(
 }
 
 static void pointer_leave(void* data, wl_pointer* pointer, uint32_t serial, wl_surface* surface) {
+    (void)data;
     (void)pointer;
     (void)serial;
-    (void)surface;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        window = g_shared.pointer_focus;
+    }
+    if (window == nullptr) {
+        g_shared.pointer_focus = nullptr;
+        return;
+    }
     window->pointer_inside = false;
     ComposeKNEvent event{};
     event.type = COMPOSEKN_EVENT_POINTER_LEAVE;
     push_event(window, event);
+    if (g_shared.pointer_focus == window) {
+        g_shared.pointer_focus = nullptr;
+    }
 }
 
 static void pointer_motion(
@@ -451,9 +738,13 @@ static void pointer_motion(
     wl_fixed_t surface_x,
     wl_fixed_t surface_y
 ) {
+    (void)data;
     (void)pointer;
     (void)time;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = g_shared.pointer_focus;
+    if (window == nullptr) {
+        return;
+    }
     window->pointer_x = wl_fixed_to_double(surface_x);
     window->pointer_y = wl_fixed_to_double(surface_y);
     ComposeKNEvent event{};
@@ -472,9 +763,13 @@ static void pointer_button(
     uint32_t button,
     uint32_t state
 ) {
+    (void)data;
     (void)pointer;
     (void)time;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = g_shared.pointer_focus;
+    if (window == nullptr) {
+        return;
+    }
     {
         FILE* f = fopen("/tmp/composekn_debug.log", "a");
         if (f) {
@@ -506,9 +801,13 @@ static void pointer_axis(
     uint32_t axis,
     wl_fixed_t value
 ) {
+    (void)data;
     (void)pointer;
     (void)time;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = g_shared.pointer_focus;
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNEvent event{};
     event.type = COMPOSEKN_EVENT_POINTER_AXIS;
     event.x = static_cast<float>(window->pointer_x);
@@ -594,10 +893,13 @@ static void touch_down(
     wl_fixed_t x,
     wl_fixed_t y
 ) {
+    (void)data;
     (void)touch;
     (void)time;
-    (void)surface;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        return;
+    }
     {
         FILE* f = fopen("/tmp/composekn_debug.log", "a");
         if (f) {
@@ -608,6 +910,7 @@ static void touch_down(
     window->last_serial = serial;
     auto pos = std::make_pair(wl_fixed_to_double(x), wl_fixed_to_double(y));
     window->touch_points[static_cast<uint32_t>(id)] = pos;
+    touch_route_set(id, window);
     ComposeKNEvent event{};
     event.type = COMPOSEKN_EVENT_TOUCH_DOWN;
     event.x = static_cast<float>(pos.first);
@@ -617,9 +920,14 @@ static void touch_down(
 }
 
 static void touch_up(void* data, wl_touch* touch, uint32_t serial, uint32_t time, int32_t id) {
+    (void)data;
     (void)touch;
     (void)time;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    (void)serial;
+    ComposeKNWindow* window = touch_route_lookup(id);
+    if (window == nullptr) {
+        return;
+    }
     uint32_t tid = static_cast<uint32_t>(id);
     double px = 0.0;
     double py = 0.0;
@@ -629,6 +937,7 @@ static void touch_up(void* data, wl_touch* touch, uint32_t serial, uint32_t time
         py = it->second.second;
     }
     window->touch_points.erase(tid);
+    touch_route_clear(id);
     ComposeKNEvent event{};
     event.type = COMPOSEKN_EVENT_TOUCH_UP;
     event.x = static_cast<float>(px);
@@ -645,9 +954,13 @@ static void touch_motion(
     wl_fixed_t x,
     wl_fixed_t y
 ) {
+    (void)data;
     (void)touch;
     (void)time;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = touch_route_lookup(id);
+    if (window == nullptr) {
+        return;
+    }
     auto pos = std::make_pair(wl_fixed_to_double(x), wl_fixed_to_double(y));
     window->touch_points[static_cast<uint32_t>(id)] = pos;
     ComposeKNEvent event{};
@@ -665,9 +978,12 @@ static void touch_frame(void* data, wl_touch* touch) {
 
 // The compositor decided this gesture is a global gesture; drop all active touch points.
 static void touch_cancel(void* data, wl_touch* touch) {
+    (void)data;
     (void)touch;
-    auto* window = static_cast<ComposeKNWindow*>(data);
-    window->touch_points.clear();
+    for (size_t i = 0; i < g_live_window_count; ++i) {
+        g_live_windows[i]->touch_points.clear();
+    }
+    touch_route_clear_all();
 }
 
 // Touch shape / orientation are not used by Compose pointer input.
@@ -696,28 +1012,10 @@ static const wl_touch_listener touch_listener = {
     touch_orientation,
 };
 
-static void keyboard_keymap(
-    void* data,
-    wl_keyboard* keyboard,
-    uint32_t format,
-    int32_t fd,
-    uint32_t size
-) {
-    (void)keyboard;
-    auto* window = static_cast<ComposeKNWindow*>(data);
-    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || fd < 0 || size == 0) {
-        if (fd >= 0) {
-            close(fd);
-        }
+static void apply_xkb_keymap_to_window(ComposeKNWindow* window, const char* map, uint32_t size) {
+    if (window == nullptr || map == nullptr || size == 0) {
         return;
     }
-
-    char* map = static_cast<char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
-    close(fd);
-    if (map == MAP_FAILED) {
-        return;
-    }
-
     if (window->kb_state != nullptr) {
         xkb_state_unref(window->kb_state);
         window->kb_state = nullptr;
@@ -740,6 +1038,86 @@ static void keyboard_keymap(
         if (window->keymap != nullptr) {
             window->kb_state = xkb_state_new(window->keymap);
         }
+    }
+}
+
+static void clone_xkb_from_window(ComposeKNWindow* dst, ComposeKNWindow* src) {
+    if (dst == nullptr || src == nullptr || src->keymap == nullptr) {
+        return;
+    }
+    if (dst->kb_state != nullptr) {
+        xkb_state_unref(dst->kb_state);
+        dst->kb_state = nullptr;
+    }
+    if (dst->keymap != nullptr) {
+        xkb_keymap_unref(dst->keymap);
+        dst->keymap = nullptr;
+    }
+    if (dst->xkb_ctx == nullptr) {
+        dst->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    }
+    if (dst->xkb_ctx == nullptr) {
+        return;
+    }
+    dst->keymap = xkb_keymap_ref(src->keymap);
+    if (dst->keymap != nullptr) {
+        dst->kb_state = xkb_state_new(dst->keymap);
+    }
+    dst->modifiers = src->modifiers;
+}
+
+// Keymap often arrives during acquire (before any window is live). Keep a copy for create.
+static char* g_pending_keymap = nullptr;
+static uint32_t g_pending_keymap_size = 0;
+
+static void store_pending_keymap(const char* map, uint32_t size) {
+    if (g_pending_keymap != nullptr) {
+        std::free(g_pending_keymap);
+        g_pending_keymap = nullptr;
+        g_pending_keymap_size = 0;
+    }
+    if (map == nullptr || size == 0) {
+        return;
+    }
+    g_pending_keymap = static_cast<char*>(std::malloc(size));
+    if (g_pending_keymap != nullptr) {
+        std::memcpy(g_pending_keymap, map, size);
+        g_pending_keymap_size = size;
+    }
+}
+
+static void apply_pending_keymap_to_window(ComposeKNWindow* window) {
+    if (window == nullptr || g_pending_keymap == nullptr || g_pending_keymap_size == 0) {
+        return;
+    }
+    apply_xkb_keymap_to_window(window, g_pending_keymap, g_pending_keymap_size);
+}
+
+static void keyboard_keymap(
+    void* data,
+    wl_keyboard* keyboard,
+    uint32_t format,
+    int32_t fd,
+    uint32_t size
+) {
+    (void)data;
+    (void)keyboard;
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || fd < 0 || size == 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return;
+    }
+
+    char* map = static_cast<char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+    close(fd);
+    if (map == MAP_FAILED) {
+        return;
+    }
+
+    store_pending_keymap(map, size);
+    for (size_t i = 0; i < g_live_window_count; ++i) {
+        apply_xkb_keymap_to_window(g_live_windows[i], map, size);
     }
     munmap(map, size);
 }
@@ -781,16 +1159,30 @@ static void keyboard_enter(
 ) {
     (void)data;
     (void)keyboard;
-    (void)serial;
-    (void)surface;
     (void)keys;
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        g_shared.keyboard_focus = nullptr;
+        return;
+    }
+    g_shared.keyboard_focus = window;
+    window->last_serial = serial;
+    if (window->keymap == nullptr) {
+        apply_pending_keymap_to_window(window);
+    }
 }
 
 static void keyboard_leave(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface) {
     (void)data;
     (void)keyboard;
     (void)serial;
-    (void)surface;
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        window = g_shared.keyboard_focus;
+    }
+    if (g_shared.keyboard_focus == window) {
+        g_shared.keyboard_focus = nullptr;
+    }
 }
 
 static uint32_t wayland_key_to_evdev(uint32_t key) {
@@ -807,10 +1199,14 @@ static void keyboard_key(
     uint32_t key,
     uint32_t state
 ) {
+    (void)data;
     (void)keyboard;
     (void)serial;
     (void)time;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = g_shared.keyboard_focus;
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNEvent event{};
     event.type = COMPOSEKN_EVENT_KEY;
     event.key_code = wayland_key_to_evdev(key);
@@ -839,8 +1235,31 @@ static void keyboard_modifiers(
     uint32_t mods_locked,
     uint32_t group
 ) {
+    (void)data;
     (void)keyboard;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = g_shared.keyboard_focus;
+    if (window == nullptr) {
+        // Still update all live windows' modifier masks when possible.
+        for (size_t i = 0; i < g_live_window_count; ++i) {
+            ComposeKNWindow* w = g_live_windows[i];
+            w->last_serial = serial;
+            if (w->kb_state != nullptr) {
+                xkb_state_update_mask(
+                    w->kb_state,
+                    mods_depressed,
+                    mods_latched,
+                    mods_locked,
+                    0,
+                    0,
+                    group
+                );
+                w->modifiers = xkb_modifiers_to_wl(w);
+            } else {
+                w->modifiers = mods_depressed | mods_latched | mods_locked;
+            }
+        }
+        return;
+    }
     window->last_serial = serial;
     if (window->kb_state != nullptr) {
         xkb_state_update_mask(
@@ -866,8 +1285,12 @@ static void keyboard_repeat_info(void* data, wl_keyboard* keyboard, int32_t rate
 }
 
 static void data_offer_offer(void* data, wl_data_offer* offer, const char* mime_type) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    (void)data;
     (void)offer;
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr) {
+        return;
+    }
     if (mime_type != nullptr && strstr(mime_type, "text/plain") != nullptr) {
         window->selection_has_text = true;
     }
@@ -980,8 +1403,15 @@ static void data_device_selection(
     wl_data_device* data_device,
     wl_data_offer* offer
 ) {
+    (void)data;
     (void)data_device;
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr) {
+        if (offer != nullptr) {
+            wl_data_offer_destroy(offer);
+        }
+        return;
+    }
     if (window->selection_offer != nullptr && window->selection_offer != offer) {
         wl_data_offer_destroy(window->selection_offer);
     }
@@ -989,7 +1419,7 @@ static void data_device_selection(
     window->selection_has_text = false;
     window->selection_read_pending = false;
     if (offer != nullptr) {
-        wl_data_offer_add_listener(offer, &data_offer_listener, window);
+        wl_data_offer_add_listener(offer, &data_offer_listener, nullptr);
         window->selection_read_pending = true;
     } else {
         window->clipboard_cache.clear();
@@ -1041,30 +1471,50 @@ static const wl_data_source_listener data_source_listener = {
     data_source_handle_cancelled,
 };
 
-static void ensure_data_device(ComposeKNWindow* window) {
-    if (window == nullptr || window->data_device != nullptr) {
+static void ensure_data_device() {
+    if (g_shared.data_device != nullptr) {
         return;
     }
-    if (window->data_device_manager == nullptr || window->seat == nullptr) {
+    if (g_shared.data_device_manager == nullptr || g_shared.seat == nullptr) {
         return;
     }
-    window->data_device = wl_data_device_manager_get_data_device(window->data_device_manager, window->seat);
-    wl_data_device_add_listener(window->data_device, &data_device_listener, window);
+    g_shared.data_device =
+        wl_data_device_manager_get_data_device(g_shared.data_device_manager, g_shared.seat);
+    wl_data_device_add_listener(g_shared.data_device, &data_device_listener, &g_shared);
+    refresh_all_window_shared_aliases();
 }
 
 /* ---- IME (zwp_text_input_v3) event handlers ---- */
-static void ti_enter(void* data, zwp_text_input_v3*, wl_surface*) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+static void ti_enter(void* data, zwp_text_input_v3*, wl_surface* surface) {
+    (void)data;
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        window = g_shared.keyboard_focus;
+    }
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNImeEvent ev; ev.kind = COMPOSEKN_IME_ENTER;
     push_ime_event(window, ev);
 }
-static void ti_leave(void* data, zwp_text_input_v3*, wl_surface*) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+static void ti_leave(void* data, zwp_text_input_v3*, wl_surface* surface) {
+    (void)data;
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        window = g_shared.keyboard_focus;
+    }
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNImeEvent ev; ev.kind = COMPOSEKN_IME_LEAVE;
     push_ime_event(window, ev);
 }
 static void ti_preedit_string(void* data, zwp_text_input_v3*, const char* text, int32_t cursor_begin, int32_t cursor_end) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    (void)data;
+    ComposeKNWindow* window = g_shared.keyboard_focus;
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNImeEvent ev; ev.kind = COMPOSEKN_IME_PREEDIT;
     ev.text = (text != nullptr) ? text : "";
     ev.a = static_cast<uint32_t>(cursor_begin < 0 ? 0 : cursor_begin);
@@ -1072,20 +1522,32 @@ static void ti_preedit_string(void* data, zwp_text_input_v3*, const char* text, 
     push_ime_event(window, ev);
 }
 static void ti_commit_string(void* data, zwp_text_input_v3*, const char* text) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    (void)data;
+    ComposeKNWindow* window = g_shared.keyboard_focus;
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNImeEvent ev; ev.kind = COMPOSEKN_IME_COMMIT;
     ev.text = (text != nullptr) ? text : "";
     push_ime_event(window, ev);
 }
 static void ti_delete_surrounding_text(void* data, zwp_text_input_v3*, uint32_t before_length, uint32_t after_length) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    (void)data;
+    ComposeKNWindow* window = g_shared.keyboard_focus;
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNImeEvent ev; ev.kind = COMPOSEKN_IME_DELETE;
     ev.a = before_length;
     ev.b = after_length;
     push_ime_event(window, ev);
 }
 static void ti_done(void* data, zwp_text_input_v3*, uint32_t) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    (void)data;
+    ComposeKNWindow* window = g_shared.keyboard_focus;
+    if (window == nullptr) {
+        return;
+    }
     ComposeKNImeEvent ev; ev.kind = COMPOSEKN_IME_DONE;
     push_ime_event(window, ev);
 }
@@ -1105,16 +1567,17 @@ static const zwp_text_input_v3_listener text_input_listener = {
     ti_preedit_hint,
 };
 
-static void ensure_text_input(ComposeKNWindow* window) {
-    if (window == nullptr || window->text_input != nullptr) {
+static void ensure_text_input() {
+    if (g_shared.text_input != nullptr) {
         return;
     }
-    if (window->text_input_manager == nullptr || window->seat == nullptr) {
+    if (g_shared.text_input_manager == nullptr || g_shared.seat == nullptr) {
         return;
     }
-    window->text_input =
-        zwp_text_input_manager_v3_get_text_input(window->text_input_manager, window->seat);
-    zwp_text_input_v3_add_listener(window->text_input, &text_input_listener, window);
+    g_shared.text_input =
+        zwp_text_input_manager_v3_get_text_input(g_shared.text_input_manager, g_shared.seat);
+    zwp_text_input_v3_add_listener(g_shared.text_input, &text_input_listener, &g_shared);
+    refresh_all_window_shared_aliases();
 }
 
 static const wl_keyboard_listener keyboard_listener = {
@@ -1127,7 +1590,7 @@ static const wl_keyboard_listener keyboard_listener = {
 };
 
 static void seat_capabilities(void* data, wl_seat* seat, uint32_t capabilities) {
-    auto* window = static_cast<ComposeKNWindow*>(data);
+    (void)data;
     {
         FILE* f = fopen("/tmp/composekn_debug.log", "a");
         if (f) {
@@ -1139,34 +1602,40 @@ static void seat_capabilities(void* data, wl_seat* seat, uint32_t capabilities) 
             std::fclose(f);
         }
     }
-    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && window->pointer == nullptr) {
-        window->pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(window->pointer, &pointer_listener, window);
-    } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && window->pointer != nullptr) {
-        wl_pointer_destroy(window->pointer);
-        window->pointer = nullptr;
+    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && g_shared.pointer == nullptr) {
+        g_shared.pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(g_shared.pointer, &pointer_listener, &g_shared);
+    } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && g_shared.pointer != nullptr) {
+        wl_pointer_destroy(g_shared.pointer);
+        g_shared.pointer = nullptr;
+        g_shared.pointer_focus = nullptr;
     }
-    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && window->keyboard == nullptr) {
-        window->keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(window->keyboard, &keyboard_listener, window);
-    } else if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && window->keyboard != nullptr) {
-        wl_keyboard_destroy(window->keyboard);
-        window->keyboard = nullptr;
+    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && g_shared.keyboard == nullptr) {
+        g_shared.keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(g_shared.keyboard, &keyboard_listener, &g_shared);
+    } else if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && g_shared.keyboard != nullptr) {
+        wl_keyboard_destroy(g_shared.keyboard);
+        g_shared.keyboard = nullptr;
+        g_shared.keyboard_focus = nullptr;
     }
-    if ((capabilities & WL_SEAT_CAPABILITY_TOUCH) && window->touch == nullptr) {
-        window->touch = wl_seat_get_touch(seat);
-        wl_touch_add_listener(window->touch, &touch_listener, window);
+    if ((capabilities & WL_SEAT_CAPABILITY_TOUCH) && g_shared.touch == nullptr) {
+        g_shared.touch = wl_seat_get_touch(seat);
+        wl_touch_add_listener(g_shared.touch, &touch_listener, &g_shared);
         fprintf(stderr, "composekn: wl_touch object created\n");
         fflush(stderr);
-    } else if (!(capabilities & WL_SEAT_CAPABILITY_TOUCH) && window->touch != nullptr) {
-        wl_touch_release(window->touch);
-        window->touch = nullptr;
-        window->touch_points.clear();
+    } else if (!(capabilities & WL_SEAT_CAPABILITY_TOUCH) && g_shared.touch != nullptr) {
+        wl_touch_release(g_shared.touch);
+        g_shared.touch = nullptr;
+        for (size_t i = 0; i < g_live_window_count; ++i) {
+            g_live_windows[i]->touch_points.clear();
+        }
+        touch_route_clear_all();
     }
-    ensure_data_device(window);
+    ensure_data_device();
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
-        ensure_text_input(window);
+        ensure_text_input();
     }
+    refresh_all_window_shared_aliases();
 }
 
 static void seat_name(void* data, wl_seat* seat, const char* name) {
@@ -1204,57 +1673,65 @@ static const wl_callback_listener frame_listener = {
 };
 
 static bool init_egl(ComposeKNWindow* window) {
-    window->egl_display = eglGetDisplay(static_cast<EGLNativeDisplayType>(window->display));
-    if (window->egl_display == EGL_NO_DISPLAY) {
-        std::fprintf(stderr, "composekn: eglGetDisplay failed\n");
-        return false;
+    if (!g_shared.egl_initialized) {
+        g_shared.egl_display = eglGetDisplay(static_cast<EGLNativeDisplayType>(g_shared.display));
+        if (g_shared.egl_display == EGL_NO_DISPLAY) {
+            std::fprintf(stderr, "composekn: eglGetDisplay failed\n");
+            return false;
+        }
+
+        EGLint major = 0;
+        EGLint minor = 0;
+        if (!eglInitialize(g_shared.egl_display, &major, &minor)) {
+            std::fprintf(stderr, "composekn: eglInitialize failed\n");
+            return false;
+        }
+
+        if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+            std::fprintf(stderr, "composekn: eglBindAPI(EGL_OPENGL_ES_API) failed\n");
+            return false;
+        }
+
+        const EGLint config_attribs_es3[] = {
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, 0,
+            EGL_STENCIL_SIZE, 8,
+            EGL_NONE,
+        };
+        const EGLint config_attribs_es2[] = {
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, 0,
+            EGL_STENCIL_SIZE, 8,
+            EGL_NONE,
+        };
+
+        EGLint num_configs = 0;
+        if (eglChooseConfig(g_shared.egl_display, config_attribs_es3, &g_shared.egl_config, 1, &num_configs) &&
+            num_configs > 0) {
+            g_shared.egl_context_client_version = 3;
+        } else if (eglChooseConfig(g_shared.egl_display, config_attribs_es2, &g_shared.egl_config, 1, &num_configs) &&
+                   num_configs > 0) {
+            g_shared.egl_context_client_version = 2;
+        } else {
+            std::fprintf(stderr, "composekn: eglChooseConfig failed\n");
+            return false;
+        }
+        g_shared.egl_initialized = true;
+        refresh_all_window_shared_aliases();
     }
 
-    EGLint major = 0;
-    EGLint minor = 0;
-    if (!eglInitialize(window->egl_display, &major, &minor)) {
-        std::fprintf(stderr, "composekn: eglInitialize failed\n");
-        return false;
-    }
-
-    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-        std::fprintf(stderr, "composekn: eglBindAPI(EGL_OPENGL_ES_API) failed\n");
-        return false;
-    }
-
-    const EGLint config_attribs_es3[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 0,
-        EGL_STENCIL_SIZE, 8,
-        EGL_NONE,
-    };
-    const EGLint config_attribs_es2[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 0,
-        EGL_STENCIL_SIZE, 8,
-        EGL_NONE,
-    };
-
-    EGLint num_configs = 0;
-    int context_client_version = 3;
-    if (eglChooseConfig(window->egl_display, config_attribs_es3, &window->egl_config, 1, &num_configs) && num_configs > 0) {
-        context_client_version = 3;
-    } else if (eglChooseConfig(window->egl_display, config_attribs_es2, &window->egl_config, 1, &num_configs) && num_configs > 0) {
-        context_client_version = 2;
-    } else {
-        std::fprintf(stderr, "composekn: eglChooseConfig failed\n");
-        return false;
-    }
+    window->egl_display = g_shared.egl_display;
+    window->egl_config = g_shared.egl_config;
 
     window->egl_window = wl_egl_window_create(
         window->surface,
@@ -1277,27 +1754,33 @@ static bool init_egl(ComposeKNWindow* window) {
         return false;
     }
 
-    const EGLint context_attribs[] = {
-        EGL_CONTEXT_CLIENT_VERSION, context_client_version,
-        EGL_NONE,
-    };
-
-    window->egl_context = eglCreateContext(
-        window->egl_display,
-        window->egl_config,
-        EGL_NO_CONTEXT,
-        context_attribs
-    );
-    if (window->egl_context == EGL_NO_CONTEXT) {
-        std::fprintf(stderr, "composekn: eglCreateContext failed (ES %d)\n", context_client_version);
-        return false;
+    if (g_shared.egl_context == EGL_NO_CONTEXT) {
+        const EGLint context_attribs[] = {
+            EGL_CONTEXT_CLIENT_VERSION, g_shared.egl_context_client_version,
+            EGL_NONE,
+        };
+        g_shared.egl_context = eglCreateContext(
+            window->egl_display,
+            window->egl_config,
+            EGL_NO_CONTEXT,
+            context_attribs
+        );
+        if (g_shared.egl_context == EGL_NO_CONTEXT) {
+            std::fprintf(stderr, "composekn: eglCreateContext failed (ES %d)\n",
+                         g_shared.egl_context_client_version);
+            return false;
+        }
     }
+    window->egl_context = g_shared.egl_context;
 
     return true;
 }
 
 static void try_init_egl_if_needed(ComposeKNWindow* window) {
     if (window == nullptr || window->egl_ready || !window->configured) {
+        return;
+    }
+    if (window->prefer_vulkan) {
         return;
     }
     if (window->width <= 0 || window->height <= 0) {
@@ -1315,34 +1798,161 @@ static void try_init_egl_if_needed(ComposeKNWindow* window) {
     window->frame_requested = true;
 }
 
+static bool acquire_shared_display() {
+    if (g_shared.refcount > 0) {
+        // Already connected — bump ref only when the shared objects are still valid.
+        if (g_shared.display == nullptr || g_shared.compositor == nullptr || g_shared.wm_base == nullptr) {
+            return false;
+        }
+        ++g_shared.refcount;
+        return true;
+    }
+
+    const char* display_name = std::getenv("WAYLAND_DISPLAY");
+    g_shared.display = wl_display_connect(display_name);
+    if (g_shared.display == nullptr) {
+        std::fprintf(stderr, "composekn: wl_display_connect failed (WAYLAND_DISPLAY=%s)\n",
+                     display_name ? display_name : "(unset)");
+        return false;
+    }
+
+    g_shared.registry = wl_display_get_registry(g_shared.display);
+    wl_registry_add_listener(g_shared.registry, &registry_listener, &g_shared);
+    wl_display_roundtrip(g_shared.display);
+
+    if (g_shared.compositor == nullptr || g_shared.wm_base == nullptr) {
+        std::fprintf(stderr, "composekn: missing compositor or xdg_wm_base\n");
+        // refcount still 0 — release tears down the partial connection.
+        release_shared_display();
+        return false;
+    }
+
+    xdg_wm_base_add_listener(g_shared.wm_base, &xdg_wm_base_listener, &g_shared);
+
+    if (g_shared.seat != nullptr) {
+        wl_seat_add_listener(g_shared.seat, &seat_listener, &g_shared);
+        // Dispatch seat capabilities (creates pointer/keyboard/touch).
+        wl_display_roundtrip(g_shared.display);
+    }
+
+    ensure_data_device();
+    ensure_text_input();
+
+    g_shared.refcount = 1;
+    return true;
+}
+
+static void release_shared_display() {
+    if (g_shared.refcount > 0) {
+        --g_shared.refcount;
+    }
+    if (g_shared.refcount > 0) {
+        return;
+    }
+
+    g_shared.pointer_focus = nullptr;
+    g_shared.keyboard_focus = nullptr;
+    touch_route_clear_all();
+
+    // Seat-bound objects first (text_input / data_device / pointer / …), then seat.
+    if (g_shared.text_input != nullptr) {
+        zwp_text_input_v3_destroy(g_shared.text_input);
+        g_shared.text_input = nullptr;
+    }
+    if (g_shared.text_input_manager != nullptr) {
+        zwp_text_input_manager_v3_destroy(g_shared.text_input_manager);
+        g_shared.text_input_manager = nullptr;
+    }
+    if (g_shared.data_device != nullptr) {
+        wl_data_device_destroy(g_shared.data_device);
+        g_shared.data_device = nullptr;
+    }
+    if (g_shared.data_device_manager != nullptr) {
+        wl_data_device_manager_destroy(g_shared.data_device_manager);
+        g_shared.data_device_manager = nullptr;
+    }
+    if (g_shared.pointer != nullptr) {
+        wl_pointer_destroy(g_shared.pointer);
+        g_shared.pointer = nullptr;
+    }
+    if (g_shared.keyboard != nullptr) {
+        wl_keyboard_destroy(g_shared.keyboard);
+        g_shared.keyboard = nullptr;
+    }
+    if (g_shared.touch != nullptr) {
+        wl_touch_release(g_shared.touch);
+        g_shared.touch = nullptr;
+    }
+    if (g_shared.seat != nullptr) {
+        wl_seat_destroy(g_shared.seat);
+        g_shared.seat = nullptr;
+    }
+    if (g_shared.decoration_manager != nullptr) {
+        zxdg_decoration_manager_v1_destroy(g_shared.decoration_manager);
+        g_shared.decoration_manager = nullptr;
+    }
+    if (g_shared.fractional_scale_manager != nullptr) {
+        wp_fractional_scale_manager_v1_destroy(g_shared.fractional_scale_manager);
+        g_shared.fractional_scale_manager = nullptr;
+    }
+    if (g_shared.egl_initialized && g_shared.egl_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(g_shared.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (g_shared.egl_context != EGL_NO_CONTEXT) {
+            eglDestroyContext(g_shared.egl_display, g_shared.egl_context);
+            g_shared.egl_context = EGL_NO_CONTEXT;
+        }
+        eglTerminate(g_shared.egl_display);
+    }
+    g_shared.egl_display = EGL_NO_DISPLAY;
+    g_shared.egl_config = nullptr;
+    g_shared.egl_context = EGL_NO_CONTEXT;
+    g_shared.egl_initialized = false;
+    g_shared.egl_context_client_version = 2;
+
+    if (g_shared.wm_base != nullptr) {
+        xdg_wm_base_destroy(g_shared.wm_base);
+        g_shared.wm_base = nullptr;
+    }
+    // compositor is released with the display connection.
+    g_shared.compositor = nullptr;
+    if (g_shared.registry != nullptr) {
+        wl_registry_destroy(g_shared.registry);
+        g_shared.registry = nullptr;
+    }
+    if (g_shared.display != nullptr) {
+        wl_display_disconnect(g_shared.display);
+        g_shared.display = nullptr;
+    }
+    if (g_pending_keymap != nullptr) {
+        std::free(g_pending_keymap);
+        g_pending_keymap = nullptr;
+        g_pending_keymap_size = 0;
+    }
+    g_shared.refcount = 0;
+    g_display_read_this_cycle = false;
+}
+
+extern "C" void composekn_display_begin_poll_cycle(void) {
+    g_display_read_this_cycle = false;
+}
+
 extern "C" ComposeKNWindow* composekn_window_create(const char* title, int width, int height) {
     auto* window = new ComposeKNWindow();
     window->width = width > 0 ? width : 800;
     window->height = height > 0 ? height : 600;
 
-    const char* display_name = std::getenv("WAYLAND_DISPLAY");
-    window->display = wl_display_connect(display_name);
-    if (window->display == nullptr) {
-        std::fprintf(stderr, "composekn: wl_display_connect failed (WAYLAND_DISPLAY=%s)\n",
-                     display_name ? display_name : "(unset)");
-        composekn_window_destroy(window);
+    if (!acquire_shared_display()) {
+        delete window;
         return nullptr;
     }
-
-    window->registry = wl_display_get_registry(window->display);
-    wl_registry_add_listener(window->registry, &registry_listener, window);
-    wl_display_roundtrip(window->display);
+    alias_shared_onto_window(window);
+    // Insert early so destroy() can tear down create-failure paths safely.
+    live_window_insert(window);
 
     if (window->compositor == nullptr || window->wm_base == nullptr) {
         std::fprintf(stderr, "composekn: missing compositor or xdg_wm_base\n");
         composekn_window_destroy(window);
         return nullptr;
-    }
-
-    xdg_wm_base_add_listener(window->wm_base, &xdg_wm_base_listener, window);
-
-    if (window->seat != nullptr) {
-        wl_seat_add_listener(window->seat, &seat_listener, window);
     }
 
     window->surface = wl_compositor_create_surface(window->compositor);
@@ -1357,24 +1967,59 @@ extern "C" ComposeKNWindow* composekn_window_create(const char* title, int width
     xdg_toplevel_set_app_id(window->toplevel, "com.composekn.demo");
     request_server_side_decoration(window);
 
+    surface_map_insert(window->surface, window);
+
+    // Default Graphite/Vulkan：先占住 wl_surface，避免 configure 抢 EGL。
+    // COMPOSEKN_RENDER_API=gl|opengl 时走 GLES；Vulkan 创建失败由 Kotlin 清 prefer_vulkan。
+    window->prefer_vulkan = true;
+    if (const char* api = std::getenv("COMPOSEKN_RENDER_API")) {
+        if (std::strcmp(api, "gl") == 0 || std::strcmp(api, "opengl") == 0 ||
+            std::strcmp(api, "gles") == 0 || std::strcmp(api, "software") == 0 ||
+            std::strcmp(api, "sw") == 0) {
+            window->prefer_vulkan = false;
+        }
+    }
+
     wl_surface_commit(window->surface);
     wl_display_roundtrip(window->display);
     try_init_egl_if_needed(window);
     composekn_flush_deferred_frame(window);
+
+    apply_pending_keymap_to_window(window);
+    if (window->keymap == nullptr && g_primary_window != nullptr && g_primary_window != window) {
+        clone_xkb_from_window(window, g_primary_window);
+    }
 
     g_primary_window = window;
     return window;
 }
 
 extern "C" void composekn_window_destroy(ComposeKNWindow* window) {
-    window = resolve_window(window);
     if (window == nullptr) {
         return;
     }
+    // destroy 后 Kotlin 仍可能持有野指针；拒绝已释放窗口（不解引用字段）。
+    if (!live_window_contains(window)) {
+        return;
+    }
+    live_window_erase(window);
+
+    if (g_shared.pointer_focus == window) {
+        g_shared.pointer_focus = nullptr;
+    }
+    if (g_shared.keyboard_focus == window) {
+        g_shared.keyboard_focus = nullptr;
+    }
+    touch_route_clear_window(window);
+    surface_map_erase(window);
 
     if (g_primary_window == window) {
-        g_primary_window = nullptr;
+        g_primary_window = (g_live_window_count > 0) ? g_live_windows[0] : nullptr;
     }
+
+    // Tear down Vulkan before EGL / wl_surface (swapchain holds the surface).
+    composekn_window_vk_destroy(window);
+
     if (window->clipboard_source != nullptr) {
         wl_data_source_destroy(window->clipboard_source);
         window->clipboard_source = nullptr;
@@ -1383,86 +2028,47 @@ extern "C" void composekn_window_destroy(ComposeKNWindow* window) {
         wl_data_offer_destroy(window->selection_offer);
         window->selection_offer = nullptr;
     }
-    if (window->data_device != nullptr) {
-        wl_data_device_destroy(window->data_device);
-        window->data_device = nullptr;
-    }
-    if (window->data_device_manager != nullptr) {
-        wl_data_device_manager_destroy(window->data_device_manager);
-        window->data_device_manager = nullptr;
-    }
 
     if (window->frame_callback != nullptr) {
         wl_callback_destroy(window->frame_callback);
-    }
-    if (window->pointer != nullptr) {
-        wl_pointer_destroy(window->pointer);
-    }
-    if (window->keyboard != nullptr) {
-        wl_keyboard_destroy(window->keyboard);
-    }
-    if (window->touch != nullptr) {
-        wl_touch_release(window->touch);
-        window->touch = nullptr;
-    }
-    if (window->seat != nullptr) {
-        wl_seat_destroy(window->seat);
+        window->frame_callback = nullptr;
     }
     if (window->fractional_scale != nullptr) {
         wp_fractional_scale_v1_destroy(window->fractional_scale);
-    }
-    if (window->fractional_scale_manager != nullptr) {
-        wp_fractional_scale_manager_v1_destroy(window->fractional_scale_manager);
-    }
-    if (window->text_input != nullptr) {
-        zwp_text_input_v3_destroy(window->text_input);
-        window->text_input = nullptr;
-    }
-    if (window->text_input_manager != nullptr) {
-        zwp_text_input_manager_v3_destroy(window->text_input_manager);
-        window->text_input_manager = nullptr;
+        window->fractional_scale = nullptr;
     }
 
+    // Per-window EGL surface/window only — shared EGLContext/Display until last window.
     if (window->egl_display != EGL_NO_DISPLAY) {
         eglMakeCurrent(window->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
-    if (window->egl_context != EGL_NO_CONTEXT) {
-        eglDestroyContext(window->egl_display, window->egl_context);
-    }
+    // window->egl_context aliases g_shared.egl_context — do not destroy here.
+    window->egl_context = EGL_NO_CONTEXT;
     if (window->egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(window->egl_display, window->egl_surface);
+        window->egl_surface = EGL_NO_SURFACE;
     }
     if (window->egl_window != nullptr) {
         wl_egl_window_destroy(window->egl_window);
+        window->egl_window = nullptr;
     }
-    if (window->egl_display != EGL_NO_DISPLAY) {
-        eglTerminate(window->egl_display);
-    }
+    window->egl_ready = false;
+
     if (window->toplevel_decoration != nullptr) {
         zxdg_toplevel_decoration_v1_destroy(window->toplevel_decoration);
         window->toplevel_decoration = nullptr;
     }
-    if (window->decoration_manager != nullptr) {
-        zxdg_decoration_manager_v1_destroy(window->decoration_manager);
-        window->decoration_manager = nullptr;
-    }
     if (window->toplevel != nullptr) {
         xdg_toplevel_destroy(window->toplevel);
+        window->toplevel = nullptr;
     }
     if (window->shell_surface != nullptr) {
         xdg_surface_destroy(window->shell_surface);
+        window->shell_surface = nullptr;
     }
     if (window->surface != nullptr) {
         wl_surface_destroy(window->surface);
-    }
-    if (window->wm_base != nullptr) {
-        xdg_wm_base_destroy(window->wm_base);
-    }
-    if (window->registry != nullptr) {
-        wl_registry_destroy(window->registry);
-    }
-    if (window->display != nullptr) {
-        wl_display_disconnect(window->display);
+        window->surface = nullptr;
     }
 
     if (window->kb_state != nullptr) {
@@ -1478,6 +2084,8 @@ extern "C" void composekn_window_destroy(ComposeKNWindow* window) {
         window->xkb_ctx = nullptr;
     }
 
+    clear_window_shared_aliases(window);
+    release_shared_display();
     delete window;
 }
 
@@ -1491,18 +2099,27 @@ extern "C" bool composekn_window_poll(ComposeKNWindow* window) {
 
     w->in_dispatch = true;
 
-    if (wl_display_prepare_read(w->display) != 0) {
-        if (wl_display_dispatch_pending(w->display) < 0) {
-            w->in_dispatch = false;
-            return false;
+    if (!g_display_read_this_cycle) {
+        g_display_read_this_cycle = true;
+        if (wl_display_prepare_read(w->display) != 0) {
+            if (wl_display_dispatch_pending(w->display) < 0) {
+                w->in_dispatch = false;
+                return false;
+            }
+        } else {
+            if (wl_display_flush(w->display) < 0 && errno != EAGAIN) {
+                wl_display_cancel_read(w->display);
+                w->in_dispatch = false;
+                return false;
+            }
+            wl_display_read_events(w->display);
+            if (wl_display_dispatch_pending(w->display) < 0) {
+                w->in_dispatch = false;
+                return false;
+            }
         }
     } else {
-        if (wl_display_flush(w->display) < 0 && errno != EAGAIN) {
-            wl_display_cancel_read(w->display);
-            w->in_dispatch = false;
-            return false;
-        }
-        wl_display_read_events(w->display);
+        // Another window already read this cycle; just drain any remaining pending.
         if (wl_display_dispatch_pending(w->display) < 0) {
             w->in_dispatch = false;
             return false;
@@ -1512,6 +2129,11 @@ extern "C" bool composekn_window_poll(ComposeKNWindow* window) {
     w->in_dispatch = false;
     composekn_flush_deferred_frame(w);
     composekn_process_deferred_selection(w);
+    // Single-window / direct poll paths never call begin_poll_cycle; clear so the
+    // next poll can prepare_read again. Multi-window host clears via begin_poll_cycle.
+    if (g_live_window_count <= 1) {
+        g_display_read_this_cycle = false;
+    }
     return true;
 }
 
@@ -1569,7 +2191,13 @@ static void composekn_flush_deferred_frame(ComposeKNWindow* window) {
     if (window == nullptr || window->surface == nullptr || window->display == nullptr) {
         return;
     }
-    if (!window->configured || !window->egl_ready || window->width <= 0 || window->height <= 0) {
+    // GLES 要等 egl_ready；Graphite/Vulkan 走 prefer_vulkan（跳过 EGL）。
+    // 若只认 egl_ready，Vulkan 永远发不出 wl_surface_frame → 无 FRAME →
+    // FrameRecomposer 卡在 withFrameNanos，exitApplication 无法拆窗。
+    if (!window->configured || window->width <= 0 || window->height <= 0) {
+        return;
+    }
+    if (!window->egl_ready && !window->prefer_vulkan) {
         return;
     }
     if (window->in_dispatch || window->frame_callback != nullptr) {
@@ -1604,13 +2232,13 @@ extern "C" bool composekn_window_frame_pending(ComposeKNWindow* window) {
 
 extern "C" void composekn_window_make_current(ComposeKNWindow* window) {
     window = resolve_window(window);
-    if (window == nullptr || window->egl_display == EGL_NO_DISPLAY) {
+    if (window == nullptr) {
         return;
     }
     if (!window->egl_ready) {
         try_init_egl_if_needed(window);
     }
-    if (window->egl_context == EGL_NO_CONTEXT) {
+    if (window->egl_display == EGL_NO_DISPLAY || window->egl_context == EGL_NO_CONTEXT) {
         return;
     }
     if (!eglMakeCurrent(window->egl_display, window->egl_surface, window->egl_surface, window->egl_context)) {
@@ -1659,6 +2287,39 @@ extern "C" float composekn_window_scale(ComposeKNWindow* window) {
     return (scale >= 1.0f && scale <= 4.0f) ? scale : 1.0f;
 }
 
+extern "C" int composekn_window_buffer_width(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    return window != nullptr ? physical_width(window) : 0;
+}
+
+extern "C" int composekn_window_buffer_height(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    return window != nullptr ? physical_height(window) : 0;
+}
+
+extern "C" void* composekn_window_wl_display(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    return window != nullptr ? static_cast<void*>(window->display) : nullptr;
+}
+
+extern "C" void* composekn_window_wl_surface(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    return window != nullptr ? static_cast<void*>(window->surface) : nullptr;
+}
+
+extern "C" void composekn_window_set_vulkan_preferred(ComposeKNWindow* window, bool preferred) {
+    window = resolve_window(window);
+    if (window == nullptr) {
+        return;
+    }
+    window->prefer_vulkan = preferred;
+}
+
+extern "C" bool composekn_window_vulkan_preferred(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    return window != nullptr && window->prefer_vulkan;
+}
+
 extern "C" bool composekn_window_consume_resized(ComposeKNWindow* window) {
     window = resolve_window(window);
     if (window == nullptr || !window->resized) {
@@ -1699,7 +2360,8 @@ extern "C" void composekn_clipboard_set_text(const char* text) {
     wl_data_source_add_listener(window->clipboard_source, &data_source_listener, window);
     wl_data_source_offer(window->clipboard_source, "text/plain;charset=utf-8");
     wl_data_source_offer(window->clipboard_source, "text/plain");
-    ensure_data_device(window);
+    ensure_data_device();
+    alias_shared_onto_window(window);
     if (window->data_device != nullptr) {
         wl_data_device_set_selection(window->data_device, window->clipboard_source, window->last_serial);
     }
@@ -1736,6 +2398,56 @@ extern "C" void composekn_window_toggle_maximized(ComposeKNWindow* window) {
 extern "C" bool composekn_window_is_maximized(ComposeKNWindow* window) {
     window = resolve_window(window);
     return window != nullptr && window->maximized;
+}
+
+extern "C" void composekn_window_set_fullscreen(ComposeKNWindow* window, bool enable) {
+    window = resolve_window(window);
+    if (window == nullptr || window->toplevel == nullptr) {
+        return;
+    }
+    if (enable) {
+        xdg_toplevel_set_fullscreen(window->toplevel, nullptr);
+    } else {
+        xdg_toplevel_unset_fullscreen(window->toplevel);
+    }
+    if (window->surface != nullptr) {
+        wl_surface_commit(window->surface);
+    }
+    if (window->display != nullptr) {
+        wl_display_flush(window->display);
+    }
+}
+
+extern "C" bool composekn_window_is_fullscreen(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    return window != nullptr && window->fullscreen;
+}
+
+/**
+ * resizable=false：把当前宽高锁成 min=max；true：清约束。
+ * 与 request_size 的临时约束协作：size_locked 时 configure 后不清。
+ */
+extern "C" void composekn_window_set_resizable(ComposeKNWindow* window, bool resizable) {
+    window = resolve_window(window);
+    if (window == nullptr || window->toplevel == nullptr) {
+        return;
+    }
+    window->size_locked = !resizable;
+    if (!resizable) {
+        const int width = window->width > 0 ? window->width : 1;
+        const int height = window->height > 0 ? window->height : 1;
+        xdg_toplevel_set_min_size(window->toplevel, width, height);
+        xdg_toplevel_set_max_size(window->toplevel, width, height);
+    } else {
+        xdg_toplevel_set_min_size(window->toplevel, 0, 0);
+        xdg_toplevel_set_max_size(window->toplevel, 0, 0);
+    }
+    if (window->surface != nullptr) {
+        wl_surface_commit(window->surface);
+    }
+    if (window->display != nullptr) {
+        wl_display_flush(window->display);
+    }
 }
 
 extern "C" void composekn_window_request_close(ComposeKNWindow* window) {
@@ -1853,7 +2565,8 @@ extern "C" void composekn_text_input_set_enabled(ComposeKNWindow* window, bool e
     if (window == nullptr) {
         return;
     }
-    ensure_text_input(window);
+    ensure_text_input();
+    alias_shared_onto_window(window);
     if (window->text_input == nullptr) {
         return;
     }

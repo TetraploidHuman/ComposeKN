@@ -103,12 +103,12 @@ class LinuxNativeWindowHandle(
     }
 
     override fun setResizable(resizable: Boolean) {
-        // Wayland 无通用 setResizable；xdg 约束留待后续
         app.composeWindow.resizable = resizable
+        app.composeWindow.window.setResizable(resizable)
     }
 
     override fun setAlwaysOnTop(alwaysOnTop: Boolean) {
-        // Wayland 无标准 always-on-top；跳过
+        // Wayland 无标准 always-on-top；仅记账。
         app.composeWindow.alwaysOnTop = alwaysOnTop
     }
 
@@ -116,14 +116,15 @@ class LinuxNativeWindowHandle(
         val w = app.composeWindow
         when (placement) {
             WindowPlacement.Floating -> {
+                if (w.window.isFullscreen) w.window.setFullscreen(false)
                 if (w.window.isMaximized) w.window.toggleMaximized()
             }
             WindowPlacement.Maximized -> {
+                if (w.window.isFullscreen) w.window.setFullscreen(false)
                 if (!w.window.isMaximized) w.window.toggleMaximized()
             }
             WindowPlacement.Fullscreen -> {
-                // Wayland fullscreen 未接
-                println("composekn: Fullscreen placement not yet supported on Wayland")
+                if (!w.window.isFullscreen) w.window.setFullscreen(true)
             }
         }
         if (isMinimized) w.window.minimize()
@@ -179,6 +180,7 @@ class LinuxNativeWindowHandle(
         val width = w.window.width
         val height = w.window.height
         val placement = when {
+            w.window.isFullscreen -> WindowPlacement.Fullscreen
             w.window.isMaximized -> WindowPlacement.Maximized
             else -> WindowPlacement.Floating
         }

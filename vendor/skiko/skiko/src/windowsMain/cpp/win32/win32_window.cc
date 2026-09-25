@@ -2123,7 +2123,8 @@ extern "C" ComposeKNWin32Window* composekn_win32_create(
 
 extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
     if (window == nullptr) return;
-    // 防 Kotlin 漏调 gl_destroy：拆 HWND 前先丢掉本窗 WGL（多窗口下不能留悬空 DC）。
+    // 防 Kotlin 漏调：拆 HWND 前先丢掉本窗 GL / Vulkan。
+    composekn_win32_vk_destroy(window);
     composekn_win32_gl_destroy(window);
     if (window->hwnd != nullptr && IsWindow(window->hwnd)) {
         // 菜单栏在 DestroyWindow 前摘掉并销毁（窗口不会自动 DestroyMenu）。
@@ -2137,7 +2138,10 @@ extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
         if (window->dropTarget != nullptr) {
             RevokeDragDrop(window->hwnd);
         }
+        // 清 USERDATA，避免 DestroyWindow 派发的尾随消息打到即将 delete 的 this。
+        SetWindowLongPtrW(window->hwnd, GWLP_USERDATA, 0);
         DestroyWindow(window->hwnd);
+        window->hwnd = nullptr;
     } else if (window->menuBar != nullptr) {
         DestroyMenu(window->menuBar);
         window->menuBar = nullptr;

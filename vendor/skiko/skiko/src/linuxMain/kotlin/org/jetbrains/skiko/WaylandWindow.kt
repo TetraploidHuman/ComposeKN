@@ -1,11 +1,14 @@
+@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
+
 package org.jetbrains.skiko
 
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.cstr
 import kotlinx.cinterop.memScoped
+import org.jetbrains.skia.impl.NativePointer
 
 /**
- * Wayland + EGL window for Kotlin/Native Linux desktop.
+ * Wayland + EGL/Vulkan window for Kotlin/Native Linux desktop.
  */
 class WaylandWindow(
     val title: String,
@@ -106,15 +109,38 @@ class WaylandWindow(
 
     fun framePending(): Boolean = composekn_window_frame_pending(native)
 
+    // ---- Graphite + Vulkan ----
+
+    fun vkCreate(): Boolean = composekn_window_vk_create(native)
+
+    /** Next-frame backbuffer SkCanvas*; failure returns a null pointer. */
+    fun vkBeginFrame(width: Int, height: Int): NativePointer =
+        composekn_window_vk_begin_frame(native, width, height)
+
+    fun vkEndFrame(): Boolean = composekn_window_vk_end_frame(native)
+
+    fun vkDestroy(): Unit = composekn_window_vk_destroy(native)
+
+    /** Clear so GLES fallback can create wl_egl_window on this surface. */
+    fun setVulkanPreferred(preferred: Boolean) =
+        composekn_window_set_vulkan_preferred(native, preferred)
+
     val usesServerDecoration: Boolean
         get() = composekn_window_uses_server_decoration(native)
 
     val isMaximized: Boolean
         get() = composekn_window_is_maximized(native)
 
+    val isFullscreen: Boolean
+        get() = composekn_window_is_fullscreen(native)
+
     fun minimize() = composekn_window_minimize(native)
 
     fun toggleMaximized() = composekn_window_toggle_maximized(native)
+
+    fun setFullscreen(enable: Boolean) = composekn_window_set_fullscreen(native, enable)
+
+    fun setResizable(resizable: Boolean) = composekn_window_set_resizable(native, resizable)
 
     fun requestClose() = composekn_window_request_close(native)
 

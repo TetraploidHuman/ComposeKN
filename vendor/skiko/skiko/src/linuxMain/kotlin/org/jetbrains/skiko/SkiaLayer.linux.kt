@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
+
 package org.jetbrains.skiko
 
 import org.jetbrains.skia.Canvas
@@ -6,16 +8,21 @@ import org.jetbrains.skia.Picture
 import org.jetbrains.skia.PictureRecorder
 import org.jetbrains.skia.PixelGeometry
 import org.jetbrains.skiko.redrawer.LinuxWaylandOpenGLRedrawer
+import org.jetbrains.skiko.redrawer.LinuxWaylandVulkanRedrawer
 import org.jetbrains.skiko.redrawer.Redrawer
+import kotlinx.cinterop.toKString
+import platform.posix.getenv
 
 /**
- * SkiaLayer for Kotlin/Native Linux with Wayland + EGL + OpenGL.
+ * SkiaLayer for Kotlin/Native Linux with Wayland.
+ *
+ * Default: Graphite/Vulkan → fallback GLES. Override with `COMPOSEKN_RENDER_API`.
  */
 actual open class SkiaLayer {
-    actual var renderApi: GraphicsApi = GraphicsApi.OPENGL
+    actual var renderApi: GraphicsApi = defaultLinuxRenderApi()
         set(value) {
-            if (value != GraphicsApi.OPENGL) {
-                throw IllegalArgumentException("Only OPENGL is supported on Linux Wayland")
+            if (value != GraphicsApi.VULKAN && value != GraphicsApi.OPENGL) {
+                throw IllegalArgumentException("Only VULKAN and OPENGL are supported on Linux Wayland")
             }
             field = value
         }
@@ -51,7 +58,7 @@ actual open class SkiaLayer {
             is String -> WaylandWindow(container)
             else -> error("container must be WaylandWindow or window title String")
         }
-        redrawer = LinuxWaylandOpenGLRedrawer(this, waylandWindow!!).apply {
+        redrawer = createRedrawer(waylandWindow!!).apply {
             syncBounds()
             needRender()
         }
@@ -120,6 +127,51 @@ actual open class SkiaLayer {
     fun renderImmediately() {
         redrawer?.renderImmediately()
     }
+
+    /**
+     * 建后端：默认 Graphite/Vulkan → GLES；可用 `COMPOSEKN_RENDER_API` 强制。
+     */
+    private fun createRedrawer(window: WaylandWindow): Redrawer {
+        val requested = linuxRenderApiOverride() ?: renderApi
+        val tryVulkan = requested == GraphicsApi.VULKAN
+        val tryGl = requested == GraphicsApi.OPENGL || requested == GraphicsApi.VULKAN
+
+        if (tryVulkan) {
+            try {
+                renderApi = GraphicsApi.VULKAN
+                return LinuxWaylandVulkanRedrawer(this, window)
+            } catch (t: Throwable) {
+                println(
+                    "composekn: Graphite/Vulkan unavailable (${t.message}); falling back to GLES",
+                )
+                window.setVulkanPreferred(false)
+            }
+        }
+        if (tryGl) {
+            renderApi = GraphicsApi.OPENGL
+            window.setVulkanPreferred(false)
+            return LinuxWaylandOpenGLRedrawer(this, window)
+        }
+        renderApi = GraphicsApi.OPENGL
+        window.setVulkanPreferred(false)
+        return LinuxWaylandOpenGLRedrawer(this, window)
+    }
 }
 
 actual val currentSystemTheme: SystemTheme = SystemTheme.UNKNOWN
+
+/**
+ * `COMPOSEKN_RENDER_API=vulkan|vk|graphite|gl|opengl|gles`：强制指定后端。
+ * 未设置时返回 null，表示按 [SkiaLayer.renderApi] 走默认逻辑。
+ */
+private fun linuxRenderApiOverride(): GraphicsApi? {
+    val raw = getenv("COMPOSEKN_RENDER_API")?.toKString()?.trim()?.lowercase() ?: return null
+    return when (raw) {
+        "vulkan", "vk", "graphite", "graphite-vk" -> GraphicsApi.VULKAN
+        "gl", "opengl", "gles", "gpu" -> GraphicsApi.OPENGL
+        else -> null
+    }
+}
+
+/** 默认后端 = Graphite/Vulkan，失败回退 GLES。 */
+private fun defaultLinuxRenderApi(): GraphicsApi = GraphicsApi.VULKAN

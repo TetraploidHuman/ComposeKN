@@ -25,8 +25,8 @@ internal class WindowsVulkanRedrawer(
     window: Win32Window,
 ) : WindowsRenderLoopRedrawer(skiaLayer, window) {
     override val renderInfo: String
-        get() = "GraphicsApi: ${GraphicsApi.VULKAN}\nPresentation: graphite(vulkan swapchain)\n"
-    override val presentationMode: String get() = "graphite(vulkan swapchain)"
+        get() = "GraphicsApi: ${GraphicsApi.VULKAN}\nPresentation: graphite(vulkan)\n"
+    override val presentationMode: String get() = "graphite(vulkan)"
 
     init {
         if (!window.vkCreate()) {

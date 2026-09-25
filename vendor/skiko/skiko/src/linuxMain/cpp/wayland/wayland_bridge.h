@@ -54,6 +54,12 @@ ComposeKNWindow* composekn_window_create(const char* title, int width, int heigh
 void composekn_window_destroy(ComposeKNWindow* window);
 
 /**
+ * Reset the shared-display poll-cycle flag. Call once per host-loop iteration
+ * before polling any windows so only the first poll does prepare_read/read_events.
+ */
+void composekn_display_begin_poll_cycle(void);
+
+/**
  * Process pending Wayland events.
  * Returns false only on display/read failure or null window.
  * Close requests do NOT stop polling (Desktop DO_NOTHING); use
@@ -94,6 +100,44 @@ int composekn_window_width(ComposeKNWindow* window);
 int composekn_window_height(ComposeKNWindow* window);
 float composekn_window_scale(ComposeKNWindow* window);
 
+/** Physical buffer size in pixels (for Vulkan swapchain / EGL window). */
+int composekn_window_buffer_width(ComposeKNWindow* window);
+int composekn_window_buffer_height(ComposeKNWindow* window);
+
+/** Opaque wl_display* / wl_surface* for VK_KHR_wayland_surface. */
+void* composekn_window_wl_display(ComposeKNWindow* window);
+void* composekn_window_wl_surface(ComposeKNWindow* window);
+
+/**
+ * When true, EGL must not attach (Vulkan owns the wl_surface).
+ * Set by composekn_window_vk_create on success.
+ */
+void composekn_window_set_vulkan_preferred(ComposeKNWindow* window, bool preferred);
+bool composekn_window_vulkan_preferred(ComposeKNWindow* window);
+
+// ---------------------------------------------------------------------------
+// Graphite + Vulkan（GPU 后端，与 GLES 并存；失败时上层回退 GLES）
+//
+// C 侧拥有 VkInstance/Device/Swapchain + skgpu::graphite::Context/Recorder。
+// 每帧 begin → 返回 SkCanvas*，Kotlin 画完后 end（present）。
+// 未编 SK_VULKAN+SK_GRAPHITE 时全部返回失败/nullptr。
+// ---------------------------------------------------------------------------
+
+/** 建 Vulkan 设备 + Graphite Context + Wayland surface/swapchain。失败 → false。 */
+bool composekn_window_vk_create(ComposeKNWindow* window);
+
+/**
+ * 获取下一帧 backbuffer 的 SkCanvas*（不转移所有权；仅在 end 前有效）。
+ * width/height 为像素尺寸；传 0 或与 buffer 不符时用 window buffer 尺寸。
+ */
+void* composekn_window_vk_begin_frame(ComposeKNWindow* window, int width, int height);
+
+/** snap + present。成功 true。 */
+bool composekn_window_vk_end_frame(ComposeKNWindow* window);
+
+/** 销毁 Graphite/Vulkan 资源。 */
+void composekn_window_vk_destroy(ComposeKNWindow* window);
+
 /** Returns true once after each xdg configure that changed the surface size. */
 bool composekn_window_consume_resized(ComposeKNWindow* window);
 
@@ -117,6 +161,10 @@ bool composekn_window_uses_server_decoration(ComposeKNWindow* window);
 void composekn_window_minimize(ComposeKNWindow* window);
 void composekn_window_toggle_maximized(ComposeKNWindow* window);
 bool composekn_window_is_maximized(ComposeKNWindow* window);
+void composekn_window_set_fullscreen(ComposeKNWindow* window, bool enable);
+bool composekn_window_is_fullscreen(ComposeKNWindow* window);
+/** false：xdg min=max 锁当前尺寸；true：清除约束。 */
+void composekn_window_set_resizable(ComposeKNWindow* window, bool resizable);
 void composekn_window_request_close(ComposeKNWindow* window);
 
 /** True after compositor/app requested close (surface still alive until destroy). */
@@ -166,6 +214,40 @@ void composekn_text_input_set_cursor_rectangle(
 void composekn_text_input_set_surrounding_text(
     ComposeKNWindow* window, const char* text, int cursor, int anchor);
 void composekn_text_input_set_content_type(ComposeKNWindow* window, int hint, int purpose);
+
+/* ---- xdg-desktop-portal FileChooser / StatusNotifierItem（libdbus）---- */
+
+bool composekn_linux_file_dialog_available(void);
+/**
+ * 同步弹出 portal 文件对话框。两段式缓冲对齐 Win32：
+ *   0=取消；-1=错误；>0=写入 UTF-8 字节数（多路径 '\n' 分隔）；
+ *   buffer 太小则返回需要的字节数。
+ * mode：0=Open，非 0=Save。
+ */
+int32_t composekn_linux_file_dialog(
+    int32_t mode,
+    const char* title,
+    const char* initialDir,
+    const char* initialName,
+    bool allowMultiple,
+    const char* filterUtf8,
+    char* buffer,
+    int32_t bufferSize);
+
+typedef void (*ComposeKNLinuxTrayCallback)(int32_t kind, int32_t arg, void* user);
+
+bool composekn_linux_tray_available(void);
+bool composekn_linux_tray_create(
+    const char* tooltip_utf8, ComposeKNLinuxTrayCallback cb, void* user);
+void composekn_linux_tray_set_tooltip(const char* tooltip_utf8);
+/** itemsUtf8：每行一项；空行 = 分隔；前缀 '-' = 禁用；格式见 ComposeKNTray.linux。 */
+void composekn_linux_tray_set_menu(const char* itemsUtf8);
+bool composekn_linux_tray_set_icon(int32_t w, int32_t h, const uint8_t* bgra);
+void composekn_linux_tray_notify(
+    const char* title_utf8, const char* body_utf8, int32_t type);
+/** 泵 dbus（应在 UI 循环里周期性调用）。 */
+void composekn_linux_tray_dispatch(void);
+void composekn_linux_tray_destroy(void);
 
 #ifdef __cplusplus
 }

@@ -71,9 +71,10 @@ fun NativeMenuBarModel.structureKey(): String = buildString {
 }
 
 /** 组合期稳定挂载点：同一 slot 重复 ensure 不会打乱顺序。 */
-private class MenuSlot(var node: NativeMenuNode)
+internal class MenuSlot(var node: NativeMenuNode)
 
-private class MenuCollector {
+/** MenuBar / Tray 共用：收集 Menu / Item / Separator 树。 */
+internal class MenuCollector {
     private val slots = mutableListOf<MenuSlot>()
 
     fun ensure(slot: MenuSlot) {
@@ -90,9 +91,9 @@ private class MenuCollector {
         slots.mapNotNull { it.node as? NativeMenuNode.Menu }
 }
 
-private val LocalMenuCollector =
+internal val LocalMenuCollector =
     compositionLocalOf<MenuCollector> {
-        error("Menu/Item 只能用在 MenuBar / Menu 内容里")
+        error("Menu/Item 只能用在 MenuBar / Tray / Menu 内容里")
     }
 
 /**

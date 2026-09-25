@@ -62,9 +62,37 @@ class LinuxComposeWindow(
     private var hostEventHandler: ((WaylandEvent) -> Unit)? = null
     private var layerAttached: Boolean = false
     private var destroyed: Boolean = false
+    /** Frame→renderImmediately 嵌套深度；>0 时 detach 推迟 native destroy，避免重入 UAF。 */
+    private var renderDepth: Int = 0
+    private var detachDeferred: Boolean = false
+    private var afterDetach: (() -> Unit)? = null
 
     fun setTitle(title: String) {
         window.setTitle(title)
+    }
+
+    private fun beginHostRender() {
+        renderDepth++
+    }
+
+    private fun endHostRender() {
+        renderDepth--
+        if (renderDepth <= 0) {
+            renderDepth = 0
+            if (detachDeferred) {
+                detachDeferred = false
+                finishDetachFromHost()
+            }
+        }
+    }
+
+    private fun renderFrameGuarded() {
+        beginHostRender()
+        try {
+            layer.renderImmediately()
+        } finally {
+            endHostRender()
+        }
     }
 
     /**
@@ -79,7 +107,7 @@ class LinuxComposeWindow(
         isHostAttached = true
         window.onEvent = { event ->
             when (event.type) {
-                WaylandEventType.Frame -> layer.renderImmediately()
+                WaylandEventType.Frame -> renderFrameGuarded()
                 WaylandEventType.Scale -> {
                     onGeometryHint?.invoke()
                     onEvent(event)
@@ -119,9 +147,27 @@ class LinuxComposeWindow(
         window.onEvent = null
     }
 
-    /** 从共享宿主摘掉并销毁 Wayland surface。 */
-    fun detachFromHost() {
-        if (!isHostAttached && !layerAttached && destroyed) return
+    /**
+     * 从共享宿主摘掉并销毁 Wayland surface。
+     *
+     * @param afterNativeDestroyed 在 layer.detach + native destroy 完成之后调用
+     *（用于 [LinuxComposeApplication.close]；若正处于 Frame 渲染中则推迟到帧结束）。
+     */
+    fun detachFromHost(afterNativeDestroyed: (() -> Unit)? = null) {
+        if (!isHostAttached && !layerAttached && destroyed) {
+            afterNativeDestroyed?.invoke()
+            return
+        }
+        if (detachDeferred) {
+            if (afterNativeDestroyed != null) {
+                val prev = afterDetach
+                afterDetach = {
+                    prev?.invoke()
+                    afterNativeDestroyed()
+                }
+            }
+            return
+        }
         println("composekn: detachFromHost")
         if (isHostAttached) {
             LinuxApplicationHost.unregister(this)
@@ -129,11 +175,25 @@ class LinuxComposeWindow(
         isHostAttached = false
         hostEventHandler = null
         window.onEvent = null
+        afterDetach = afterNativeDestroyed
+        // renderImmediately 内部可能重入 flush Main → exitApplication → 本函数；
+        // 推迟 layer.detach / native destroy / after，等帧结束再拆。
+        if (renderDepth > 0) {
+            detachDeferred = true
+            return
+        }
+        finishDetachFromHost()
+    }
+
+    private fun finishDetachFromHost() {
         if (layerAttached) {
             layer.detach()
             layerAttached = false
         }
         destroyNative()
+        val cb = afterDetach
+        afterDetach = null
+        cb?.invoke()
     }
 
     /**
@@ -154,7 +214,7 @@ class LinuxComposeWindow(
         }
         window.onEvent = { event ->
             when (event.type) {
-                WaylandEventType.Frame -> layer.renderImmediately()
+                WaylandEventType.Frame -> renderFrameGuarded()
                 else -> onEvent(event)
             }
         }

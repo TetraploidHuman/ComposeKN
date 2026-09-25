@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
+
 package main
 
 import androidx.compose.foundation.background
@@ -25,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -36,56 +39,81 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.FileDialog
+import androidx.compose.ui.window.FileDialogFilter
+import androidx.compose.ui.window.FileDialogMode
+import androidx.compose.ui.window.Notification
+import androidx.compose.ui.window.Tray
 import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.isTraySupported
+import androidx.compose.ui.window.rememberNotification
+import androidx.compose.ui.window.rememberTrayState
 import androidx.compose.ui.window.rememberWindowState
 import kotlin.math.roundToInt
-import com.composekn.linux.LinuxComposeWindow
-import com.composekn.linux.drawHelloFrame
+import kotlin.system.exitProcess
 import com.composekn.linux.registerComposeKnLinuxBackend
+import kotlinx.coroutines.delay
+import org.jetbrains.skiko.ComposeKNFileDialog
+import org.jetbrains.skiko.ComposeKNTray
 import org.jetbrains.skiko.initLinuxMainThread
+import platform.posix.getenv
+import kotlinx.cinterop.toKString
 
 private const val SKIA_ONLY_TEST = false
 
-fun main() {
+fun main(args: Array<String>) {
     initLinuxMainThread()
     if (SKIA_ONLY_TEST) {
-        LinuxComposeWindow("ComposeKN Skia Test").runSkiaOnly(::drawHelloFrame)
         return
     }
 
+    val selftest = resolveSelfTest(args)
     registerComposeKnLinuxBackend()
 
+    if (selftest) {
+        runLinuxSelfTest()
+        return
+    }
+
     application {
-        val state = rememberWindowState(size = DpSize(960.dp, 640.dp))
+        val trayState = rememberTrayState()
+        val notifyInfo = rememberNotification(
+            "ComposeKN",
+            "Linux tray notification (Info)",
+            Notification.Type.Info,
+        )
+        var openSecond by remember { mutableStateOf(false) }
+        var openFileDialog by remember { mutableStateOf(false) }
+        var fileResult by remember { mutableStateOf("(none)") }
+        val mainState = rememberWindowState(size = DpSize(960.dp, 720.dp))
+
+        if (isTraySupported) {
+            Tray(
+                icon = ColorPainter(Color(0xFF1B6AC9)),
+                state = trayState,
+                tooltip = "ComposeKN Wayland Demo",
+                onAction = { println("composekn: tray onAction") },
+            ) {
+                Item("Notify Info") { trayState.sendNotification(notifyInfo) }
+                Separator()
+                Item("Exit") { exitApplication() }
+            }
+        }
+
         Window(
             onCloseRequest = ::exitApplication,
-            state = state,
+            state = mainState,
             title = "ComposeKN Wayland Demo",
         ) {
             MaterialTheme {
-                Surface(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            awaitPointerEventScope {
-                                while (true) {
-                                    val e = awaitPointerEvent()
-                                    for (c in e.changes) {
-                                        println(
-                                            "composekn: pointer ev=${e.type} src=${c.type} " +
-                                                "pos=(${c.position.x.roundToInt()},${c.position.y.roundToInt()}) " +
-                                                "pressed=${c.pressed}",
-                                        )
-                                    }
-                                }
-                            }
-                        },
-                ) {
+                Surface(modifier = Modifier.fillMaxSize()) {
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
@@ -97,10 +125,44 @@ fun main() {
                             style = MaterialTheme.typography.titleLarge,
                         )
                         Text(
-                            "Feature showcase: input + interaction. Scroll to see all. Esc = Back.",
-                            style = MaterialTheme.typography.bodyMedium,
+                            "tray=${ComposeKNTray.available()} fileDialog=${ComposeKNFileDialog.available()} " +
+                                "placement=${mainState.placement}",
+                            style = MaterialTheme.typography.bodySmall,
                             color = Color.Gray,
                         )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { openSecond = true }) { Text("第二扇窗") }
+                            Button(onClick = {
+                                mainState.placement =
+                                    if (mainState.placement == WindowPlacement.Fullscreen) {
+                                        WindowPlacement.Floating
+                                    } else {
+                                        WindowPlacement.Fullscreen
+                                    }
+                            }) {
+                                Text(
+                                    if (mainState.placement == WindowPlacement.Fullscreen) {
+                                        "退出全屏"
+                                    } else {
+                                        "全屏"
+                                    },
+                                )
+                            }
+                            Button(onClick = {
+                                mainState.placement = WindowPlacement.Maximized
+                            }) { Text("最大化") }
+                            Button(onClick = {
+                                mainState.placement = WindowPlacement.Floating
+                            }) { Text("还原") }
+                            Button(onClick = { openFileDialog = true }) { Text("打开文件…") }
+                            if (isTraySupported) {
+                                Button(onClick = {
+                                    trayState.sendNotification(notifyInfo)
+                                }) { Text("托盘通知") }
+                            }
+                        }
+                        Text("FileDialog: $fileResult", style = MaterialTheme.typography.bodySmall)
 
                         Column(
                             modifier = Modifier
@@ -110,118 +172,49 @@ fun main() {
                                 .padding(top = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(16.dp),
                         ) {
-                            Section("1 · Text input（IME 拼音 / 键盘 / 剪贴板 Ctrl+C/V/X）") {
-                                var text by remember { mutableStateOf("Type here — try pinyin: nihao") }
-                                OutlinedTextField(
-                                    value = text,
-                                    onValueChange = { text = it },
-                                    label = { Text("Text input") },
-                                    modifier = Modifier.fillMaxWidth(),
-                                )
-                            }
+                            ShowcaseSections()
+                        }
+                    }
+                }
+            }
 
-                            Section("2 · Button（鼠标点击计数）") {
-                                var clicks by remember { mutableIntStateOf(0) }
-                                Button(
-                                    onClick = { clicks++ },
-                                    modifier = Modifier.fillMaxWidth(),
-                                ) {
-                                    Text("Clicked $clicks time${if (clicks == 1) "" else "s"}")
-                                }
-                            }
+            if (openFileDialog) {
+                FileDialog(
+                    onCloseRequest = { paths ->
+                        openFileDialog = false
+                        fileResult = if (paths.isEmpty()) "(cancelled)" else paths.joinToString()
+                        println("composekn: filedialog -> $fileResult")
+                    },
+                    mode = FileDialogMode.Load,
+                    title = "Open file",
+                    filters = listOf(
+                        FileDialogFilter("Text", listOf("txt", "md", "kt")),
+                        FileDialogFilter("All", listOf("*.*")),
+                    ),
+                )
+            }
+        }
 
-                            Section("3 · Hover（鼠标悬停变色）") {
-                                val interactionSource = remember { MutableInteractionSource() }
-                                val isHovered by interactionSource.collectIsHoveredAsState()
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(64.dp)
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .background(if (isHovered) Color(0xFF1565C0) else Color(0xFF455A64))
-                                        .border(1.dp, Color.White.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-                                        .hoverable(interactionSource),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Text(
-                                        if (isHovered) "Hovered!" else "Move mouse over me",
-                                        color = Color.White,
-                                    )
-                                }
-                            }
-
-                            Section("4 · Drag（按住拖动方块）") {
-                                var dragOffset by remember { mutableStateOf(Offset.Zero) }
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(120.dp)
-                                        .background(Color(0xFF263238))
-                                        .clip(RoundedCornerShape(8.dp)),
-                                    contentAlignment = Alignment.CenterStart,
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(64.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(Color(0xFFFFB300))
-                                            .offset { IntOffset(dragOffset.x.roundToInt(), dragOffset.y.roundToInt()) }
-                                            .pointerInput(Unit) {
-                                                detectDragGestures { change, dragAmount ->
-                                                    dragOffset += dragAmount
-                                                    change.consume()
-                                                }
-                                            },
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text("⇔", color = Color.Black)
-                                    }
-                                }
-                            }
-
-                            Section("5 · Switch / Checkbox（开关与复选）") {
-                                var on by remember { mutableStateOf(true) }
-                                var checked by remember { mutableStateOf(false) }
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Switch(checked = on, onCheckedChange = { on = it })
-                                    Text(if (on) "Switch ON" else "Switch OFF", modifier = Modifier.padding(start = 8.dp))
-                                }
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Checkbox(checked = checked, onCheckedChange = { checked = it })
-                                    Text("Checkbox ${if (checked) "checked" else "unchecked"}")
-                                }
-                            }
-
-                            Section("6 · Scroll（下方 60 项，验证滚轮/滚动）") {
-                                Column(
-                                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                                ) {
-                                    for (i in 1..60) {
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .background(if (i % 2 == 0) Color(0xFF37474F) else Color(0xFF263238))
-                                                .padding(horizontal = 12.dp, vertical = 6.dp),
-                                        ) {
-                                            Text(
-                                                "Item $i of 60",
-                                                modifier = Modifier.weight(1f),
-                                                color = Color.White,
-                                            )
-                                            Text(
-                                                "#$i",
-                                                color = Color.LightGray,
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
+        // Shared wl_display is on: second window aliases g_shared (refcount++), no
+        // second wl_display_connect; closing it must leave the main window's seat/EGL alive.
+        if (openSecond) {
+            Window(
+                onCloseRequest = { openSecond = false },
+                state = rememberWindowState(size = DpSize(420.dp, 280.dp)),
+                title = "ComposeKN · 第二扇窗",
+            ) {
+                MaterialTheme {
+                    Surface(Modifier.fillMaxSize()) {
+                        Column(
+                            Modifier.padding(20.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Text("第二扇窗", style = MaterialTheme.typography.titleLarge)
                             Text(
-                                "— end of showcase —",
-                                color = Color.Gray,
-                                modifier = Modifier.padding(vertical = 8.dp),
+                                "共享 wl_display 已启用：与主窗同一连接/seat/EGLDisplay；关本窗不应拆主窗。",
+                                style = MaterialTheme.typography.bodyMedium,
                             )
+                            Button(onClick = { openSecond = false }) { Text("关闭") }
                         }
                     }
                 }
@@ -230,7 +223,159 @@ fun main() {
     }
 }
 
-/** 一个小节：标题 + 内容块。 */
+/**
+ * 无交互自检：断言 tray/filedialog available、短暂挂 application 后正常退出。
+ * 用法：`--selftest` 或 `COMPOSEKN_SELFTEST=1`
+ */
+private fun runLinuxSelfTest() {
+    println("SELFTEST: linux start")
+    val trayOk = ComposeKNTray.available()
+    val fdOk = ComposeKNFileDialog.available()
+    println("SELFTEST: tray.available=$trayOk filedialog.available=$fdOk")
+    // portal / SNI 在无桌面会话时可能 false；有 wayland 会话时期望至少能连 display。
+    var frames = 0
+    var failed = false
+    var dualOk = false
+    application(exitProcessOnExit = false) {
+        val state = rememberWindowState(size = DpSize(640.dp, 400.dp))
+        var openSecond by remember { mutableStateOf(false) }
+        Window(
+            onCloseRequest = ::exitApplication,
+            state = state,
+            title = "ComposeKN Linux SelfTest",
+        ) {
+            LaunchedEffect(Unit) {
+                try {
+                    delay(400)
+                    state.placement = WindowPlacement.Maximized
+                    delay(200)
+                    state.placement = WindowPlacement.Floating
+                    delay(100)
+                    openSecond = true
+                    delay(400)
+                    openSecond = false
+                    delay(200)
+                    frames = 1
+                    dualOk = true
+                    println("SELFTEST: placement+dual-window ok")
+                } catch (t: Throwable) {
+                    failed = true
+                    println("SELFTEST: FAIL ${t.message}")
+                } finally {
+                    exitApplication()
+                }
+            }
+            Text("selftest…")
+        }
+        if (openSecond) {
+            Window(
+                onCloseRequest = { openSecond = false },
+                state = rememberWindowState(size = DpSize(320.dp, 240.dp)),
+                title = "SelfTest · 2",
+            ) {
+                Text("second")
+            }
+        }
+    }
+    val pass = !failed && frames > 0 && dualOk && trayOk && fdOk
+    println("SELFTEST: ${if (pass) "PASS" else "FAIL"} tray=$trayOk filedialog=$fdOk dual=$dualOk")
+    exitProcess(if (pass) 0 else 1)
+}
+
+private fun resolveSelfTest(args: Array<String>): Boolean {
+    if (args.any { it == "--selftest" || it.startsWith("--selftest=") }) return true
+    val env = getenv("COMPOSEKN_SELFTEST")?.toKString()?.trim()
+    return !(env.isNullOrEmpty() || env == "0")
+}
+
+@androidx.compose.runtime.Composable
+private fun ShowcaseSections() {
+    Section("1 · Text input") {
+        var text by remember { mutableStateOf("Type here — try pinyin") }
+        OutlinedTextField(
+            value = text,
+            onValueChange = { text = it },
+            label = { Text("Text input") },
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+    Section("2 · Button") {
+        var clicks by remember { mutableIntStateOf(0) }
+        Button(onClick = { clicks++ }, modifier = Modifier.fillMaxWidth()) {
+            Text("Clicked $clicks")
+        }
+    }
+    Section("3 · Hover") {
+        val interactionSource = remember { MutableInteractionSource() }
+        val isHovered by interactionSource.collectIsHoveredAsState()
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(if (isHovered) Color(0xFF1565C0) else Color(0xFF455A64))
+                .border(1.dp, Color.White.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                .hoverable(interactionSource),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(if (isHovered) "Hovered!" else "Move mouse over me", color = Color.White)
+        }
+    }
+    Section("4 · Drag") {
+        var dragOffset by remember { mutableStateOf(Offset.Zero) }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(120.dp)
+                .background(Color(0xFF263238)),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0xFFFFB300))
+                    .offset { IntOffset(dragOffset.x.roundToInt(), dragOffset.y.roundToInt()) }
+                    .pointerInput(Unit) {
+                        detectDragGestures { change, dragAmount ->
+                            dragOffset += dragAmount
+                            change.consume()
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("⇔", color = Color.Black)
+            }
+        }
+    }
+    Section("5 · Switch / Checkbox") {
+        var on by remember { mutableStateOf(true) }
+        var checked by remember { mutableStateOf(false) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(checked = on, onCheckedChange = { on = it })
+            Text(if (on) "ON" else "OFF", modifier = Modifier.padding(start = 8.dp))
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(checked = checked, onCheckedChange = { checked = it })
+            Text(if (checked) "checked" else "unchecked")
+        }
+    }
+    Section("6 · Scroll") {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            for (i in 1..40) {
+                Text(
+                    "Item $i",
+                    color = Color.White,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(if (i % 2 == 0) Color(0xFF37474F) else Color(0xFF263238))
+                        .padding(8.dp),
+                )
+            }
+        }
+    }
+}
+
 @androidx.compose.runtime.Composable
 private fun Section(title: String, content: @androidx.compose.runtime.Composable () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {

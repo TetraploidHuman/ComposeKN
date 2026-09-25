@@ -3,7 +3,7 @@
  *
  * 系统文件对话框（打开 / 保存）。
  * Windows：comdlg32 GetOpenFileNameW / GetSaveFileNameW（Wine 友好）。
- * Linux：skiko stub（取消 → 空列表）；后续可接 xdg-desktop-portal。
+ * Linux：xdg-desktop-portal FileChooser（libdbus）。
  */
 
 package androidx.compose.ui.window

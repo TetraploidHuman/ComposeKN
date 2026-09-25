@@ -87,6 +87,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.FileDialog
 import androidx.compose.ui.window.FileDialogFilter
 import androidx.compose.ui.window.FileDialogMode
+import androidx.compose.ui.window.Notification
+import androidx.compose.ui.window.TrayState
+import androidx.compose.ui.window.rememberNotification
 import com.composekn.windows.TaskbarProgressState
 import com.composekn.windows.WindowsComposeWindow
 import kotlin.concurrent.Volatile
@@ -97,6 +100,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import com.composekn.windows.internal.winlog
 import androidx.compose.runtime.withFrameNanos
 import org.jetbrains.skiko.ComposeKNFileDialog
+import org.jetbrains.skiko.ComposeKNTray
 
 /**
  * 组件画廊的「观测点」。
@@ -145,6 +149,9 @@ class GalleryProbe {
 
     /** 原生 MenuBar 最近一次点选（File/Edit 探针）。 */
     var menuAction by mutableStateOf("(none)")
+
+    /** 托盘最近一次动作（双击 / 菜单项）。 */
+    var trayAction by mutableStateOf("(none)")
 
     /**
      * 「重组到底发生在哪个作用域」的诊断计数（性能日志用）。
@@ -225,6 +232,9 @@ fun ComponentGallery(
     onOpenSecondWindow: (() -> Unit)? = null,
     /** 打开 DialogWindow（软模态对话框）。 */
     onOpenDialogWindow: (() -> Unit)? = null,
+    /** application 层 Tray 的状态（画廊按钮发通知）。 */
+    trayState: TrayState? = null,
+    traySupported: Boolean = false,
 ) {
     probe.galleryComposes++
     MaterialTheme(
@@ -273,7 +283,16 @@ fun ComponentGallery(
 
             LazyColumn(state = outerState, modifier = Modifier.fillMaxSize()) {
                 item { DiagnosticsHud(probe, window) }
-                gallerySections(probe, animate, innerState, window, onOpenSecondWindow, onOpenDialogWindow)
+                gallerySections(
+                    probe,
+                    animate,
+                    innerState,
+                    window,
+                    onOpenSecondWindow,
+                    onOpenDialogWindow,
+                    trayState,
+                    traySupported,
+                )
                 item { Spacer(Modifier.height(24.dp)) }
             }
         }
@@ -317,6 +336,8 @@ private fun LazyListScope.gallerySections(
     window: WindowsComposeWindow,
     onOpenSecondWindow: (() -> Unit)?,
     onOpenDialogWindow: (() -> Unit)?,
+    trayState: TrayState?,
+    traySupported: Boolean,
 ) {
     section("按钮 / Buttons") {
         Row(
@@ -390,6 +411,52 @@ private fun LazyListScope.gallerySections(
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.padding(top = 4.dp),
         )
+    }
+
+    section("托盘 / Tray + Notification") {
+        Text(
+            "available=${ComposeKNTray.available()} / isTraySupported=$traySupported。" +
+                "任务栏通知区应有蓝底白圆图标；双击 = onAction，右键 = 菜单。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text(
+            "最近托盘动作：${probe.trayAction}",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+        if (trayState != null && traySupported) {
+            val info = rememberNotification(
+                "ComposeKN",
+                "画廊按钮发出的 Info 通知",
+                Notification.Type.Info,
+            )
+            val err = rememberNotification(
+                "ComposeKN",
+                "画廊按钮发出的 Error 通知",
+                Notification.Type.Error,
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(top = 8.dp),
+            ) {
+                Button(onClick = {
+                    probe.trayAction = "gallery-info"
+                    trayState.sendNotification(info)
+                    winlog("tray: gallery sendNotification Info")
+                }) { Text("发 Info 通知") }
+                Button(onClick = {
+                    probe.trayAction = "gallery-error"
+                    trayState.sendNotification(err)
+                    winlog("tray: gallery sendNotification Error")
+                }) { Text("发 Error 通知") }
+            }
+        } else {
+            Text(
+                "当前平台不支持托盘（或未挂 Tray）。",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
     }
 
     section("文本 / Text") {
@@ -1276,7 +1343,7 @@ fun SecondWindowContent(onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "v0.5.33：swapchain INPUT_ATTACHMENT + 关窗先 close 场景",
+                    "v0.5.39：Painter→HICON + Linux SNI/FileDialog/Fullscreen",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Button(onClick = onClose) {

@@ -643,6 +643,31 @@ int32_t composekn_win32_file_dialog(
     char* buffer,
     int32_t bufferSize);
 
+// ---------------------------------------------------------------------------
+// 系统托盘（Shell_NotifyIcon + 消息窗口 + TrackPopupMenu）
+//
+// 进程单例：同时只挂一个托盘图标（对齐 Compose Desktop Tray 的常见用法）。
+// 回调 kind：0 = 主操作（双击），1 = 菜单命令（arg = 菜单 id）。
+// tray_set_menu 接管传入的 HMENU（popup）所有权；传 null 清除。
+// ---------------------------------------------------------------------------
+
+typedef void (*ComposeKNTrayCallback)(int32_t kind, int32_t arg, void* user);
+
+bool composekn_win32_tray_available(void);
+bool composekn_win32_tray_create(
+    const char* tooltip_utf8, ComposeKNTrayCallback cb, void* user);
+void composekn_win32_tray_set_tooltip(const char* tooltip_utf8);
+void composekn_win32_tray_set_menu(void* hmenu);
+/** type: 0=None 1=Info 2=Warning 3=Error（对齐 Notification.Type 序）。 */
+void composekn_win32_tray_notify(
+    const char* title_utf8, const char* body_utf8, int32_t type);
+void composekn_win32_tray_destroy(void);
+/**
+ * 设置托盘图标（BGRA、自上而下、每像素 4 字节）。
+ * w/h 通常 16；失败时保留原图标。
+ */
+bool composekn_win32_tray_set_icon(int32_t w, int32_t h, const uint8_t* bgra);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

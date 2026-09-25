@@ -2,6 +2,10 @@
 
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
+>
+> **当前平台宿主基线：v0.5.41**（Linux Graphite/Vulkan + 共享 wl_display；
+> Windows Vulkan/Tray 真机绿；见文末「Linux Graphite/Vulkan（v0.5.41）」；
+> 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 
 ## 0. 一句话背景
 
@@ -3711,10 +3715,14 @@ COMPOSEKN_SELFTEST=window   # / all / logic
 #### 已知缺口
 
 * ~~Wayland / linux 尚未登记 `ComposeNativeWindowBackend`~~ → v0.5.26 已登记（见上）。
-* 无 Tray；MenuBar / FileDialog / Aligned 见 v0.5.27。
+* ~~无 Tray~~ → v0.5.38 Tray + Notification（见下）。MenuBar / FileDialog / Aligned 见 v0.5.27。
 * ~~声明式路径下 state→原生窗的双向同步~~ → v0.5.25 已双向。
 * 拖出自定义装饰图 / MOVE 语义未做。
-* Linux：每窗独立 `wl_display`（无共享 display）；`Fullscreen` / always-on-top / setResizable 未接；绝对定位不可用。
+* ~~Linux：每窗独立 `wl_display`~~ → v0.5.40 进程级共享 display（见下）。
+* Linux：绝对定位 / `WindowPosition.Aligned` 仍为 no-op（无通用协议；layer-shell 未接）；
+  always-on-top 无标准 API（仅记账）。
+* ~~Linux Tray：仅 notify-send~~ → v0.5.39 SNI + DBusMenu（无 watcher 时仍可用 notify-send）。
+* ~~Linux FileDialog / Fullscreen / setResizable~~ → v0.5.39。
 
 #### 启动崩溃修复（v0.5.21）
 
@@ -3801,7 +3809,9 @@ Recomposer；自检新增 `application-api/frames`（声明式入口至少 12 �
 * **几何写回**：`consumeResized` / Scale → `onGeometryHint` → `WindowGeometrySnapshot`
 * **定位**：`Absolute` / `Aligned` 均为 no-op（Aligned 打一次日志）；不伪造坐标
 
-仍缺：共享 `wl_display`、Fullscreen、always-on-top、真正 setResizable、绝对/对齐定位。
+~~仍缺：共享 `wl_display`、Fullscreen、always-on-top、真正 setResizable、绝对/对齐定位。~~
+→ Fullscreen / setResizable：v0.5.39；共享 display：v0.5.40。
+仍缺：always-on-top（无标准协议）、Absolute/Aligned 定位。
 
 #### MenuBar / FileDialog / Aligned（v0.5.27，Windows + Linux 对齐续）
 
@@ -3873,4 +3883,142 @@ Wine 上常因 winevulkan 缺 instance procs 回退 GL（日志 `vk: missing ins
 注意：`gn --args="$(tr '\n' ' ' < file)"` 时 **args 文件不能有 `#` 注释行**，
 否则整串被当成一行注释（曾误开默认 dng_sdk）。
 
-后续：Linux/Wayland `VK_KHR_wayland_surface`。
+后续：Linux/Wayland `VK_KHR_wayland_surface` → **v0.5.41 已落地**（见文末）。
+
+#### Graphite / Vulkan 收口（v0.5.34 —— v0.5.37）
+
+真机（Intel Iris Xe）把 v0.5.30 探针跑通后的收口：
+
+1. **Intel swapchain 无 `INPUT_ATTACHMENT`** → Graphite `WrapBackendTexture` 失败。
+   修法：检测 surface usage；缺位则 **offscreen Graphite RT + blit 到 swapchain**
+   （`win32_vulkan.cc`：`useOffscreenBlit`）。日志
+   `vk: surface usage=… lacks INPUT_ATTACHMENT — offscreen+blit` →
+   `vk: Graphite/Vulkan ready`。
+2. **swapchain 尺寸**：勿用 `dp×scale` 推像素（会与 `GetClientRect` 差 1px 循环重建）。
+   一律 `GetClientRect`。
+3. **关窗 AV / `vk_begin_frame null`**：
+   * `detachFromSharedHost`：quiesce → `scene.close()` → `GC.collect()` → 再拆 HWND；
+   * `WindowsRenderLoopRedrawer.update()`：disposed 后跳过 `renderOneFrame`；
+   * 勿在 teardown 里 `setMenuBar(null)` 触发嵌套 DestroyMenu。
+4. **发布**：v0.5.34（offscreen+blit）… v0.5.37（update 跳过 disposed present）均已绿。
+
+#### Tray + Notification（v0.5.38）
+
+对齐 Desktop `Tray` / `TrayState` / `Notification` / `isTraySupported`：
+
+| 平台 | 图标 | 菜单 | 通知 |
+|---|---|---|---|
+| Windows | Shell_NotifyIcon（默认 16×16 蓝底白圆；Painter→HICON 未接） | 右键 TrackPopupMenu（复用 MenuScope） | NIF_INFO 气球 |
+| Linux | stub（无 SNI） | stub | `notify-send`（有则 `isTraySupported=true`） |
+
+* compose-core overlay：`Tray.linux.kt` / `Notification.linux.kt`
+* skiko：`ComposeKNTray.windows.kt` + `win32_tray.cc`；`ComposeKNTray.linux.kt`
+* 画廊 `application { Tray {…} }`；自检 `window/tray-available`
+* Painter 图标、Linux StatusNotifierItem：见 v0.5.39。
+
+#### Tray 尾巴 + Linux Desktop 对齐（v0.5.39）
+
+1. **Painter→图标**：`TrayIconRaster.linux.kt` 光栅化 16×16 BGRA；
+   Windows `composekn_win32_tray_set_icon`；Linux SNI `IconPixmap`。
+2. **Linux SNI**：`linux_tray_sni.cc`（libdbus）+ 极简 DBusMenu；
+   `ComposeKNTray.dispatch()` 挂在 `LinuxApplicationHost` 泵上；通知仍 `notify-send`。
+3. **Linux FileDialog**：`linux_file_dialog.cc` → portal FileChooser；
+   `ComposeKNFileDialog.available()` 探测 `org.freedesktop.portal.Desktop`。
+4. **Wayland 窗口语义**：`xdg_toplevel_set/unset_fullscreen`；
+   `set_resizable(false)` → min=max 当前尺寸（`size_locked` 防 request_size 清约束）；
+   always-on-top 仍无标准协议（仅记账）。
+5. **依赖**：`shell.nix` + `composekn_wayland.def` 加 `dbus` / `-ldbus-1`。
+
+~~共享 `wl_display` 仍为独立大项，本轮未做。~~ → **v0.5.40 已做**（见下）。
+
+#### Linux 共享 wl_display + 退出 UAF + 双窗 GL（v0.5.40）
+
+本机（NixOS + Wayland + llvmpipe）自测绿；Windows 真机日志同步确认
+Vulkan/Tray/关窗仍绿（Iris Xe，`offscreen+blit`，关窗 ~66ms）。
+
+##### 1. 退出段错误（selftest SIGSEGV）
+
+根因：`Frame` → `renderImmediately` 内部 flush Main → `exitApplication` →
+`detachFromHost` 立刻 `layer.detach` / `delete` 窗口，随后同一栈上
+`composekn_flush_deferred_frame` / `wl_surface_frame` 踩野指针。
+
+修法：
+* `LinuxComposeWindow`：`renderDepth` + 推迟 `finishDetachFromHost`（含 `close()`）；
+* C：`g_live_windows[]` 固定表，`resolve_window` 拒绝已 destroy 指针
+  （**勿用** `unordered_set`：会拉 `std::__throw_bad_array_new_length`，konan ld.lld 链不上）；
+* `LinuxWaylandOpenGLRedrawer.renderImmediately`：dispose 后各阶段早退。
+
+##### 2. Tray `available()`（nix PATH）
+
+`composekn_linux_tray_available`：无 SNI watcher 时除硬编码路径外再扫 `PATH`
+找 `notify-send`。selftest：`tray.available=true`。
+
+##### 3. 共享 `wl_display`
+
+* `ComposeKNSharedDisplay g_shared`：一条 display/registry/compositor/xdg_wm_base/seat/
+  managers/data_device/text_input + **refcount**；
+* 每窗：`wl_surface` / xdg_* / 事件队列 / `wl_egl_window` + `EGLSurface`；
+* `g_surface_map[]`：pointer/keyboard/touch enter 按 surface 路由；
+* 销毁：只拆窗级对象；refcount→0 才 `wl_seat_destroy` / `eglTerminate` / disconnect；
+* Host：`composekn_display_begin_poll_cycle()` 后首窗 `prepare_read`，其余窗只
+  `dispatch_pending` + drain。
+
+##### 4. 双窗共用 GL（llvmpipe 必修）
+
+共享 `EGLDisplay` 后若每窗独立 `EGLContext` + 独立 `GrDirectContext`，
+flush 时在 `llvmpipe_resource_data` SIGSEGV。
+
+修法（单线程 Host 模型，**不同于** Win32「每窗独立 HGLRC」）：
+* C：`g_shared.egl_context` 一份；窗只持有 surface；
+* Kotlin：`LinuxSharedGpuContext` 引用计数一份 `DirectContext`；
+* `LinuxWaylandOpenGLContextHandler.initCanvas`：**每帧**按当前 makeCurrent 的
+  默认 FBO 重绑 BackendRT（切 surface 后 FB 会变）。
+
+##### 5. Demo / 自检
+
+* `wayland-demo`：Tray / FileDialog / Fullscreen / 第二扇窗；
+* `COMPOSEKN_SELFTEST=1` / `--selftest`：`exitProcessOnExit=false`，断言
+  tray+filedialog+placement+双窗，打印 `SELFTEST: PASS … dual=true`。
+
+```bash
+# Linux
+nix-shell ./shell.nix --run './scripts/link-wayland-demo.sh'
+WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
+  nix-shell ./shell.nix --run \
+  './samples/wayland-demo/build/bin/linuxX64/releaseExecutable/wayland-demo.kexe'
+
+# Windows（已有产物）
+COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
+```
+
+##### 已知仍缺（v0.5.40 后）
+
+* 拖出自定义装饰图 / CSD MOVE 语义（Win/Linux）
+* Wayland Absolute / Aligned 定位；always-on-top
+* CI 自动跑 Linux `--selftest`
+* Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
+
+#### Linux Graphite / Vulkan（v0.5.41）
+
+对齐 Windows：Linux 默认 **Graphite + Vulkan**，失败回退 GLES（Ganesh）。
+
+1. **桥** ✅ — `wayland_vulkan.cc`：`dlopen(libvulkan.so.1)`、
+   `VK_KHR_wayland_surface` / swapchain、Graphite `ContextFactory::MakeVulkan`、
+   begin/end_frame；缺 `INPUT_ATTACHMENT` 时同 Win 走 offscreen+blit。
+2. **Skiko** ✅ — `LinuxWaylandVulkanRedrawer`；`SkiaLayer.linux` 默认
+   `GraphicsApi.VULKAN` → GLES；`COMPOSEKN_RENDER_API=vulkan|gl` 可强制。
+3. **构建** ✅ — Linux Skia 链 `skia_graphite_ext` + `SK_VULKAN`/`SK_GRAPHITE`；
+   `shell.nix` 带 `vulkan-loader` / headers，默认
+   `VK_ICD_FILENAMES=${mesa}/…/lvp_icd.x86_64.json`（与 `LIBGL_ALWAYS_SOFTWARE` 配套）。
+   **切勿**把 ICD 设成含未展开 `*` 的路径（loader → `Found no drivers` /
+   `CreateInstance=-9`）。真机 GPU：`COMPOSEKN_VK_HARDWARE=1 nix-shell …`。
+4. **FRAME 门闩** ✅ — `composekn_flush_deferred_frame` 原先只认 `egl_ready`，
+   Vulkan 跳过 EGL 后永远发不出 `wl_surface_frame` → FrameRecomposer 卡在
+   `withFrameNanos` → `exitApplication` 挂死。现：`egl_ready || prefer_vulkan`；
+   present 后再 `requestFrame`（对齐 GLES `swap_buffers`）。
+5. **自检绿**（本机）：
+   * lavapipe：`vk: device=llvmpipe …` → `Graphite/Vulkan ready` → 双窗 →
+     `SELFTEST: PASS`；
+   * RADV BONAIRE：同上；
+   * `COMPOSEKN_RENDER_API=gl`：GLES 路径仍 PASS。
+

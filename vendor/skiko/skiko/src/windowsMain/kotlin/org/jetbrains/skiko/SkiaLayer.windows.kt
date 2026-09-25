@@ -96,6 +96,15 @@ actual open class SkiaLayer {
         picture = null
     }
 
+    /**
+     * 停渲染 tick，保留 GPU 后端（关窗时先 [quiesce] → scene.close → [detach]）。
+     */
+    fun quiesceRedrawer() {
+        (redrawer as? WindowsRenderLoopRedrawer)?.quiesce()
+        setRenderRequestHandler(null)
+        picture = null
+    }
+
     actual fun needRender(throttledToVsync: Boolean) {
         redrawer?.needRender(throttledToVsync)
     }

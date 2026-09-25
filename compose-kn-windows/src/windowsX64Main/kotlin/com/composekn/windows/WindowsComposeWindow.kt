@@ -261,6 +261,7 @@ class WindowsComposeWindow(
      * 共享泵的一帧渲染 tick（按需 + 帧节流 + 最小化跳过）。
      */
     internal fun tickRenderForHost(nowNanos: Long): HostRenderTick {
+        if (!isHostAttached) return HostRenderTick.Idle
         val win = win32Window ?: return HostRenderTick.Idle
         val nextMax = win.isMaximized
         val nextMin = win.isMinimized
@@ -280,6 +281,8 @@ class WindowsComposeWindow(
         if (!layer.renderIfRequested()) {
             return HostRenderTick.Wait(hostNextFrameNanos)
         }
+        // render 期间可能同步关窗（update→dispose）；拆掉后不要推进帧计数。
+        if (!isHostAttached || win32Window == null) return HostRenderTick.Idle
         val after = currentNanoTime()
         val interval = frameIntervalNanos(win)
         hostNextFrameNanos = maxOf(hostNextFrameNanos + interval, after)
@@ -301,18 +304,32 @@ class WindowsComposeWindow(
         win32Window?.waitMessage(timeoutMillis) ?: false
 
     /**
+     * 关场景前停宿主调度：unregister + 摘 render tick，**保留** GPU 后端。
+     * 与 [detachFromHost] 配对（见 [WindowsComposeApplication.detachFromSharedHost]）。
+     */
+    fun prepareDetachFromHost() {
+        if (!isHostAttached) return
+        WindowsApplicationHost.unregister(this)
+        isHostAttached = false
+        hostEventHandler = null
+        layer.quiesceRedrawer()
+        win32Log("prepareDetachFromHost: rendering quiesced (GPU kept)")
+    }
+
+    /**
      * 从共享宿主摘掉并销毁 HWND（离开 composition / 会话收尾时调用）。
      */
     fun detachFromHost() {
         if (!isHostAttached && win32Window == null) return
         win32Log("detachFromHost: frames=$hostFrames")
-        // 先摘 redrawer（去掉 WM_SIZE render tick），再 Hide：否则 Hide→WM_SIZE
-        // 会在即将销毁的场景上同步再绘一帧。
         val t0 = currentNanoTime()
-        WindowsApplicationHost.unregister(this)
-        isHostAttached = false
-        hostEventHandler = null
-        layer.setRenderRequestHandler(null)
+        // prepareDetachFromHost 可能已 unregister；幂等。
+        if (isHostAttached) {
+            WindowsApplicationHost.unregister(this)
+            isHostAttached = false
+            hostEventHandler = null
+            layer.setRenderRequestHandler(null)
+        }
         layer.detach()
         val t1 = currentNanoTime()
         win32Window?.hide()

@@ -1,6 +1,6 @@
 headers = src/linuxMain/cpp/wayland/wayland_bridge.h
 compilerOpts = -Isrc/linuxMain/cpp/wayland
-linkerOpts = -lwayland-client -lwayland-egl -lEGL -lGLESv2 -lxkbcommon -ldl
+linkerOpts = -lwayland-client -lwayland-egl -lEGL -lGLESv2 -lxkbcommon -ldbus-1 -ldl
 
 ---
 typedef struct ComposeKNEvent ComposeKNEvent;

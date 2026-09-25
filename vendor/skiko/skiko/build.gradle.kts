@@ -47,6 +47,7 @@ val coreDependencies: SkikoDependencyScope.() -> Unit = {
             staticSkiaLibs(
                 "skia",
                 "skia_ganesh_ext",
+                "skia_graphite_ext",
                 "svg",
                 "skparagraph",
                 "skshaper",
@@ -94,6 +95,7 @@ val coreDependencies: SkikoDependencyScope.() -> Unit = {
                     "sksg",
                     "skia",
                     "skia_ganesh_ext",
+                    "skia_graphite_ext",
                     "skunicode_core",
                     "skunicode_icu",
                     "skshaper",
@@ -125,7 +127,8 @@ val coreDependencies: SkikoDependencyScope.() -> Unit = {
                     "skunicode_core",
                     "skunicode_icu",
                     "skia",
-                    "skia_ganesh_ext"
+                    "skia_ganesh_ext",
+                    "skia_graphite_ext"
                 )
                 dynamicSystemLibs("fontconfig", "GL", "wayland-client", "wayland-egl", "EGL", "GLESv2", "xkbcommon")
                 arm64 { dynamicSystemLibs("EGL") }

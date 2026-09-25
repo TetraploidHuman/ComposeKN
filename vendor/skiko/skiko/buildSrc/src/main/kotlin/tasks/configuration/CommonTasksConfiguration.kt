@@ -130,7 +130,12 @@ fun skiaPreprocessorFlags(
         )
         OS.Linux -> listOf(
             "-DSK_BUILD_FOR_LINUX",
-            "-D_GLIBCXX_USE_CXX11_ABI=0"
+            "-D_GLIBCXX_USE_CXX11_ABI=0",
+            // JetBrains m150 linux prebuilt 含 Graphite+Vulkan（libskia_graphite_ext.a）。
+            "-DSK_VULKAN",
+            "-DSK_GRAPHITE",
+            "-DSK_USE_INTERNAL_VULKAN_HEADERS",
+            "-DVK_USE_PLATFORM_WAYLAND_KHR",
         )
         OS.Wasm -> listOf(
             "-DSKIKO_WASM",

@@ -25,6 +25,7 @@ import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import org.jetbrains.kotlin.gradle.tasks.CInteropProcess
 import projectDirs
 import runPkgConfig
+import runPkgConfigLinkerOpts
 import registerOrGetSkiaDirProvider
 import registerSkikoTask
 import symbols.HideSkiaSymbolsTask
@@ -203,7 +204,7 @@ fun SkikoProjectContext.compileNativeBridgesTask(
         includeHeadersNonRecursive(skiaHeadersDirs(unpackedSkia))
         if (os == OS.Linux) {
             includeHeadersNonRecursive(projectDir.resolve("src/linuxMain/cpp/wayland"))
-            includeHeadersNonRecursive(runPkgConfig("fontconfig", "wayland-client", "egl", "glesv2", "xkbcommon"))
+            includeHeadersNonRecursive(runPkgConfig("fontconfig", "wayland-client", "egl", "glesv2", "xkbcommon", "dbus-1"))
         }
     }
 }
@@ -220,6 +221,12 @@ private fun resolveWaylandDefFile(project: Project): File {
     val template = project.projectDir.resolve("src/linuxMain/cinterop/composekn_wayland.def")
     val out = project.layout.buildDirectory.file("composekn-wayland/composekn_wayland.def").get().asFile
     out.parentFile.mkdirs()
+    // konanc 的 ld.lld 不认 nix 的 LIBRARY_PATH；把 pkg-config 的 -L/-l 写进 .def。
+    val dbusLibs = try {
+        runPkgConfigLinkerOpts("dbus-1").joinToString(" ")
+    } catch (_: Exception) {
+        "-ldbus-1"
+    }
     out.writeText(
         template.readLines().joinToString("\n") { line ->
             val trimmed = line.trim()
@@ -237,6 +244,13 @@ private fun resolveWaylandDefFile(project: Project): File {
                                 opt
                             }
                         }
+                trimmed.startsWith("linkerOpts = ") -> {
+                    val base = trimmed.removePrefix("linkerOpts = ").trim()
+                        // 模板里的裸 -ldbus-1 换成带 -L 的 pkg-config 结果，避免重复。
+                        .replace(Regex("""(^|\s)-ldbus-1(\s|$)"""), " ")
+                        .trim()
+                    "linkerOpts = $base $dbusLibs".trim()
+                }
                 else -> line
             }
         } + "\n"
@@ -381,6 +395,12 @@ fun SkikoProjectContext.configureNativeTarget(os: OS, arch: Arch, target: Kotlin
                 "-L/usr/lib64",
                 "-L/usr/lib/${if (arch == Arch.Arm64) "aarch64" else "x86_64"}-linux-gnu",
             )
+            // dbus：最终 kexe 链接也需要 -L（nix store）；cinterop .def 已写一份，这里再加防漏。
+            try {
+                options.addAll(runPkgConfigLinkerOpts("dbus-1"))
+            } catch (_: Exception) {
+                options.add("-ldbus-1")
+            }
             options.addAll(resolvedBinaryInputs.directStaticArchivePaths)
             options.addAll(resolvedBinaryInputs.dynamicLibNames.map { "-l$it" })
             options.addAll(resolvedBinaryInputs.linkFlags)
