@@ -408,6 +408,8 @@ class WindowsComposeWindow(
                         else -> onEvent(event)
                     }
                 }
+                // 指针派发结束后再跑排队的 DoDragDrop（勿在 handleEvent 栈里嵌套 OLE）。
+                WindowsDragAndDropManager.flushPendingOutgoingDrags()
                 // 事件处理可能在 UI 队列里排了新任务（输入 -> 状态变更 -> 重组）
                 flushMainUIDispatcher()
                 if (!running || win32Window == null) break

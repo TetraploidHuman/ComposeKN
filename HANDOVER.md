@@ -3,14 +3,13 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.50**（嵌套模态 / Wayland grab 卡住 Press 扫除；
-> DoDragDrop·FileDialog·beginMove/Resize 合成 UP；Wayland `set_parent`；
-> CSD `WindowDraggableArea`；compose-core `v1.12.1`；共享 VkDevice；见文末；
+> **当前平台宿主基线：v0.5.51**（DoDragDrop：清 Escape 残留 + 推迟到派发后；
+> 嵌套模态合成 UP；Wayland grab；compose-core `v1.12.1`；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 > **compose-core 源码基线：`v1.12.1`**（见 `vendor/compose-core.local/VERSIONS`；
 > Maven `compose_deps` 仍为 `1.11.1`）。
-> **本轮已补**：Win DoDragDrop/FileDialog + Linux beginMove/beginResize/portal
-> FileDialog 合成左键 UP，避免下一次要点两次。
+> **本轮已补**：发出侧 DnD 不再在 Compose 指针栈里同步 `DoDragDrop`（IME Escape /
+> 空 keyState 会立刻 CANCEL）；队列清 Escape + QueryContinueDrag 异步交叉验证。
 
 ## 0. 一句话背景
 
@@ -3999,7 +3998,7 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.50 后）
+##### 已知仍缺（v0.5.51 后）
 
 * ~~CSD MOVE / `WindowDraggableArea`~~ → `ComposeNativeWindowHandle.beginMove` +
   foundation `WindowDraggableArea.linux.kt`（Win/Linux）；画廊「无边框窗」；
@@ -4007,8 +4006,8 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 * ~~Win beginMove 卡按下~~ → v0.5.49：`WM_NCLBUTTONUP` 后合成 client 左键 UP
 * ~~嵌套模态 / 交互式 grab 卡 Press（Win+Linux）~~ → v0.5.50：DoDragDrop / FileDialog /
   Wayland `beginMove`+`beginResize`+portal FileDialog：统一合成左键 UP
-  （`composekn_win32_synth_left_up_if_released` /
-  `composekn_window_synth_left_up_if_pressed`）
+* ~~DoDragDrop 立刻 CANCEL（v0.5.50 回归）~~ → v0.5.51：派发后再 `DoDragDrop`；
+  进 OLE 前清 Escape 残留；`QueryContinueDrag` 用 `GetAsyncKeyState` 交叉验证
 * 自定义装饰图拖出（仍未做）；Linux 尚无发出侧 DnD（`wl_data_source` start_drag）
 * ~~Wayland PlatformDefault / Aligned~~ → `xdg_toplevel_set_parent`（transient 提示）；
   Absolute / always-on-top 仍无标准协议（诚实 no-op / 记账）
@@ -4022,6 +4021,19 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 * ~~Windows `PlatformDefault` / 跨 DPI cascade~~ → v0.5.43–45；
   ~~Dialog `Aligned(Center)` 总回主屏~~ → v0.5.46
 * ~~上游 Compose 再同步~~ → `v1.12.1`（`compose-core.local/VERSIONS`；linux 编译绿）
+
+#### DoDragDrop 立刻 CANCEL 修复（v0.5.51）
+
+v0.5.50 合成 UP 让每次手势都能进 `DoDragDrop`，暴露了潜伏问题：在 Compose
+指针派发栈里同步跑 OLE 嵌套泵时，线程队列里常有 IME 收起注入的 Escape，或首帧
+`keyState` 无 `MK_LBUTTON` → ~20ms 内 `DRAGDROP_S_CANCEL` / 误 DROP。
+
+| 改动 | 作用 |
+| --- | --- |
+| `flushPendingOutgoingDrags` | 指针 `drainEvents` 结束后再 `DoDragDrop` |
+| `discardQueuedEscapeKeys` | 进 OLE 前丢掉键盘队列里残留 Escape |
+| `QueryContinueDrag` | `GetAsyncKeyState` 交叉验证；Esc 仅在仍按下或拖放已建立后 CANCEL |
+| 合成 UP（v0.5.50） | 仍保留（结束后清 `primaryPressed`） |
 
 #### 嵌套模态卡住 Press 扫除（v0.5.50）
 

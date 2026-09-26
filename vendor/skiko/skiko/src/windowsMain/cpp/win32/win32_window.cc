@@ -3896,6 +3896,8 @@ private:
 
 class ComposeKNDropSource final : public IDropSource {
 public:
+    ComposeKNDropSource() = default;
+
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (ppv == nullptr) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IDropSource) {
@@ -3916,8 +3918,35 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override {
-        if (escapePressed) return DRAGDROP_S_CANCEL;
-        if ((keyState & MK_LBUTTON) == 0) return DRAGDROP_S_DROP;
+        ++queryCount_;
+        const bool leftAsync = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        const bool leftInState = (keyState & MK_LBUTTON) != 0;
+        const bool leftDown = leftAsync || leftInState;
+        const bool escAsync = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+
+        // OLE often delivers keyState==0 on the first tick while the button is still
+        // down (spurious DROP). IME dismiss can latch escapePressed without Esc still
+        // being down (spurious CANCEL). Cross-check async state; only cancel on Esc
+        // once the drag is established or Esc is physically down.
+        if (queryCount_ <= 8 || (escapePressed && !escAsync) || (!leftInState && leftAsync)) {
+            composeknLog(
+                "drag: QueryContinueDrag #%d esc=%d/%d key=0x%lX left=%d/%d established=%d",
+                queryCount_,
+                escapePressed ? 1 : 0,
+                escAsync ? 1 : 0,
+                static_cast<unsigned long>(keyState),
+                leftInState ? 1 : 0,
+                leftAsync ? 1 : 0,
+                established_ ? 1 : 0);
+        }
+
+        if (!leftDown) {
+            return DRAGDROP_S_DROP;
+        }
+        if (escapePressed && (escAsync || established_)) {
+            return DRAGDROP_S_CANCEL;
+        }
+        established_ = true;
         return S_OK;
     }
 
@@ -3928,7 +3957,31 @@ public:
 private:
     ~ComposeKNDropSource() = default;
     LONG refCount_ = 1;
+    int queryCount_ = 0;
+    bool established_ = false;
 };
+
+/**
+ * Drop Escape key messages still sitting in the thread queue (IME composition
+ * cancel often injects one right before we enter DoDragDrop). Only touches the
+ * keyboard message range so mouse ordering stays intact.
+ */
+static void discardQueuedEscapeKeys() {
+    std::vector<MSG> keep;
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE)) {
+        const bool isEsc =
+            msg.wParam == VK_ESCAPE &&
+            (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP ||
+             msg.message == WM_SYSKEYDOWN || msg.message == WM_SYSKEYUP);
+        if (!isEsc) {
+            keep.push_back(msg);
+        }
+    }
+    for (const MSG& m : keep) {
+        PostMessageW(m.hwnd, m.message, m.wParam, m.lParam);
+    }
+}
 
 extern "C" int32_t composekn_win32_do_drag_drop(
     ComposeKNWin32Window* window,
@@ -3939,6 +3992,10 @@ extern "C" int32_t composekn_win32_do_drag_drop(
     const bool hasFiles = utf8_files != nullptr && utf8_files[0] != '\0';
     const bool hasText = utf8_text != nullptr && utf8_text[0] != '\0';
     if (!hasFiles && !hasText) return -1;
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+        composeknLog("drag: skip DoDragDrop（左键已抬起）");
+        return 0;
+    }
     ComposeKNSourceDataObject* data = new ComposeKNSourceDataObject(
         hasFiles ? utf8_files : nullptr,
         hasText ? utf8_text : nullptr
@@ -3948,6 +4005,10 @@ extern "C" int32_t composekn_win32_do_drag_drop(
     const DWORD allowed = allowed_effects != 0
         ? static_cast<DWORD>(allowed_effects)
         : DROPEFFECT_COPY;
+    // Leave any capture before OLE's nested loop (same idea as beginMove).
+    ReleaseCapture();
+    // Clear IME-dismiss Escape residue so QueryContinueDrag does not CANCEL instantly.
+    discardQueuedEscapeKeys();
     // DoDragDrop runs a nested OLE message loop; the button-up that ends the
     // drag is consumed there, so Compose never sees WM_LBUTTONUP (same class of
     // bug as beginMove / HTCAPTION). Synthesize after return.

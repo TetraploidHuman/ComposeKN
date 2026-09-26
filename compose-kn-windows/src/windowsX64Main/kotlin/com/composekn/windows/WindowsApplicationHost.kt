@@ -298,6 +298,8 @@ object WindowsApplicationHost {
                         // 不让单窗事件异常拆掉整条泵；下一轮继续服务其它窗。
                     }
                 }
+                // 指针派发结束后再跑排队的 DoDragDrop（勿在 handleEvent 栈里嵌套 OLE）。
+                WindowsDragAndDropManager.flushPendingOutgoingDrags()
                 flushMainUIDispatcher()
 
                 var anyPendingRender = false
