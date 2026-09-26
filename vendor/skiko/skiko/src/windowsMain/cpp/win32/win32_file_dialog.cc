@@ -186,7 +186,10 @@ extern "C" int32_t composekn_win32_file_dialog(
         if (allowMultiple) ofn.Flags |= OFN_ALLOWMULTISELECT;
     }
 
+    // comdlg32 runs a nested modal loop; if the opener still held primaryPressed
+    // (or focus churn left Compose thinking so), clear it like beginMove/DoDragDrop.
     const BOOL ok = isSave ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn);
+    composekn_win32_synth_left_up_if_released(owner, "FileDialog");
     if (!ok) {
         const DWORD err = CommDlgExtendedError();
         if (err == 0) {

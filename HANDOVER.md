@@ -3,14 +3,14 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.49**（Wayland `set_parent` 定位对齐；Win beginMove
-> 合成 UP；CSD `WindowDraggableArea`；compose-core `v1.12.1`；共享 VkDevice；
-> Linux Graphite/Vulkan + CI selftest；见文末；
+> **当前平台宿主基线：v0.5.50**（嵌套模态 / Wayland grab 卡住 Press 扫除；
+> DoDragDrop·FileDialog·beginMove/Resize 合成 UP；Wayland `set_parent`；
+> CSD `WindowDraggableArea`；compose-core `v1.12.1`；共享 VkDevice；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 > **compose-core 源码基线：`v1.12.1`**（见 `vendor/compose-core.local/VERSIONS`；
 > Maven `compose_deps` 仍为 `1.11.1`）。
-> **本轮已补**：Wayland PlatformDefault/Aligned → `xdg_toplevel_set_parent`；
-> Win beginMove 后合成左键 UP（避免拖标题后要点两次）。
+> **本轮已补**：Win DoDragDrop/FileDialog + Linux beginMove/beginResize/portal
+> FileDialog 合成左键 UP，避免下一次要点两次。
 
 ## 0. 一句话背景
 
@@ -3999,13 +3999,17 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.49 后）
+##### 已知仍缺（v0.5.50 后）
 
 * ~~CSD MOVE / `WindowDraggableArea`~~ → `ComposeNativeWindowHandle.beginMove` +
   foundation `WindowDraggableArea.linux.kt`（Win/Linux）；画廊「无边框窗」；
   自检 `window/beginMove`
 * ~~Win beginMove 卡按下~~ → v0.5.49：`WM_NCLBUTTONUP` 后合成 client 左键 UP
-* 自定义装饰图拖出（仍未做）
+* ~~嵌套模态 / 交互式 grab 卡 Press（Win+Linux）~~ → v0.5.50：DoDragDrop / FileDialog /
+  Wayland `beginMove`+`beginResize`+portal FileDialog：统一合成左键 UP
+  （`composekn_win32_synth_left_up_if_released` /
+  `composekn_window_synth_left_up_if_pressed`）
+* 自定义装饰图拖出（仍未做）；Linux 尚无发出侧 DnD（`wl_data_source` start_drag）
 * ~~Wayland PlatformDefault / Aligned~~ → `xdg_toplevel_set_parent`（transient 提示）；
   Absolute / always-on-top 仍无标准协议（诚实 no-op / 记账）
 * ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
@@ -4018,6 +4022,23 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 * ~~Windows `PlatformDefault` / 跨 DPI cascade~~ → v0.5.43–45；
   ~~Dialog `Aligned(Center)` 总回主屏~~ → v0.5.46
 * ~~上游 Compose 再同步~~ → `v1.12.1`（`compose-core.local/VERSIONS`；linux 编译绿）
+
+#### 嵌套模态卡住 Press 扫除（v0.5.50）
+
+同一根因：嵌套消息泵 / 合成器 grab 吃掉抬起 → Compose `primaryPressed` 卡住，
+下一次手势只用来清状态。
+
+| 路径 | 平台 | 修法 |
+| --- | --- | --- |
+| `beginMove`（HTCAPTION） | Win | 阻塞返回后 `synth_left_up_if_released`（v0.5.49） |
+| `DoDragDrop` | Win | 同上（v0.5.50） |
+| `GetOpen/SaveFileName` | Win | 同上（v0.5.50） |
+| `xdg_toplevel_move` | Linux | **立即**合成 UP（API 不阻塞；v0.5.50） |
+| `xdg_toplevel_resize` | Linux | 同上 |
+| portal FileChooser | Linux | 阻塞返回后合成 UP |
+
+托盘 `TrackPopupMenu` 走消息专用 HWND，不污染 Compose 客户区按键态，跳过。
+Linux 发出侧 DnD 尚未实现，落地时同样在 `wl_data_device.start_drag` 结束处合成。
 
 #### Wayland 定位对齐 + Win beginMove UP（v0.5.49）
 

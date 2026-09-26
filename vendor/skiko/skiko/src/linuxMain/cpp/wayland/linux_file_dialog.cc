@@ -276,6 +276,9 @@ extern "C" int32_t composekn_linux_file_dialog(
     }
 done:
     dbus_bus_remove_match(c, match.c_str(), nullptr);
+    // Portal wait is a nested block on the UI thread; clear any stuck left Press
+    // (align Win32 FileDialog / beginMove synth UP).
+    composekn_window_synth_left_up_if_pressed(nullptr, "FileDialog");
 
     if (responseCode != 0 || paths.empty()) return 0;
 

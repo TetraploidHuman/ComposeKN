@@ -193,6 +193,13 @@ void composekn_window_begin_move(ComposeKNWindow* window);
 void composekn_window_begin_resize(ComposeKNWindow* window, uint32_t edges);
 
 /**
+ * After interactive move/resize / a nested portal FileDialog, the compositor may
+ * never deliver wl_pointer.button release. Push a synthetic left-up when BTN_LEFT
+ * is still marked down. window=NULL → primary live window.
+ */
+void composekn_window_synth_left_up_if_pressed(ComposeKNWindow* window, const char* reason);
+
+/**
  * xdg_toplevel_set_parent — Dialog / Aligned / PlatformDefault 的可移植提示。
  * parent=NULL 清除 transient 关系。标准 xdg-shell **没有**绝对坐标 API；
  * compositor 通常会把 transient 窗相对 parent 居中或叠放。

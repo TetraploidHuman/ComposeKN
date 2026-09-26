@@ -2190,19 +2190,11 @@ extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
     delete window;
 }
 
-extern "C" void composekn_win32_begin_move(ComposeKNWin32Window* window) {
+extern "C" void composekn_win32_synth_left_up_if_released(
+    ComposeKNWin32Window* window, const char* reason
+) {
     if (window == nullptr || window->hwnd == nullptr) return;
-    ReleaseCapture();
-    // DefWindowProc(HTCAPTION) runs a nested move loop and consumes the button-up as
-    // WM_NCLBUTTONUP — our WM_LBUTTONUP handler never runs. Compose therefore keeps
-    // primaryPressed=true after every title-bar drag (including the restore-from-
-    // maximized drag Windows does on first move). The next client click only clears
-    // that stuck Press; the click after that finally reaches buttons. Synthesize a
-    // client button-up when the native drag ends and the physical button is up.
-    SendMessageW(window->hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
-        return;
-    }
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) return;
     POINT pt{};
     GetCursorPos(&pt);
     ScreenToClient(window->hwnd, &pt);
@@ -2216,9 +2208,19 @@ extern "C" void composekn_win32_begin_move(ComposeKNWin32Window* window) {
     pushEvent(window, e);
     if (window->mouseLogCount < 600) {
         ++window->mouseLogCount;
-        composeknLog("mouse: 左键 UP(synth after beginMove) pos=%ld,%ld",
+        composeknLog("mouse: 左键 UP(synth after %s) pos=%ld,%ld",
+                     reason != nullptr ? reason : "?",
                      static_cast<long>(pt.x), static_cast<long>(pt.y));
     }
+}
+
+extern "C" void composekn_win32_begin_move(ComposeKNWin32Window* window) {
+    if (window == nullptr || window->hwnd == nullptr) return;
+    ReleaseCapture();
+    // DefWindowProc(HTCAPTION) runs a nested move loop and consumes the button-up as
+    // WM_NCLBUTTONUP — our WM_LBUTTONUP handler never runs.
+    SendMessageW(window->hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    composekn_win32_synth_left_up_if_released(window, "beginMove");
 }
 
 extern "C" bool composekn_win32_pump(ComposeKNWin32Window* window) {
@@ -3934,7 +3936,6 @@ extern "C" int32_t composekn_win32_do_drag_drop(
     const char* utf8_text,
     int32_t allowed_effects
 ) {
-    (void)window;
     const bool hasFiles = utf8_files != nullptr && utf8_files[0] != '\0';
     const bool hasText = utf8_text != nullptr && utf8_text[0] != '\0';
     if (!hasFiles && !hasText) return -1;
@@ -3947,9 +3948,13 @@ extern "C" int32_t composekn_win32_do_drag_drop(
     const DWORD allowed = allowed_effects != 0
         ? static_cast<DWORD>(allowed_effects)
         : DROPEFFECT_COPY;
+    // DoDragDrop runs a nested OLE message loop; the button-up that ends the
+    // drag is consumed there, so Compose never sees WM_LBUTTONUP (same class of
+    // bug as beginMove / HTCAPTION). Synthesize after return.
     const HRESULT hr = DoDragDrop(data, source, allowed, &effect);
     source->Release();
     data->Release();
+    composekn_win32_synth_left_up_if_released(window, "DoDragDrop");
     if (hr == DRAGDROP_S_CANCEL) {
         composeknLog("drag: DoDragDrop 取消");
         return 0;

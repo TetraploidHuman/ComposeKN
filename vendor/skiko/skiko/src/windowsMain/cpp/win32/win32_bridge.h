@@ -108,6 +108,15 @@ void composekn_win32_set_render_tick(ComposeKNRenderTickFn fn, void* user);
  */
 void composekn_win32_begin_move(ComposeKNWin32Window* window);
 
+/**
+ * After a nested Win32 modal loop (caption move / DoDragDrop / comdlg32), the
+ * physical button-up may never reach WM_LBUTTONUP. Push a synthetic client
+ * left-up when the physical button is already up so Compose does not keep
+ * primaryPressed stuck. `reason` is for logging only (may be null).
+ */
+void composekn_win32_synth_left_up_if_released(
+    ComposeKNWin32Window* window, const char* reason);
+
 /** Create a top-level Win32 window. Returns NULL on failure. */
 ComposeKNWin32Window* composekn_win32_create(
     const char* title, int width_dp, int height_dp, int undecorated);

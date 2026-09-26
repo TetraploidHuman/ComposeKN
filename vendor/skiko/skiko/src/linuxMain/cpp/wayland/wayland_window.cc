@@ -2554,12 +2554,56 @@ extern "C" void composekn_window_request_size(ComposeKNWindow* window, int w, in
     }
 }
 
+/**
+ * xdg_toplevel_move / _resize hand the pointer grab to the compositor and return
+ * immediately. The button-up that ends the interactive gesture often never
+ * reaches wl_pointer.button — Compose keeps primaryPressed stuck (same class of
+ * bug as Win32 beginMove / DoDragDrop). Synthesize a left release if we still
+ * think BTN_LEFT is down.
+ */
+static void synth_left_button_up_if_pressed(ComposeKNWindow* window, const char* reason) {
+    if (window == nullptr) return;
+    // linux/input-event-codes.h BTN_LEFT = 0x110 = 272; bit index = button - 272.
+    constexpr uint32_t kBtnLeft = 272u;
+    constexpr uint32_t kLeftBit = 1u << 0;
+    if ((window->pointer_buttons & kLeftBit) == 0) return;
+    window->pointer_buttons &= ~kLeftBit;
+    ComposeKNEvent event{};
+    event.type = COMPOSEKN_EVENT_POINTER_BUTTON;
+    event.x = static_cast<float>(window->pointer_x);
+    event.y = static_cast<float>(window->pointer_y);
+    event.button = kBtnLeft;
+    event.state = WL_POINTER_BUTTON_STATE_RELEASED;
+    event.modifiers = window->modifiers;
+    push_event(window, event);
+    std::fprintf(
+        stderr,
+        "composekn: pointer UP(synth after %s) pos=%.1f,%.1f\n",
+        reason != nullptr ? reason : "?",
+        window->pointer_x,
+        window->pointer_y);
+}
+
 extern "C" void composekn_window_begin_move(ComposeKNWindow* window) {
     window = resolve_window(window);
     if (window == nullptr || window->toplevel == nullptr || window->seat == nullptr) {
         return;
     }
     xdg_toplevel_move(window->toplevel, window->seat, window->last_serial);
+    synth_left_button_up_if_pressed(window, "beginMove");
+}
+
+extern "C" void composekn_window_synth_left_up_if_pressed(
+    ComposeKNWindow* window, const char* reason
+) {
+    window = resolve_window(window);
+    if (window == nullptr) {
+        window = g_shared.pointer_focus;
+    }
+    if (window == nullptr) {
+        window = clipboard_target_window();
+    }
+    synth_left_button_up_if_pressed(window, reason);
 }
 
 extern "C" void composekn_window_set_parent(ComposeKNWindow* child, ComposeKNWindow* parent) {
@@ -2612,6 +2656,7 @@ extern "C" void composekn_window_begin_resize(ComposeKNWindow* window, uint32_t 
         return;
     }
     xdg_toplevel_resize(window->toplevel, window->seat, window->last_serial, edges);
+    synth_left_button_up_if_pressed(window, "beginResize");
 }
 
 /* ---- IME (zwp_text_input_v3) ---- */
