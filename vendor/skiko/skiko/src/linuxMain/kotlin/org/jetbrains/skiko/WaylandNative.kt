@@ -31,6 +31,8 @@ enum class WaylandEventType(val nativeValue: Int) {
     TouchDown(9),
     TouchMotion(10),
     TouchUp(11),
+    /** Keyboard focus enter/leave; [WaylandEvent.pressed] = hasFocus. */
+    Focus(12),
 }
 
 data class WaylandEvent(
@@ -166,6 +168,15 @@ internal external fun composekn_window_request_size(window: COpaquePointer, widt
 
 @SymbolName("composekn_window_begin_move")
 internal external fun composekn_window_begin_move(window: COpaquePointer)
+
+@SymbolName("composekn_window_set_parent")
+internal external fun composekn_window_set_parent(child: COpaquePointer, parent: COpaquePointer?)
+
+@SymbolName("composekn_window_set_always_on_top")
+internal external fun composekn_window_set_always_on_top(window: COpaquePointer, onTop: Boolean): Boolean
+
+@SymbolName("composekn_window_always_on_top_supported")
+internal external fun composekn_window_always_on_top_supported(): Boolean
 
 @SymbolName("composekn_window_begin_resize")
 internal external fun composekn_window_begin_resize(window: COpaquePointer, edges: UInt)

@@ -167,6 +167,7 @@ internal fun ComposeScene.dispatchWaylandEvent(
             )
         }
         WaylandEventType.Key -> Unit
+        WaylandEventType.Focus -> Unit
         WaylandEventType.Scale,
         WaylandEventType.Frame -> Unit
     }

@@ -44,6 +44,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogWindow
 import androidx.compose.ui.window.FileDialog
 import androidx.compose.ui.window.FileDialogFilter
 import androidx.compose.ui.window.FileDialogMode
@@ -53,6 +54,7 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.isTraySupported
+import androidx.compose.ui.window.rememberDialogState
 import androidx.compose.ui.window.rememberNotification
 import androidx.compose.ui.window.rememberTrayState
 import androidx.compose.ui.window.rememberWindowState
@@ -90,6 +92,7 @@ fun main(args: Array<String>) {
             Notification.Type.Info,
         )
         var openSecond by remember { mutableStateOf(false) }
+        var openDialog by remember { mutableStateOf(false) }
         var openFileDialog by remember { mutableStateOf(false) }
         var fileResult by remember { mutableStateOf("(none)") }
         val mainState = rememberWindowState(size = DpSize(960.dp, 720.dp))
@@ -133,6 +136,7 @@ fun main(args: Array<String>) {
 
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { openSecond = true }) { Text("第二扇窗") }
+                            Button(onClick = { openDialog = true }) { Text("DialogWindow") }
                             Button(onClick = {
                                 mainState.placement =
                                     if (mainState.placement == WindowPlacement.Fullscreen) {
@@ -211,10 +215,36 @@ fun main(args: Array<String>) {
                         ) {
                             Text("第二扇窗", style = MaterialTheme.typography.titleLarge)
                             Text(
-                                "共享 wl_display 已启用：与主窗同一连接/seat/EGLDisplay；关本窗不应拆主窗。",
+                                "PlatformDefault → xdg_toplevel_set_parent（相对主窗 transient；" +
+                                    "屏幕坐标仍由 compositor 决定）。",
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                             Button(onClick = { openSecond = false }) { Text("关闭") }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (openDialog) {
+            DialogWindow(
+                onCloseRequest = { openDialog = false },
+                state = rememberDialogState(size = DpSize(360.dp, 220.dp)),
+                title = "ComposeKN · DialogWindow",
+            ) {
+                MaterialTheme {
+                    Surface(Modifier.fillMaxSize()) {
+                        Column(
+                            Modifier.padding(20.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Text("DialogWindow", style = MaterialTheme.typography.titleLarge)
+                            Text(
+                                "Aligned(Center) → set_parent；多数 compositor 会相对父窗居中。" +
+                                    "软模态：父窗输入被暂时丢弃。",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Button(onClick = { openDialog = false }) { Text("关闭") }
                         }
                     }
                 }
@@ -236,9 +266,11 @@ private fun runLinuxSelfTest() {
     var frames = 0
     var failed = false
     var dualOk = false
+    var dialogOk = false
     application(exitProcessOnExit = false) {
         val state = rememberWindowState(size = DpSize(640.dp, 400.dp))
         var openSecond by remember { mutableStateOf(false) }
+        var openDialog by remember { mutableStateOf(false) }
         Window(
             onCloseRequest = ::exitApplication,
             state = state,
@@ -258,9 +290,15 @@ private fun runLinuxSelfTest() {
                     delay(400)
                     openSecond = false
                     delay(200)
+                    // DialogWindow：Aligned(Center) → set_parent
+                    openDialog = true
+                    delay(400)
+                    openDialog = false
+                    delay(200)
                     frames = 1
                     dualOk = true
-                    println("SELFTEST: placement+dual-window ok")
+                    dialogOk = true
+                    println("SELFTEST: placement+dual-window+dialog ok")
                 } catch (t: Throwable) {
                     failed = true
                     println("SELFTEST: FAIL ${t.message}")
@@ -279,15 +317,27 @@ private fun runLinuxSelfTest() {
                 Text("second")
             }
         }
+        if (openDialog) {
+            DialogWindow(
+                onCloseRequest = { openDialog = false },
+                state = rememberDialogState(size = DpSize(280.dp, 180.dp)),
+                title = "SelfTest · Dialog",
+            ) {
+                Text("dialog")
+            }
+        }
     }
-    val passCore = !failed && frames > 0 && dualOk
+    val passCore = !failed && frames > 0 && dualOk && dialogOk
     val extrasRequired = selftestExtrasRequired()
     val extrasOk = !extrasRequired || (trayOk && fdOk)
     if (!extrasRequired && !(trayOk && fdOk)) {
         println("SELFTEST: tray/filedialog soft (CI/RELAX) tray=$trayOk filedialog=$fdOk")
     }
     val pass = passCore && extrasOk
-    println("SELFTEST: ${if (pass) "PASS" else "FAIL"} tray=$trayOk filedialog=$fdOk dual=$dualOk")
+    println(
+        "SELFTEST: ${if (pass) "PASS" else "FAIL"} " +
+            "tray=$trayOk filedialog=$fdOk dual=$dualOk dialog=$dialogOk",
+    )
     exitProcess(if (pass) 0 else 1)
 }
 

@@ -24,6 +24,8 @@ typedef enum ComposeKNEventType {
     COMPOSEKN_EVENT_TOUCH_DOWN = 9,
     COMPOSEKN_EVENT_TOUCH_MOTION = 10,
     COMPOSEKN_EVENT_TOUCH_UP = 11,
+    /** Keyboard focus: state=1 enter, state=0 leave (mirrors Win32 FocusEvent). */
+    COMPOSEKN_EVENT_FOCUS = 12,
 } ComposeKNEventType;
 
 /* IME (zwp_text_input_v3) event kinds, delivered via composekn_window_pop_ime_event. */
@@ -189,6 +191,20 @@ void composekn_window_request_size(ComposeKNWindow* window, int w, int h);
 
 void composekn_window_begin_move(ComposeKNWindow* window);
 void composekn_window_begin_resize(ComposeKNWindow* window, uint32_t edges);
+
+/**
+ * xdg_toplevel_set_parent — Dialog / Aligned / PlatformDefault 的可移植提示。
+ * parent=NULL 清除 transient 关系。标准 xdg-shell **没有**绝对坐标 API；
+ * compositor 通常会把 transient 窗相对 parent 居中或叠放。
+ */
+void composekn_window_set_parent(ComposeKNWindow* child, ComposeKNWindow* parent);
+
+/**
+ * Wayland 无标准 always-on-top。返回 false（unsupported）；Kotlin 侧可记账。
+ * 预留入口，避免日后接 compositor 扩展时改 API。
+ */
+bool composekn_window_set_always_on_top(ComposeKNWindow* window, bool on_top);
+bool composekn_window_always_on_top_supported(void);
 
 /* ---- IME (zwp_text_input_v3) ---- */
 

@@ -53,7 +53,8 @@ private object LinuxComposeNativeBackend : ComposeNativeWindowBackend {
             app.composeWindow.isDialogWindow = true
         }
         handle.applyPlacement(params.placement, params.isMinimized)
-        // 先挂宿主；Wayland 无法像 Win32 那样隐藏再 show，创建即可见。
+        // Wayland 无法像 Win32 隐藏再 show；创建即可见。先挂宿主再设 parent，
+        // 让 compositor 尽快拿到 transient 关系（Dialog / cascade / Aligned）。
         app.attachToSharedHost(
             withChrome = params.undecorated,
             onCloseRequest = params.onCloseRequest,
@@ -64,8 +65,16 @@ private object LinuxComposeNativeBackend : ComposeNativeWindowBackend {
         }
         when (val pos = params.position) {
             is WindowPosition.Absolute -> handle.applyPosition(pos)
-            is WindowPosition.Aligned -> handle.applyPosition(pos)
-            WindowPosition.PlatformDefault -> Unit
+            is WindowPosition.Aligned -> {
+                // Dialog 默认 Aligned(Center)：xdg_toplevel_set_parent(锚点)
+                if (!LinuxApplicationHost.placeAligned(app.composeWindow)) {
+                    handle.applyPosition(pos)
+                }
+            }
+            WindowPosition.PlatformDefault -> {
+                // 有锚点 → set_parent（compositor 叠放/居中）；首扇无锚点交给 compositor。
+                LinuxApplicationHost.placeCascaded(app.composeWindow)
+            }
         }
         return handle
     }
@@ -75,7 +84,6 @@ private object LinuxComposeNativeBackend : ComposeNativeWindowBackend {
     }
 
     override fun wakeApplicationPump() {
-        // eventfd wake；失败时共享泵 idleWait ≤2ms
         LinuxApplicationHost.wake()
     }
 }
@@ -92,8 +100,9 @@ class LinuxNativeWindowHandle(
     private var geometryListener: ((WindowGeometrySnapshot) -> Unit)? = null
 
     companion object {
-        /** Aligned 定位限制只打一次日志，避免 resize SideEffect 刷屏。 */
-        private var alignedPositionLogged = false
+        /** Absolute / always-on-top 限制只打一次日志，避免 SideEffect 刷屏。 */
+        private var absolutePositionLogged = false
+        private var alwaysOnTopLogged = false
     }
 
     override fun asPlatformWindow(): Any? = app.composeWindow
@@ -108,8 +117,15 @@ class LinuxNativeWindowHandle(
     }
 
     override fun setAlwaysOnTop(alwaysOnTop: Boolean) {
-        // Wayland 无标准 always-on-top；仅记账。
         app.composeWindow.alwaysOnTop = alwaysOnTop
+        val accepted = app.composeWindow.window.setAlwaysOnTop(alwaysOnTop)
+        if (alwaysOnTop && !accepted && !alwaysOnTopLogged) {
+            alwaysOnTopLogged = true
+            println(
+                "composekn: alwaysOnTop is unsupported on standard xdg-shell " +
+                    "(requested=$alwaysOnTop; flag stored only)",
+            )
+        }
     }
 
     override fun applyPlacement(placement: WindowPlacement, isMinimized: Boolean) {
@@ -132,7 +148,6 @@ class LinuxNativeWindowHandle(
 
     override fun applySize(size: DpSize) {
         if (!size.width.isSpecified || !size.height.isSpecified) return
-        // 经 composekn_window_request_size：min=max + geometry，configure 后清约束
         app.composeWindow.window.requestSize(
             size.width.value.toInt().coerceAtLeast(1),
             size.height.value.toInt().coerceAtLeast(1),
@@ -140,15 +155,23 @@ class LinuxNativeWindowHandle(
     }
 
     override fun applyPosition(position: WindowPosition) {
-        // Wayland 无通用绝对定位；不伪造 Absolute。Aligned 亦无可靠 API（无 layer-shell）。
         when (position) {
-            is WindowPosition.Absolute -> Unit
-            is WindowPosition.Aligned -> {
-                if (!alignedPositionLogged) {
-                    alignedPositionLogged = true
+            is WindowPosition.Absolute -> {
+                // 标准 xdg-shell 无绝对坐标；不伪造 (0,0)。
+                if (!absolutePositionLogged) {
+                    absolutePositionLogged = true
                     println(
-                        "composekn: WindowPosition.Aligned is a no-op on Wayland " +
-                            "(compositor owns placement)",
+                        "composekn: WindowPosition.Absolute is a no-op on Wayland " +
+                            "(compositor owns placement; requested " +
+                            "${position.x.value.toInt()},${position.y.value.toInt()})",
+                    )
+                }
+            }
+            is WindowPosition.Aligned -> {
+                if (!LinuxApplicationHost.placeAligned(app.composeWindow)) {
+                    println(
+                        "composekn: WindowPosition.Aligned has no anchor yet " +
+                            "(will rely on compositor default)",
                     )
                 }
             }
@@ -188,6 +211,7 @@ class LinuxNativeWindowHandle(
             w.window.isMaximized -> WindowPlacement.Maximized
             else -> WindowPlacement.Floating
         }
+        // Wayland 客户端通常拿不到屏幕坐标；保持 Absolute(0,0) 表示 unspecified。
         listener(
             WindowGeometrySnapshot(
                 size = DpSize(width.dp, height.dp),

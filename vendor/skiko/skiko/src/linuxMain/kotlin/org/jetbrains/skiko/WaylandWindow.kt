@@ -146,6 +146,22 @@ class WaylandWindow(
 
     fun beginMove() = composekn_window_begin_move(native)
 
+    /**
+     * `xdg_toplevel_set_parent`：Dialog / Aligned / PlatformDefault 的可移植提示。
+     * [parent]=null 清除 transient。标准协议无绝对坐标。
+     */
+    fun setParent(parent: WaylandWindow?) {
+        composekn_window_set_parent(native, parent?.nativeHandle)
+    }
+
+    /**
+     * Wayland 无标准 always-on-top；返回是否被 compositor 接受（当前恒 false）。
+     */
+    fun setAlwaysOnTop(onTop: Boolean): Boolean =
+        composekn_window_set_always_on_top(native, onTop)
+
+    fun alwaysOnTopSupported(): Boolean = composekn_window_always_on_top_supported()
+
     fun beginResize(edges: UInt) = composekn_window_begin_resize(native, edges)
 
     fun destroy() {

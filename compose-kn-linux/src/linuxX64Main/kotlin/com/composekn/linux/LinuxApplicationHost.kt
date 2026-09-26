@@ -32,6 +32,8 @@ import platform.posix.write
  * - 真正销毁发生在离开 composition / [unregister] 时
  * - 泵在 [shouldContinue] 变 false 时退出
  * - Dialog 软模态：有任一 DialogWindow 时，非对话框丢弃 pointer/key/touch（对齐 Win32 EnableWindow）
+ * - **定位**：标准 xdg-shell 无绝对坐标；[placeCascaded] / [placeAligned] 通过
+ *   `xdg_toplevel_set_parent` 把新窗标成相对锚点的 transient（compositor 通常居中/叠放）
  *
  * 多窗共享同一 `wl_display`（native `ComposeKNSharedDisplay`）；每轮迭代先
  * [composekn_display_begin_poll_cycle]，再逐窗 poll（仅首窗 prepare_read）。
@@ -39,6 +41,14 @@ import platform.posix.write
  */
 object LinuxApplicationHost {
     private val sessions = mutableListOf<LinuxComposeWindow>()
+
+    /** 当前键盘焦点窗（Focus 事件）；IME / 定位锚点优先用它。 */
+    var focusedSession: LinuxComposeWindow? = null
+        private set
+
+    /** 最近活跃窗（焦点或点击）；无焦点时 cascade/align 的锚点。 */
+    var lastActiveSession: LinuxComposeWindow? = null
+        private set
 
     /** eventfd：跨线程 [wake] 写入，空闲 [poll] 可读即醒。失败则退回 usleep。 */
     private val wakeFd: Int = eventfd(0, EFD_CLOEXEC or EFD_NONBLOCK)
@@ -50,6 +60,7 @@ object LinuxApplicationHost {
     fun register(window: LinuxComposeWindow) {
         if (sessions.contains(window)) return
         sessions.add(window)
+        // 不抢 lastActive：否则新窗会把自己当 cascade 锚点（对齐 Windows v0.5.43）。
         refreshWakeHandler()
         refreshDialogModality()
         println("composekn: host register window count=${sessions.size}")
@@ -57,9 +68,62 @@ object LinuxApplicationHost {
 
     fun unregister(window: LinuxComposeWindow) {
         if (!sessions.remove(window)) return
+        if (focusedSession === window) focusedSession = null
+        if (lastActiveSession === window) {
+            lastActiveSession = sessions.lastOrNull()
+        }
         refreshWakeHandler()
         refreshDialogModality()
         println("composekn: host unregister window count=${sessions.size}")
+    }
+
+    fun noteFocus(window: LinuxComposeWindow, hasFocus: Boolean) {
+        if (hasFocus) {
+            focusedSession = window
+            lastActiveSession = window
+        } else if (focusedSession === window) {
+            focusedSession = null
+        }
+    }
+
+    /** 指针按下也记活跃（无键盘焦点时仍能选到 cascade 锚点）。 */
+    fun notePointerActivity(window: LinuxComposeWindow) {
+        lastActiveSession = window
+    }
+
+    /**
+     * Desktop [WindowPosition.PlatformDefault]：相对最近焦点兄弟窗设 transient parent。
+     * 无锚点时返回 false（调用方可不做事，交给 compositor 默认落点）。
+     */
+    fun placeCascaded(window: LinuxComposeWindow): Boolean {
+        val anchor = placementAnchor(window) ?: return false
+        window.window.setParent(anchor.window)
+        println(
+            "composekn: PlatformDefault → set_parent " +
+                "(transient hint; compositor owns screen coords)",
+        )
+        return true
+    }
+
+    /**
+     * [WindowPosition.Aligned]：相对锚点设 transient parent。
+     * Wayland 无法实现完整 Alignment 网格；Center/其它一律走 set_parent。
+     * 无锚点返回 false。
+     */
+    fun placeAligned(window: LinuxComposeWindow): Boolean {
+        val anchor = placementAnchor(window) ?: return false
+        window.window.setParent(anchor.window)
+        println(
+            "composekn: Aligned → set_parent " +
+                "(transient hint; compositor typically centers over parent)",
+        )
+        return true
+    }
+
+    private fun placementAnchor(window: LinuxComposeWindow): LinuxComposeWindow? = when {
+        focusedSession != null && focusedSession !== window -> focusedSession
+        lastActiveSession != null && lastActiveSession !== window -> lastActiveSession
+        else -> sessions.lastOrNull { it !== window }
     }
 
     /**

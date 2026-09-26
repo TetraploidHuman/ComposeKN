@@ -1173,6 +1173,10 @@ static void keyboard_enter(
     if (window->keymap == nullptr) {
         apply_pending_keymap_to_window(window);
     }
+    ComposeKNEvent focus{};
+    focus.type = COMPOSEKN_EVENT_FOCUS;
+    focus.state = 1;
+    push_event(window, focus);
 }
 
 static void keyboard_leave(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface) {
@@ -1185,6 +1189,12 @@ static void keyboard_leave(void* data, wl_keyboard* keyboard, uint32_t serial, w
     }
     if (g_shared.keyboard_focus == window) {
         g_shared.keyboard_focus = nullptr;
+    }
+    if (window != nullptr) {
+        ComposeKNEvent focus{};
+        focus.type = COMPOSEKN_EVENT_FOCUS;
+        focus.state = 0;
+        push_event(window, focus);
     }
 }
 
@@ -2550,6 +2560,42 @@ extern "C" void composekn_window_begin_move(ComposeKNWindow* window) {
         return;
     }
     xdg_toplevel_move(window->toplevel, window->seat, window->last_serial);
+}
+
+extern "C" void composekn_window_set_parent(ComposeKNWindow* child, ComposeKNWindow* parent) {
+    child = resolve_window(child);
+    parent = parent != nullptr ? resolve_window(parent) : nullptr;
+    if (child == nullptr || child->toplevel == nullptr) {
+        return;
+    }
+    if (parent != nullptr && parent->toplevel == nullptr) {
+        parent = nullptr;
+    }
+    xdg_toplevel_set_parent(
+        child->toplevel,
+        parent != nullptr ? parent->toplevel : nullptr);
+    if (child->surface != nullptr) {
+        wl_surface_commit(child->surface);
+    }
+    if (child->display != nullptr) {
+        wl_display_flush(child->display);
+    }
+    std::fprintf(
+        stderr,
+        "composekn: xdg_toplevel_set_parent child=%p parent=%p\n",
+        static_cast<void*>(child),
+        static_cast<void*>(parent));
+}
+
+extern "C" bool composekn_window_set_always_on_top(ComposeKNWindow* window, bool on_top) {
+    (void)window;
+    (void)on_top;
+    // xdg-shell 无 always-on-top；layer-shell / 厂商扩展另议。
+    return false;
+}
+
+extern "C" bool composekn_window_always_on_top_supported(void) {
+    return false;
 }
 
 extern "C" void composekn_window_begin_resize(ComposeKNWindow* window, uint32_t edges) {

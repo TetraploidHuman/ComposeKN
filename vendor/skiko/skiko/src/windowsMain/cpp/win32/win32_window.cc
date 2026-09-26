@@ -2193,7 +2193,32 @@ extern "C" void composekn_win32_destroy(ComposeKNWin32Window* window) {
 extern "C" void composekn_win32_begin_move(ComposeKNWin32Window* window) {
     if (window == nullptr || window->hwnd == nullptr) return;
     ReleaseCapture();
+    // DefWindowProc(HTCAPTION) runs a nested move loop and consumes the button-up as
+    // WM_NCLBUTTONUP — our WM_LBUTTONUP handler never runs. Compose therefore keeps
+    // primaryPressed=true after every title-bar drag (including the restore-from-
+    // maximized drag Windows does on first move). The next client click only clears
+    // that stuck Press; the click after that finally reaches buttons. Synthesize a
+    // client button-up when the native drag ends and the physical button is up.
     SendMessageW(window->hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+        return;
+    }
+    POINT pt{};
+    GetCursorPos(&pt);
+    ScreenToClient(window->hwnd, &pt);
+    ComposeKNWin32Event e{};
+    e.type = COMPOSEKN_WIN32_EVENT_MOUSE_BUTTON;
+    e.x = static_cast<float>(pt.x);
+    e.y = static_cast<float>(pt.y);
+    e.button = 272u;  // Left (matches WM_LBUTTON* mapping)
+    e.state = 0u;       // up
+    e.modifiers = queryCurrentModifiers();
+    pushEvent(window, e);
+    if (window->mouseLogCount < 600) {
+        ++window->mouseLogCount;
+        composeknLog("mouse: 左键 UP(synth after beginMove) pos=%ld,%ld",
+                     static_cast<long>(pt.x), static_cast<long>(pt.y));
+    }
 }
 
 extern "C" bool composekn_win32_pump(ComposeKNWin32Window* window) {

@@ -3,13 +3,14 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.47**（CSD `WindowDraggableArea`/`beginMove`；compose-core
-> `v1.12.1`；Dialog Aligned 跟锚点屏；cascade 物理像素；共享 VkDevice；
+> **当前平台宿主基线：v0.5.49**（Wayland `set_parent` 定位对齐；Win beginMove
+> 合成 UP；CSD `WindowDraggableArea`；compose-core `v1.12.1`；共享 VkDevice；
 > Linux Graphite/Vulkan + CI selftest；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 > **compose-core 源码基线：`v1.12.1`**（见 `vendor/compose-core.local/VERSIONS`；
 > Maven `compose_deps` 仍为 `1.11.1`）。
-> **本轮已补**：CSD `WindowDraggableArea` → `beginMove`（Win HTCAPTION / Wayland xdg_toplevel_move）。
+> **本轮已补**：Wayland PlatformDefault/Aligned → `xdg_toplevel_set_parent`；
+> Win beginMove 后合成左键 UP（避免拖标题后要点两次）。
 
 ## 0. 一句话背景
 
@@ -3998,13 +3999,15 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.47 后）
+##### 已知仍缺（v0.5.49 后）
 
 * ~~CSD MOVE / `WindowDraggableArea`~~ → `ComposeNativeWindowHandle.beginMove` +
   foundation `WindowDraggableArea.linux.kt`（Win/Linux）；画廊「无边框窗」；
   自检 `window/beginMove`
+* ~~Win beginMove 卡按下~~ → v0.5.49：`WM_NCLBUTTONUP` 后合成 client 左键 UP
 * 自定义装饰图拖出（仍未做）
-* Wayland Absolute / Aligned 定位；always-on-top；PlatformDefault cascade（无通用绝对定位）
+* ~~Wayland PlatformDefault / Aligned~~ → `xdg_toplevel_set_parent`（transient 提示）；
+  Absolute / always-on-top 仍无标准协议（诚实 no-op / 记账）
 * ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
   `scripts/test-linux-native.sh`（headless weston；FRAME 超时回退；CI 跳过 maximize）
 * ~~Windows CI `--selftest`~~ → `.github/workflows/windows-native-selftest.yml` +
@@ -4015,7 +4018,16 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 * ~~Windows `PlatformDefault` / 跨 DPI cascade~~ → v0.5.43–45；
   ~~Dialog `Aligned(Center)` 总回主屏~~ → v0.5.46
 * ~~上游 Compose 再同步~~ → `v1.12.1`（`compose-core.local/VERSIONS`；linux 编译绿）
-* Windows README 历史「空 checkbox」已在本轮改掉（见 `compose-kn-windows/README.md`）
+
+#### Wayland 定位对齐 + Win beginMove UP（v0.5.49）
+
+1. **Linux**：`LinuxApplicationHost` 锚点（focused/lastActive）+
+   `placeCascaded` / `placeAligned` → `composekn_window_set_parent`（`xdg_toplevel_set_parent`）。
+   Dialog `Aligned(Center)` 与第二扇 `PlatformDefault` 走 transient；Absolute/alwaysOnTop
+   诚实 no-op + 一次日志。键盘 Focus 事件进入 Host。
+2. **Windows**：`beginMove`（HTCAPTION）结束后合成左键 UP，避免拖标题/还原后
+   Compose `primaryPressed` 卡住要点两次。
+3. 画廊：wayland-demo「DialogWindow」；自检 dual+dialog。
 
 #### CSD MOVE + compose-core v1.12.1（v0.5.47）
 

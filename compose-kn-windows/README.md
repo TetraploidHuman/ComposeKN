@@ -3,7 +3,7 @@
 Kotlin/Native **windowsX64** 宿主：Win32 + Skia（Graphite/Vulkan 优先，可回退 GL）上的
 Compose Multiplatform。
 
-当前文档基线：**v0.5.47**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.49**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
@@ -21,7 +21,7 @@ Compose Multiplatform。
 - [x] Per-Monitor DPI；任务栏进度（ITaskbarList3）
 - [x] Tray + Notification（Shell_NotifyIcon；Painter→16×16 HICON）
 - [x] FileDialog（comdlg32）；WindowPlacement / Aligned / always-on-top
-- [x] 自定义装饰拖移：`WindowDraggableArea` → `beginMove`（HTCAPTION）
+- [x] 自定义装饰拖移：`WindowDraggableArea` → `beginMove`（HTCAPTION；结束后合成左键 UP）
 - [ ] 自定义装饰图拖出（未做）
 
 ## Requirements
@@ -65,7 +65,7 @@ COMPOSEKN_SELFTEST=window   # 或 all / logic
 
 ## Known gaps
 
-- 自定义装饰图拖出未做（拖移已对齐 `WindowDraggableArea`）
+- 自定义装饰图拖出未做（拖移已对齐 `WindowDraggableArea`；beginMove 结束后合成 UP）
 - Wine 下退出期偶发 AV（真机关窗路径已收口；见 HANDOVER Vulkan 节）
 
 ## License

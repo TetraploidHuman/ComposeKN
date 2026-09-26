@@ -101,7 +101,11 @@ int32_t composekn_win32_refresh_hz(ComposeKNWin32Window* window);
 typedef void (*ComposeKNRenderTickFn)(void* user);
 void composekn_win32_set_render_tick(ComposeKNRenderTickFn fn, void* user);
 
-/** Begin native move drag (ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION). */
+/**
+ * Begin native move drag (ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION).
+ * On return, synthesizes a client left-button UP when the physical button is up
+ * (caption drag consumes WM_NCLBUTTONUP, not WM_LBUTTONUP).
+ */
 void composekn_win32_begin_move(ComposeKNWin32Window* window);
 
 /** Create a top-level Win32 window. Returns NULL on failure. */

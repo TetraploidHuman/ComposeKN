@@ -866,6 +866,10 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     /**
      * Begin a native move drag from a WM_NCLBUTTONDOWN/HTCAPTION synthetic event.
      * Uses ReleaseCapture + SendMessage so Compose-injected press can drive it.
+     *
+     * After the nested caption-drag loop, the bridge synthesizes a left-button UP
+     * if needed: Win32 ends the drag with WM_NCLBUTTONUP, which would otherwise
+     * leave Compose's primaryPressed stuck and require an extra click.
      */
     fun beginMove() = composekn_win32_begin_move(native)
 

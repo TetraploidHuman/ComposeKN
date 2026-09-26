@@ -199,6 +199,10 @@ class LinuxComposeApplication(
             scene.density = Density(event.scale)
             return
         }
+        if (event.type == WaylandEventType.Focus) {
+            // 宿主已在 attachToHost 里 noteFocus；此处无需再派发到 Compose。
+            return
+        }
         // 软模态：有 Dialog 时非对话框丢弃 pointer/key/touch（对齐 Win32 EnableWindow）
         if (!composeWindow.inputEnabled && event.type.isPointerKeyOrTouch()) {
             return

@@ -2,7 +2,7 @@
 
 Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES）+ Skia 上的 Compose Multiplatform。
 
-当前文档基线：**v0.5.47**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.49**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
@@ -20,7 +20,9 @@ Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES�
 - [x] Tray：StatusNotifierItem + DBusMenu；通知 `notify-send`（无 SNI 时亦算 available）
 - [x] FileDialog：xdg-desktop-portal FileChooser
 - [x] Dialog 软模态；eventfd 唤醒共享泵
-- [ ] Absolute / Aligned 定位；always-on-top（无标准协议）
+- [x] **定位对齐（Wayland 可移植子集）**：
+  `PlatformDefault` / `Aligned` → `xdg_toplevel_set_parent`（相对锚点 transient）；
+  `Absolute` 诚实 no-op（标准协议无绝对坐标）；`alwaysOnTop` 记账 + 一次日志
 - [x] 自定义装饰拖移：`WindowDraggableArea` → `beginMove`（xdg_toplevel_move）
 
 ## Requirements
@@ -87,9 +89,12 @@ COMPOSEKN_VK_HARDWARE=1 nix-shell ./shell.nix --run './scripts/run-linux-native.
 
 ## Known gaps
 
-- Wayland 无法通用绝对/对齐定位；always-on-top 仅记账
+- **Absolute 屏幕坐标**：标准 xdg-shell 无 API（诚实 no-op）；`Aligned` /
+  `PlatformDefault` 已用 `xdg_toplevel_set_parent` 做可移植 transient 提示
+- **always-on-top**：无标准协议（记账 + 一次日志）；layer-shell / 厂商扩展另议
 - 无 SNI watcher 的会话：Tray 菜单不可用，通知仍可走 `notify-send`
 - weston headless 对 maximized geometry 较严（CI selftest 在 RELAX 下跳过 maximize）
+- 自定义装饰图拖出未做
 
 ## License
 

@@ -112,6 +112,16 @@ class LinuxComposeWindow(
                     onGeometryHint?.invoke()
                     onEvent(event)
                 }
+                WaylandEventType.Focus -> {
+                    LinuxApplicationHost.noteFocus(this, event.pressed)
+                    onEvent(event)
+                }
+                WaylandEventType.PointerButton -> {
+                    if (event.pressed) {
+                        LinuxApplicationHost.notePointerActivity(this)
+                    }
+                    onEvent(event)
+                }
                 else -> onEvent(event)
             }
         }
