@@ -3,7 +3,7 @@
 Kotlin/Native **windowsX64** 宿主：Win32 + Skia（Graphite/Vulkan 优先，可回退 GL）上的
 Compose Multiplatform。
 
-当前文档基线：**v0.5.52**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.53**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
@@ -25,6 +25,7 @@ Compose Multiplatform。
 - [x] 嵌套模态后按键态复位：`DoDragDrop` / `FileDialog`（comdlg32）返回后合成左键 UP
 - [x] 发出侧 DnD：派发后再 `DoDragDrop`；进 OLE 前清 Escape；`QueryContinueDrag` 异步交叉验证
 - [x] 自定义装饰图拖出（`drawDragDecoration` → `IDragSourceHelper::InitializeFromBitmap`）
+- [x] 自定义字体：`compose-kn-resources` / `Res.font.*` → LoadedFont（见该模块 README）
 
 ## Requirements
 

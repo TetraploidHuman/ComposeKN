@@ -2,7 +2,7 @@
 
 Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES）+ Skia 上的 Compose Multiplatform。
 
-当前文档基线：**v0.5.52**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.53**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
@@ -28,6 +28,7 @@ Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES�
 - [x] FileDialog（portal）返回后合成左键 UP（对齐 Win32）
 - [x] 发出 / 接收 DnD：`wl_data_device_start_drag` + enter/drop；自定义拖影 → icon surface
 - [x] 自定义装饰图拖出（`drawDragDecoration` → BGRA icon）
+- [x] 自定义字体：`compose-kn-resources` / `Res.font.*` → LoadedFont（见该模块 README）
 
 ## Requirements
 

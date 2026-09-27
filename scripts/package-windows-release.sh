@@ -46,6 +46,13 @@ fi
 rm -rf "$STAGE" && mkdir -p "$STAGE"
 cp -f "$EXE" "$STAGE/ComposeKN-Windows-Native.exe"
 
+# 自定义字体（compose-kn-resources）：与 exe 同级的 composeResources/font/
+FONTS_SRC="$(dirname "$EXE")/composeResources/font"
+if [ -d "$FONTS_SRC" ]; then
+    mkdir -p "$STAGE/composeResources/font"
+    cp -f "$FONTS_SRC"/* "$STAGE/composeResources/font/" 2>/dev/null || true
+fi
+
 # 注意：heredoc 必须**带引号**（<<'EOF'）。
 # 不引号时 shell 会吃掉反引号（``cmd`` 会被当命令替换执行、文本直接消失），
 # v0.2.9/v0.3.0 的 README 就是这样丢掉了一整行的命令提示。
@@ -54,10 +61,9 @@ cat > "$STAGE/README.txt" <<'EOF'
 ComposeKN Windows 原生组件画廊 v__VERSION__
 =========================================
 
-免安装：**单个 exe**，双击即可运行（也可以在资源管理器里选中压缩包内的
-ComposeKN-Windows-Native.exe 直接运行 —— 不会缺文件了）。
-ICU 数据文件（icudtl.dat，10MB，Skia 文本排版用）在链接期被直接编进了 exe，
-所以 exe 体积约 42MB、不需要任何同目录的附带文件。
+免安装：解压后双击 `ComposeKN-Windows-Native.exe` 即可。
+ICU 数据已内嵌进 exe。若带 `composeResources/font/`，为自定义字体（Noto /
+JetBrains Mono 等），请与 exe **保持相对路径**（compose-kn-resources 运行时查找）。
 
 内容
 ----

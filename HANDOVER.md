@@ -3,13 +3,11 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.52**（Linux 发出/接收 DnD + 富剪贴板；两端自定义拖影；
-> 嵌套模态合成 UP / DoDragDrop 推迟；compose-core `v1.12.1`；见文末；
-> 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
+> **当前平台宿主基线：v0.5.53**（compose-kn-resources：`Res.font.*` + LoadedFont；
+> v0.5.52 DnD/富剪贴板/拖影；compose-core `v1.12.1`；见文末）。
 > **compose-core 源码基线：`v1.12.1`**（见 `vendor/compose-core.local/VERSIONS`；
 > Maven `compose_deps` 仍为 `1.11.1`）。
-> **本轮已补**：Linux `start_drag` / multi-MIME 剪贴板；Win+Linux
-> `drawDragDecoration`；入站 DnD 接 Compose。
+> **本轮已补**：自定义字体管线（对齐官方 Res.font 用法）；LumiCode / 画廊演示。
 
 ## 0. 一句话背景
 
@@ -3998,8 +3996,11 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.52 后）
+##### 已知仍缺（v0.5.53 后）
 
+* ~~自定义字体 / Res.font~~ → `compose-kn-resources` + Gradle 插件生成 `Res.font.*`；
+  旁路 `composeResources/font/`；LumiCode `InstallArchiveFonts` 已接。
+  （官方 components-resources 仍无 linuxX64/mingwX64 变体。）
 * ~~CSD MOVE / `WindowDraggableArea`~~ → `ComposeNativeWindowHandle.beginMove` +
   foundation `WindowDraggableArea.linux.kt`（Win/Linux）；画廊「无边框窗」；
   自检 `window/beginMove`
@@ -4058,6 +4059,19 @@ v0.5.50 合成 UP 让每次手势都能进 `DoDragDrop`，暴露了潜伏问题�
 托盘 `TrackPopupMenu` 走消息专用 HWND，不污染 Compose 客户区按键态，跳过。
 Linux 发出侧 DnD：`start_drag` 立即合成 UP（API 不阻塞，同 beginMove）；
 完成态经 `drag_poll_result` 回调 `onTransferCompleted`。
+
+#### 自定义字体 / Res.font（v0.5.53）
+
+官方 `components-resources` 无 linuxX64/mingwX64 → ComposeKN 旁路：
+
+1. **`compose-kn-resources`**：`Font(Res.font.*)` / `Font(bytes)` / `FontFromFile` →
+   Skia `LoadedFont` / `makeFromData`（非「只能系统字体」）。
+2. **Gradle 插件 `com.composekn.resources`**：扫 `composeResources/font/` +
+   `extraFontDirs` → 生成 `Res.font.<name>`；link 后 copy 到 exe 旁
+   `composeResources/font/`。
+3. **样本**：wayland-demo / windows-demo 画廊「Custom fonts」；
+   LumiCode `InstallArchiveFonts`（linux+mingw）接同一套字体文件。
+4. **打包**：`package-windows-release.sh` 一并打进 `composeResources/font/`。
 
 #### Linux DnD + 富剪贴板 + 自定义拖影（v0.5.52）
 

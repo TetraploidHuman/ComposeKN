@@ -21,5 +21,9 @@ gradlePlugin {
             id = "com.composekn.windows-native-linker"
             implementationClass = "com.composekn.gradle.WindowsNativeLinkerPlugin"
         }
+        create("composeKnResources") {
+            id = "com.composekn.resources"
+            implementationClass = "com.composekn.gradle.ComposeKnResourcesPlugin"
+        }
     }
 }
