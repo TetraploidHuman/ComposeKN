@@ -54,7 +54,7 @@ kotlin {
                 implementation(libs.compose.material3)
                 implementation(libs.compose.ui)
                 implementation(libs.coroutines.core)
-                implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.7.1")
+                implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.8.0")
                 implementation(project(":compose-kn-resources"))
             }
         }
@@ -92,5 +92,5 @@ tasks.matching { it.name.startsWith("compileKotlinMingw") }.configureEach {
 tasks.named("generateComposeKnResources") { dependsOn("verifyLumicodeSources") }
 
 configurations.configureEach {
-    resolutionStrategy.force("org.jetbrains.kotlinx:kotlinx-datetime:0.7.1")
+    resolutionStrategy.force("org.jetbrains.kotlinx:kotlinx-datetime:0.8.0")
 }
