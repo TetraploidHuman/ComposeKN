@@ -1,8 +1,7 @@
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.compose)
-    id("com.composekn.linux-native-linker")
-    id("com.composekn.windows-native-linker")
+    id("com.composekn.host")
     id("com.composekn.resources")
 }
 
@@ -29,6 +28,7 @@ kotlin {
         binaries {
             executable {
                 entryPoint = "main.main"
+                // Cross-link Skia prebuilts (build-windows.sh sets these props).
                 val mingwLibs = (project.findProperty("skiko.mingw.libs") as? String)
                 if (!mingwLibs.isNullOrBlank()) {
                     linkerOpts.addAll(
@@ -61,14 +61,14 @@ kotlin {
 
         val linuxX64Main by getting {
             dependencies {
-                implementation(project(":compose-kn-linux"))
+                // compose-kn-linux 由 com.composekn.host 注入
                 implementation(project(":compose-kn-resources"))
             }
         }
 
         val mingwX64Main by getting {
             dependencies {
-                implementation(project(":compose-kn-windows"))
+                // compose-kn-windows 由 com.composekn.host 注入
                 implementation(project(":compose-kn-resources"))
             }
         }

@@ -10,11 +10,11 @@ import org.gradle.kotlin.dsl.create
 /**
  * 给 compose-kn-* 挂 maven-publish（`com.composekn:<module>:<composekn.version>`）。
  *
- * 仓库：
- * 1. 本地 `build/maven-repo`
- * 2. `-Pcomposekn.publish.url=` 私服
- * 3. 若存在 `GITHUB_TOKEN`（或 `-Pcomposekn.publish.github=true`）：
- *    `https://maven.pkg.github.com/<owner>/<repo>`（默认 TetraploidHuman/ComposeKN）
+ * 仓库：本地 `build/maven-repo`、可选私服、GitHub Packages（`GITHUB_TOKEN`）。
+ *
+ * `-Pcomposekn.publish.skipMetadata=true`（发布脚本默认打开）：禁用全项目
+ * `*KotlinMetadata` 任务，避开 skiko/compose-core 在 KN 2.4 下的
+ * `@OptionalExpectation` 编译失败，仍可发 native klib。
  */
 class ComposeKnPublishPlugin : Plugin<Project> {
     override fun apply(project: Project) {
@@ -22,6 +22,16 @@ class ComposeKnPublishPlugin : Plugin<Project> {
         val version = project.findProperty("composekn.version")?.toString() ?: "0.5.55"
         project.group = project.findProperty("composekn.group")?.toString() ?: "com.composekn"
         project.version = version
+
+        if (project.findProperty("composekn.publish.skipMetadata")?.toString() == "true") {
+            project.rootProject.allprojects {
+                tasks.configureEach {
+                    if (name.contains("KotlinMetadata")) {
+                        enabled = false
+                    }
+                }
+            }
+        }
 
         project.pluginManager.withPlugin("maven-publish") {
             project.extensions.configure<PublishingExtension> {

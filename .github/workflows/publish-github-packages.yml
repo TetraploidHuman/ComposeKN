@@ -7,6 +7,9 @@
 #   com.composekn:skiko                              (from vendor/skiko when enabled)
 #
 # Consumers: see CONSUMING.md + plugins { id("com.composekn.settings") }
+#
+# mingwX64 klib 需要 nix-shell 里的 mingw 交叉编译器编译 skiko bridges
+# （与 windows-native-selftest.yml 相同 pin）。
 
 name: Publish GitHub Packages
 
@@ -29,6 +32,10 @@ permissions:
   contents: read
   packages: write
 
+env:
+  NIXPKGS_REV: c25784012c9982bca5b3e0de87e90bbdac8927d3
+  NIXPKGS_URL: https://github.com/NixOS/nixpkgs/archive/c25784012c9982bca5b3e0de87e90bbdac8927d3.tar.gz
+
 jobs:
   publish-hosts:
     name: Publish compose-kn-* hosts
@@ -45,8 +52,21 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Cache Kotlin/Native toolchain (~/.konan)
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('vendor/skiko/dependencies.toml', 'gradle.properties') }}
+
       - name: Fetch mingw Skia prebuilt (for mingwX64 klib)
-        run: ./scripts/fetch-skia-mingw.sh /tmp/composekn-skia-mingw
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd
+          ./scripts/fetch-skia-mingw.sh /tmp/composekn-skia-mingw
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -57,13 +77,17 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
+          NIXPKGS_URL: ${{ env.NIXPKGS_URL }}
         run: |
           set -euo pipefail
           if [ -d "$SKIA_MINGW_PREBUILT" ]; then
             echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
           fi
           # 勿用 umbrella :publish —— 会拉 skiko/compose-core common metadata（KN 2.4 下炸）
-          ./scripts/publish-composekn-packages.sh --github
+          # mingw 段在脚本内 nix_run（需本 job 已 install-nix）
+          # --release：即便 Packages 账单异常，也把 maven zip 挂到同 tag（本机也可 --release）
+          ./scripts/publish-composekn-packages.sh --github --release || \
+            ./scripts/publish-composekn-packages.sh --release
 
   publish-compose-ui:
     name: Publish com.composekn.compose:*
@@ -91,11 +115,14 @@ jobs:
         run: |
           set -euo pipefail
           CKN_VER=$(grep '^composekn.version=' gradle.properties | cut -d= -f2)
+          # 禁用 metadata，只发各 native publication
           ./gradlew -p vendor/compose-core \
             -Pcomposekn.publish.composeUi=true \
             -Pcomposekn.version="$CKN_VER" \
-            publish \
-            --no-daemon
+            -Pcomposekn.publish.skipMetadata=true \
+            publishAllPublicationsToComposeKnLocalRepository \
+            publishAllPublicationsToGitHubPackagesRepository \
+            --continue --no-daemon
 
   publish-skiko:
     name: Publish com.composekn:skiko

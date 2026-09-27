@@ -11,13 +11,30 @@
 | Compose **UI** | **1.12.1** | 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.55` |
 | Maven `compose_deps` | 1.11.1 | 仅 runtime 等未顶掉坐标；**不是** UI 版本 |
 
-仓库（GitHub Packages，私有包需 token）：
+### 仓库怎么拿（按优先级）
+
+1. **Release Maven zip（推荐，不依赖 Packages / Actions Billing）**
+
+```bash
+# 在任意目录；私有仓需 GITHUB_TOKEN
+./scripts/fetch-composekn-maven.sh ~/composekn-m2
+# 或：curl 拉 releases/download 后 unzip（公开仓）
+```
+
+```kotlin
+maven { url = uri("${System.getProperty("user.home")}/composekn-m2") }
+```
+
+资产名：`composekn-maven-<ver>.zip`（挂在 tag `v<ver>`，由  
+`./scripts/publish-composekn-packages.sh --release` 上传）。
+
+2. **GitHub Packages**（需账户 Billing / Packages spending limit 正常）
 
 ```
 https://maven.pkg.github.com/TetraploidHuman/ComposeKN
 ```
 
-本地开发也可：`./scripts/publish-composekn-packages.sh` → `build/maven-repo`。
+3. **本机 publish**：`./scripts/publish-composekn-packages.sh` → `build/maven-repo`。
 
 ---
 
