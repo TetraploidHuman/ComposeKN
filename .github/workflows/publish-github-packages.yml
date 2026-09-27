@@ -59,17 +59,11 @@ jobs:
           SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
         run: |
           set -euo pipefail
-          # Ensure Windows native bridges can configure (prebuilt path for linker props)
           if [ -d "$SKIA_MINGW_PREBUILT" ]; then
             echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
           fi
-          ./gradlew \
-            -Pcomposekn.publish.github=true \
-            :compose-kn-bom:publish \
-            :compose-kn-resources:publish \
-            :compose-kn-linux:publish \
-            :compose-kn-windows:publish \
-            --no-daemon
+          # 勿用 umbrella :publish —— 会拉 skiko/compose-core common metadata（KN 2.4 下炸）
+          ./scripts/publish-composekn-packages.sh --github
 
   publish-compose-ui:
     name: Publish com.composekn.compose:*
