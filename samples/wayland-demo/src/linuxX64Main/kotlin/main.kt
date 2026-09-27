@@ -73,7 +73,6 @@ import com.composekn.resources.Font
 import main.resources.Res
 import kotlin.math.roundToInt
 import kotlin.system.exitProcess
-import com.composekn.linux.registerComposeKnLinuxBackend
 import kotlinx.coroutines.delay
 import org.jetbrains.skiko.ComposeKNFileDialog
 import org.jetbrains.skiko.ComposeKNTray
@@ -91,7 +90,7 @@ fun main(args: Array<String>) {
     }
 
     val selftest = resolveSelfTest(args)
-    registerComposeKnLinuxBackend()
+    // 后端登记：com.composekn.host 已在 entry wrapper 里 register；此处保留亦可（幂等）
 
     if (selftest) {
         runLinuxSelfTest()

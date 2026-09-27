@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
+    id("com.composekn.publish")
 }
 
 kotlin {

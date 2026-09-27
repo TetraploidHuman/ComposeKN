@@ -23,6 +23,7 @@ import org.jetbrains.skiko.win32Log
  * `androidx.compose.ui.window.application { Window(...) }` 调用。
  *
  * 幂等；[WindowsComposeApplication] 构造时也会自动调用。
+ * 依赖本模块时，[installComposeKnWindowsAutoRegister] 会把自动登记挂到 Registry。
  */
 fun registerComposeKnWindowsBackend() {
     // FileDialog：asPlatformWindow() → WindowsComposeWindow → nativeWindow
@@ -36,6 +37,17 @@ fun registerComposeKnWindowsBackend() {
 
 /** 供 Application.init / 测试调用的别名。 */
 internal fun ensureWindowsComposeBackendRegistered() = registerComposeKnWindowsBackend()
+
+/** 挂到 [ComposeNativeWindowBackendRegistry.autoRegister]。 */
+fun installComposeKnWindowsAutoRegister() {
+    ComposeNativeWindowBackendRegistry.autoRegister = { registerComposeKnWindowsBackend() }
+}
+
+@Suppress("unused")
+private val composeKnWindowsAutoRegisterInstall: Boolean = run {
+    installComposeKnWindowsAutoRegister()
+    true
+}
 
 private object WindowsComposeNativeBackend : ComposeNativeWindowBackend {
     override fun initMainThread() {

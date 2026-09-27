@@ -25,5 +25,13 @@ gradlePlugin {
             id = "com.composekn.resources"
             implementationClass = "com.composekn.gradle.ComposeKnResourcesPlugin"
         }
+        create("composeKnHost") {
+            id = "com.composekn.host"
+            implementationClass = "com.composekn.gradle.ComposeKnHostPlugin"
+        }
+        create("composeKnPublish") {
+            id = "com.composekn.publish"
+            implementationClass = "com.composekn.gradle.ComposeKnPublishPlugin"
+        }
     }
 }

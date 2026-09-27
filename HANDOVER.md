@@ -3,11 +3,11 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.53**（compose-kn-resources：`Res.font.*` + LoadedFont；
-> v0.5.52 DnD/富剪贴板/拖影；compose-core `v1.12.1`；见文末）。
-> **compose-core 源码基线：`v1.12.1`**（见 `vendor/compose-core.local/VERSIONS`；
-> Maven `compose_deps` 仍为 `1.11.1`）。
-> **本轮已补**：自定义字体管线（对齐官方 Res.font 用法）；LumiCode / 画廊演示。
+> **当前平台宿主基线：v0.5.54**（BOM / host 插件 / resources 官方包名；
+> v0.5.53 Res.font；compose-core UI **1.12.1**；见 `CONSUMING.md`）。
+> **compose-core 源码基线：`v1.12.1`**（唯一 UI 基线；Maven `compose_deps=1.11.1`
+> 仅 runtime 等未顶掉坐标，**不要**当 UI 版本）。
+> **本轮已补**：消费指南、BOM、一键 host、resources string/drawable。
 
 ## 0. 一句话背景
 

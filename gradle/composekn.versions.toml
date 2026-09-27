@@ -1,0 +1,18 @@
+[versions]
+composekn = "0.5.54"
+kotlin = "2.4.0"
+# UI / foundation / material3：与 vendor/compose-core 源码基线一致（经 includeBuild substitution）
+compose-ui = "1.12.1"
+# 未被顶掉的 Maven 构件（runtime 等）仍可能是 1.11.1 —— 见 CONSUMING.md
+compose-maven-deps = "1.11.1"
+coroutines = "1.10.2"
+
+[libraries]
+composekn-bom = { module = "com.composekn:compose-kn-bom", version.ref = "composekn" }
+composekn-linux = { module = "com.composekn:compose-kn-linux", version.ref = "composekn" }
+composekn-windows = { module = "com.composekn:compose-kn-windows", version.ref = "composekn" }
+composekn-resources = { module = "com.composekn:compose-kn-resources", version.ref = "composekn" }
+
+[plugins]
+composekn-host = { id = "com.composekn.host", version.ref = "composekn" }
+composekn-resources = { id = "com.composekn.resources", version.ref = "composekn" }
