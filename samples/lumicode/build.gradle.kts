@@ -46,6 +46,7 @@ kotlin {
                 implementation(libs.compose.material3)
                 implementation(libs.compose.ui)
                 implementation(libs.coroutines.core)
+                implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.6.2")
             }
         }
 
@@ -73,4 +74,9 @@ tasks.register("verifyLumicodeSources") {
 tasks.named("compileKotlinLinuxX64") { dependsOn("verifyLumicodeSources") }
 tasks.matching { it.name.startsWith("compileKotlinMingw") }.configureEach {
     dependsOn("verifyLumicodeSources")
+}
+
+// material3 等可能传递 0.7.x（Clock API 已迁到 kotlin.time）；LumiCode common 用 0.6.x API。
+configurations.configureEach {
+    resolutionStrategy.force("org.jetbrains.kotlinx:kotlinx-datetime:0.6.2")
 }
