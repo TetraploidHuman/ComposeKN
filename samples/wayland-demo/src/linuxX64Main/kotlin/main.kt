@@ -50,6 +50,8 @@ import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -67,6 +69,8 @@ import androidx.compose.ui.window.rememberDialogState
 import androidx.compose.ui.window.rememberNotification
 import androidx.compose.ui.window.rememberTrayState
 import androidx.compose.ui.window.rememberWindowState
+import com.composekn.resources.Font
+import main.resources.Res
 import kotlin.math.roundToInt
 import kotlin.system.exitProcess
 import com.composekn.linux.registerComposeKnLinuxBackend
@@ -480,6 +484,19 @@ private fun ShowcaseSections() {
                 )
             }
         }
+    }
+    Section("9 · Custom fonts") {
+        val sans = remember {
+            FontFamily(
+                Font(Res.font.noto_sans_regular, FontWeight.Normal),
+                Font(Res.font.noto_sans_bold, FontWeight.Bold),
+            )
+        }
+        val mono = remember {
+            FontFamily(Font(Res.font.jbmono_regular, FontWeight.Normal))
+        }
+        Text("Noto Sans — ComposeKN Res.font", fontFamily = sans, color = Color.White)
+        Text("JetBrains Mono 0123", fontFamily = mono, color = Color(0xFFB0BEC5))
     }
 }
 

@@ -81,6 +81,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -90,8 +92,10 @@ import androidx.compose.ui.window.FileDialogMode
 import androidx.compose.ui.window.Notification
 import androidx.compose.ui.window.TrayState
 import androidx.compose.ui.window.rememberNotification
+import com.composekn.resources.Font
 import com.composekn.windows.TaskbarProgressState
 import com.composekn.windows.WindowsComposeWindow
+import main.resources.Res
 import kotlin.concurrent.Volatile
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -486,6 +490,10 @@ private fun LazyListScope.gallerySections(
             style = MaterialTheme.typography.bodyMedium,
         )
         Text("28sp 大字号 AaBbGg0123", fontSize = 28.sp)
+    }
+
+    section("字体 / Custom Fonts") {
+        CustomFontsDemoBox()
     }
 
     section("输入 / Input") {
@@ -1268,6 +1276,39 @@ private fun DragAndDropDemoBox() {
         }
         Text(
             "发出走 DoDragDrop；接收走 IDropTarget（与自检同一条 OLE 链）。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+}
+
+@Composable
+private fun CustomFontsDemoBox() {
+    val sans = remember {
+        FontFamily(
+            Font(Res.font.noto_sans_regular, FontWeight.Normal),
+            Font(Res.font.noto_sans_bold, FontWeight.Bold),
+        )
+    }
+    val mono = remember {
+        FontFamily(
+            Font(Res.font.jbmono_regular, FontWeight.Normal),
+            Font(Res.font.jbmono_bold, FontWeight.Bold),
+        )
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            "Noto Sans — 自定义字体（Res.font / compose-kn-resources）",
+            fontFamily = sans,
+            style = MaterialTheme.typography.titleSmall,
+        )
+        Text(
+            "JetBrains Mono — code 0123456789",
+            fontFamily = mono,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            "对照：系统 SansSerif",
+            fontFamily = FontFamily.SansSerif,
             style = MaterialTheme.typography.bodySmall,
         )
     }

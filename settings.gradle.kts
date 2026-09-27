@@ -47,6 +47,8 @@ includeBuild("vendor/compose-core") {
 }
 
 include(":compose-kn-linux")
+include(":compose-kn-windows")
+include(":compose-kn-resources")
 include(":compose-kn-tests")
 include(":samples:wayland-demo")
 include(":samples:link-smoke")
@@ -62,5 +64,4 @@ include(":samples:lumicode")
 // still gate windows-demo, but always include compose-kn-windows so :samples:lumicode can
 // declare mingwX64 deps. If configure fails off-Windows, wrap in isWindowsHost again.
 val isWindowsHost = System.getProperty("os.name", "").lowercase().contains("windows")
-include(":compose-kn-windows")
 include(":samples:windows-demo")
