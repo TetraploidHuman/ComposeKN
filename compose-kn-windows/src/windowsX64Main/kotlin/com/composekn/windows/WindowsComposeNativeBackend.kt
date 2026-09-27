@@ -26,6 +26,8 @@ import org.jetbrains.skiko.win32Log
  * 依赖本模块时，[installComposeKnWindowsAutoRegister] 会把自动登记挂到 Registry。
  */
 fun registerComposeKnWindowsBackend() {
+    // Skiko UI 主线程标记（幂等）；消费者不必再手写 initWindowsMainThread()
+    initWindowsMainThread()
     // FileDialog：asPlatformWindow() → WindowsComposeWindow → nativeWindow
     composeKnFileDialogOwnerResolver = { platform ->
         (platform as? WindowsComposeWindow)?.nativeWindow

@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.composekn"
-version = providers.gradleProperty("composekn.version").getOrElse("0.5.54")
+version = providers.gradleProperty("composekn.version").getOrElse("0.5.55")
 
 dependencies {
     constraints {

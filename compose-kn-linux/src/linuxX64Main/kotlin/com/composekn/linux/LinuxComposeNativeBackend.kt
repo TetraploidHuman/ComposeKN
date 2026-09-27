@@ -23,6 +23,8 @@ import org.jetbrains.skiko.initLinuxMainThread
  * 依赖本模块时，[installComposeKnLinuxAutoRegister] 会把自动登记挂到 Registry。
  */
 fun registerComposeKnLinuxBackend() {
+    // Skiko UI 主线程标记（幂等）；消费者不必再手写 initLinuxMainThread()
+    initLinuxMainThread()
     if (ComposeNativeWindowBackendRegistry.backend != null) return
     ComposeNativeWindowBackendRegistry.register(LinuxComposeNativeBackend)
     println("composekn: backend ComposeNativeWindowBackend registered (Linux/Wayland)")

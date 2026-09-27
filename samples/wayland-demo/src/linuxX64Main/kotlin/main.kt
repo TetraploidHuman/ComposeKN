@@ -77,20 +77,20 @@ import kotlinx.coroutines.delay
 import org.jetbrains.skiko.ComposeKNFileDialog
 import org.jetbrains.skiko.ComposeKNTray
 import org.jetbrains.skiko.WaylandClipboard
-import org.jetbrains.skiko.initLinuxMainThread
 import platform.posix.getenv
 import kotlinx.cinterop.toKString
 
 private const val SKIA_ONLY_TEST = false
 
 fun main(args: Array<String>) {
-    initLinuxMainThread()
+    // initLinuxMainThread + registerBackend：由 com.composekn.host entry wrapper /
+    // registerComposeKnLinuxBackend() 负责（幂等）。自检路径无 wrapper 时补登记：
+    com.composekn.linux.registerComposeKnLinuxBackend()
     if (SKIA_ONLY_TEST) {
         return
     }
 
     val selftest = resolveSelfTest(args)
-    // 后端登记：com.composekn.host 已在 entry wrapper 里 register；此处保留亦可（幂等）
 
     if (selftest) {
         runLinuxSelfTest()
