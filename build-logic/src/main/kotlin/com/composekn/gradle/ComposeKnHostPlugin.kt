@@ -197,7 +197,7 @@ class ComposeKnHostPlugin : Plugin<Project> {
     }
 
     companion object {
-        const val DEFAULT_VERSION = "0.5.56"
+        const val DEFAULT_VERSION = "0.5.57"
     }
 }
 

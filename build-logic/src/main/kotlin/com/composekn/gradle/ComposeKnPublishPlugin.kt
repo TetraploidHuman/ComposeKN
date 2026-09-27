@@ -50,8 +50,9 @@ class ComposeKnPublishPlugin : Plugin<Project> {
                     }
                     val ghToken = System.getenv("GITHUB_TOKEN")
                         ?: project.findProperty("composekn.publish.password")?.toString()
-                    val wantGh = project.findProperty("composekn.publish.github")?.toString() == "true" ||
-                        !ghToken.isNullOrBlank()
+                    // 仅显式 -Pcomposekn.publish.github=true 才挂 GitHub Packages，
+                    // 避免 CI 环境里有 GITHUB_TOKEN 时 :publish 误传 / 409 Conflict。
+                    val wantGh = project.findProperty("composekn.publish.github")?.toString() == "true"
                     if (wantGh && !ghToken.isNullOrBlank()) {
                         val owner = project.findProperty("composekn.publish.github.owner")?.toString()
                             ?: System.getenv("GITHUB_REPOSITORY_OWNER")

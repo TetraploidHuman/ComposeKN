@@ -63,8 +63,9 @@ if [ "$DO_RELEASE" = 1 ] && [ "$DO_GITHUB" = 0 ] && [ "$DO_UI" = 0 ] && [ "$DO_S
 fi
 
 if [ "$NEED_BUILD" = 1 ]; then
-  info "Publish BOM"
-  ./gradlew "${ARGS[@]}" :compose-kn-bom:publish
+  info "Publish BOM (local only — :publish 会误传到 GitHub Packages)"
+  ./gradlew "${ARGS[@]}" \
+    :compose-kn-bom:publishMavenPublicationToComposeKnLocalRepository
 
   info "Publish linuxX64 (resources + linux host) — required"
   ./gradlew "${ARGS[@]}" \
