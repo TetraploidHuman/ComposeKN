@@ -15,6 +15,8 @@ import java.io.File
  * - 依赖 compose-kn-linux / compose-kn-windows
  * - 生成 entry wrapper：先 registerBackend，再调用户原来的 entryPoint
  *
+ * Linux / Windows 生成源分目录，避免双 target 时互相污染编译。
+ *
  * 用法：`id("com.composekn.host")`
  */
 class ComposeKnHostPlugin : Plugin<Project> {
@@ -43,14 +45,17 @@ class ComposeKnHostPlugin : Plugin<Project> {
         if (hasLinux) project.pluginManager.apply("com.composekn.linux-native-linker")
         if (hasMingw) project.pluginManager.apply("com.composekn.windows-native-linker")
 
-        val genDir = project.layout.buildDirectory.dir("generated/composekn/host")
+        val linuxGen = project.layout.buildDirectory.dir("generated/composekn/host/linux")
+        val windowsGen = project.layout.buildDirectory.dir("generated/composekn/host/windows")
+
         val generate = project.tasks.register("generateComposeKnHostBootstrap") {
-            outputs.dir(genDir)
+            outputs.dir(linuxGen)
+            outputs.dir(windowsGen)
             inputs.property("wrap", ext.wrapEntryPoint)
             doLast {
-                val dir = genDir.get().asFile
-                dir.mkdirs()
                 if (hasLinux) {
+                    val dir = linuxGen.get().asFile
+                    dir.mkdirs()
                     writeBootstrap(
                         File(dir, "ComposeKnLinuxBootstrap.kt"),
                         platform = "linux",
@@ -61,6 +66,8 @@ class ComposeKnHostPlugin : Plugin<Project> {
                     )
                 }
                 if (hasMingw) {
+                    val dir = windowsGen.get().asFile
+                    dir.mkdirs()
                     writeBootstrap(
                         File(dir, "ComposeKnWindowsBootstrap.kt"),
                         platform = "windows",
@@ -77,7 +84,12 @@ class ComposeKnHostPlugin : Plugin<Project> {
             dependsOn(generate)
         }
 
-        fun addDep(sourceSetName: String, projectPath: String, mavenArtifact: String) {
+        fun addDep(
+            sourceSetName: String,
+            projectPath: String,
+            mavenArtifact: String,
+            genDir: org.gradle.api.provider.Provider<org.gradle.api.file.Directory>,
+        ) {
             kotlin.sourceSets.findByName(sourceSetName)?.let { ss ->
                 ss.kotlin.srcDir(genDir)
                 ss.dependencies {
@@ -91,8 +103,12 @@ class ComposeKnHostPlugin : Plugin<Project> {
                 }
             }
         }
-        if (hasLinux) addDep("linuxX64Main", ":compose-kn-linux", "compose-kn-linux")
-        if (hasMingw) addDep("mingwX64Main", ":compose-kn-windows", "compose-kn-windows")
+        if (hasLinux) {
+            addDep("linuxX64Main", ":compose-kn-linux", "compose-kn-linux", linuxGen)
+        }
+        if (hasMingw) {
+            addDep("mingwX64Main", ":compose-kn-windows", "compose-kn-windows", windowsGen)
+        }
 
         if (!ext.wrapEntryPoint.get()) return
 
@@ -109,10 +125,11 @@ class ComposeKnHostPlugin : Plugin<Project> {
                 } else {
                     "composekn.host.generated.composeknWindowsHostMain"
                 }
-                // 生成调用用户 entry 的 wrapper
+                val platformGen = if (isLinux) linuxGen else windowsGen
                 generate.configure {
                     doLast {
-                        val dir = genDir.get().asFile
+                        val dir = platformGen.get().asFile
+                        dir.mkdirs()
                         val userFq = userEntry
                         val fileName =
                             if (isLinux) "ComposeKnLinuxEntry.kt" else "ComposeKnWindowsEntry.kt"
@@ -128,7 +145,6 @@ class ComposeKnHostPlugin : Plugin<Project> {
                         } else {
                             "registerComposeKnWindowsBackend()"
                         }
-                        // 用户 entry 形如 main.main → 直接 FQ 调用，避免 import main.main 歧义
                         File(dir, fileName).writeText(
                             """
                             |package composekn.host.generated
