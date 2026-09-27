@@ -3983,11 +3983,113 @@ static void discardQueuedEscapeKeys() {
     }
 }
 
+/**
+ * Top-down BGRA → 32bpp HBITMAP for IDragSourceHelper.
+ * Shell expects premultiplied alpha; CreateDIBSection with BITMAPV5HEADER alpha mask.
+ */
+static HBITMAP createDragImageBitmap(int32_t w, int32_t h, const uint8_t* bgra) {
+    if (w <= 0 || h <= 0 || bgra == nullptr) return nullptr;
+
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(BITMAPV5HEADER);
+    bi.bV5Width = w;
+    bi.bV5Height = -h; // top-down
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP hbmp = CreateDIBSection(
+        screen, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (!hbmp || !bits) {
+        if (hbmp) DeleteObject(hbmp);
+        return nullptr;
+    }
+
+    auto* dst = static_cast<uint8_t*>(bits);
+    const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* s = bgra + i * 4;
+        const unsigned b = s[0];
+        const unsigned g = s[1];
+        const unsigned r = s[2];
+        const unsigned a = s[3];
+        dst[i * 4 + 0] = static_cast<uint8_t>((b * a) / 255u);
+        dst[i * 4 + 1] = static_cast<uint8_t>((g * a) / 255u);
+        dst[i * 4 + 2] = static_cast<uint8_t>((r * a) / 255u);
+        dst[i * 4 + 3] = static_cast<uint8_t>(a);
+    }
+    return hbmp;
+}
+
+/** Attach custom drag image via IDragSourceHelper; takes HBITMAP ownership on success. */
+static void attachDragSourceHelperImage(
+    IDataObject* data,
+    int32_t icon_w,
+    int32_t icon_h,
+    const uint8_t* icon_bgra,
+    int32_t hot_x,
+    int32_t hot_y
+) {
+    if (icon_bgra == nullptr || icon_w <= 0 || icon_h <= 0 || data == nullptr) return;
+
+    HBITMAP hbmp = createDragImageBitmap(icon_w, icon_h, icon_bgra);
+    if (!hbmp) {
+        composeknLog("drag: CreateDIBSection for drag image failed");
+        return;
+    }
+
+    SHDRAGIMAGE di{};
+    di.sizeDragImage.cx = icon_w;
+    di.sizeDragImage.cy = icon_h;
+    di.ptOffset.x = hot_x;
+    di.ptOffset.y = hot_y;
+    di.hbmpDragImage = hbmp;
+    di.crColorKey = CLR_NONE;
+
+    IDragSourceHelper* helper = nullptr;
+    HRESULT chr = CoCreateInstance(
+        CLSID_DragDropHelper,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_IDragSourceHelper,
+        reinterpret_cast<void**>(&helper));
+    if (FAILED(chr) || helper == nullptr) {
+        composeknLog("drag: CoCreateInstance(DragDropHelper) failed hr=0x%08lX",
+                     (unsigned long)chr);
+        DeleteObject(hbmp);
+        return;
+    }
+
+    HRESULT ihr = helper->InitializeFromBitmap(&di, data);
+    helper->Release();
+    if (FAILED(ihr)) {
+        // Ownership stays with us on failure — free the bitmap.
+        composeknLog("drag: InitializeFromBitmap failed hr=0x%08lX", (unsigned long)ihr);
+        DeleteObject(hbmp);
+        return;
+    }
+    // Success: DragDropHelper owns hbmp — do not DeleteObject.
+    composeknLog("drag: IDragSourceHelper image %dx%d hot=(%d,%d)",
+                 icon_w, icon_h, hot_x, hot_y);
+}
+
 extern "C" int32_t composekn_win32_do_drag_drop(
     ComposeKNWin32Window* window,
     const char* utf8_files,
     const char* utf8_text,
-    int32_t allowed_effects
+    int32_t allowed_effects,
+    int32_t icon_w,
+    int32_t icon_h,
+    const uint8_t* icon_bgra,
+    int32_t hot_x,
+    int32_t hot_y
 ) {
     const bool hasFiles = utf8_files != nullptr && utf8_files[0] != '\0';
     const bool hasText = utf8_text != nullptr && utf8_text[0] != '\0';
@@ -4005,6 +4107,10 @@ extern "C" int32_t composekn_win32_do_drag_drop(
     const DWORD allowed = allowed_effects != 0
         ? static_cast<DWORD>(allowed_effects)
         : DROPEFFECT_COPY;
+
+    // Custom drag decoration before the nested OLE loop.
+    attachDragSourceHelperImage(data, icon_w, icon_h, icon_bgra, hot_x, hot_y);
+
     // Leave any capture before OLE's nested loop (same idea as beginMove).
     ReleaseCapture();
     // Clear IME-dismiss Escape residue so QueryContinueDrag does not CANCEL instantly.

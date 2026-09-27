@@ -22,14 +22,15 @@ import androidx.compose.ui.geometry.Offset
 /**
  * 拖放传输的数据（**发起侧**：应用自己往外拖）。
  *
- * Windows 上映射为 OLE `IDataObject`：`files` → CF_HDROP，`text` → CF_UNICODETEXT。
- * 至少要有一个非空字段，否则 [WindowsDragAndDropManager] 不会启动 `DoDragDrop`。
+ * Windows：OLE `IDataObject`（`files` → CF_HDROP，`text` → CF_UNICODETEXT）。
+ * Linux：`wl_data_source`（`files` → text/uri-list，`text` → text/plain）。
+ * 至少要有一个非空字段，否则宿主不会启动拖放。
  */
 actual class DragAndDropTransferData @ExperimentalComposeUiApi constructor(
-    /** 文件路径列表（Windows：CF_HDROP）。 */
+    /** 文件路径列表（Win：CF_HDROP；Linux：text/uri-list）。 */
     @property:ExperimentalComposeUiApi
     val files: List<String> = emptyList(),
-    /** 纯文本（Windows：CF_UNICODETEXT）。 */
+    /** 纯文本（Win：CF_UNICODETEXT；Linux：text/plain）。 */
     @property:ExperimentalComposeUiApi
     val text: String? = null,
     /**

@@ -218,6 +218,9 @@ object LinuxApplicationHost {
                         session.markHostDetachedAfterPollFailure()
                     }
                 }
+                // 指针派发结束后再 start_drag；再 poll 完成态
+                LinuxDragAndDropManager.flushPendingOutgoingDrags()
+                LinuxDragAndDropManager.pollOutgoingDragResults()
                 flushMainUIDispatcher()
 
                 // StatusNotifierItem / DBusMenu 回调

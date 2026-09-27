@@ -72,6 +72,7 @@ class LinuxComposeApplication(
     init {
         initLinuxMainThread()
         ensureLinuxComposeBackendRegistered()
+        platformContext.dragWindowProvider = { composeWindow.window }
     }
 
     /** 渲染用的 Compose 场景。 */
@@ -212,8 +213,25 @@ class LinuxComposeApplication(
             scene.dispatchWaylandKeyEvent(event, inputState, backNavigationInput)
             return
         }
+        if (event.type.isDrag()) {
+            val accepted = scene.dispatchWaylandDragEvent(
+                event,
+                composeWindow.layer.contentScale,
+                composeWindow.window,
+            )
+            composeWindow.window.dndSetAccept(accepted)
+            return
+        }
         scene.dispatchWaylandEvent(event, composeWindow.layer.contentScale, inputState)
     }
+}
+
+private fun WaylandEventType.isDrag(): Boolean = when (this) {
+    WaylandEventType.DragEnter,
+    WaylandEventType.DragOver,
+    WaylandEventType.DragLeave,
+    WaylandEventType.DragDrop -> true
+    else -> false
 }
 
 private fun WaylandEventType.isPointerKeyOrTouch(): Boolean = when (this) {

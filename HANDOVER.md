@@ -3,13 +3,13 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.51**（DoDragDrop：清 Escape 残留 + 推迟到派发后；
-> 嵌套模态合成 UP；Wayland grab；compose-core `v1.12.1`；见文末；
+> **当前平台宿主基线：v0.5.52**（Linux 发出/接收 DnD + 富剪贴板；两端自定义拖影；
+> 嵌套模态合成 UP / DoDragDrop 推迟；compose-core `v1.12.1`；见文末；
 > 模块 README：`compose-kn-linux/README.md` / `compose-kn-windows/README.md`）。
 > **compose-core 源码基线：`v1.12.1`**（见 `vendor/compose-core.local/VERSIONS`；
 > Maven `compose_deps` 仍为 `1.11.1`）。
-> **本轮已补**：发出侧 DnD 不再在 Compose 指针栈里同步 `DoDragDrop`（IME Escape /
-> 空 keyState 会立刻 CANCEL）；队列清 Escape + QueryContinueDrag 异步交叉验证。
+> **本轮已补**：Linux `start_drag` / multi-MIME 剪贴板；Win+Linux
+> `drawDragDecoration`；入站 DnD 接 Compose。
 
 ## 0. 一句话背景
 
@@ -3998,7 +3998,7 @@ WAYLAND_DISPLAY=wayland-0 COMPOSEKN_SELFTEST=1 \
 COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
 ```
 
-##### 已知仍缺（v0.5.51 后）
+##### 已知仍缺（v0.5.52 后）
 
 * ~~CSD MOVE / `WindowDraggableArea`~~ → `ComposeNativeWindowHandle.beginMove` +
   foundation `WindowDraggableArea.linux.kt`（Win/Linux）；画廊「无边框窗」；
@@ -4008,7 +4008,13 @@ COMPOSEKN_SELFTEST=window   # 或画廊手测 Tray / 第二扇窗 / 关窗
   Wayland `beginMove`+`beginResize`+portal FileDialog：统一合成左键 UP
 * ~~DoDragDrop 立刻 CANCEL（v0.5.50 回归）~~ → v0.5.51：派发后再 `DoDragDrop`；
   进 OLE 前清 Escape 残留；`QueryContinueDrag` 用 `GetAsyncKeyState` 交叉验证
-* 自定义装饰图拖出（仍未做）；Linux 尚无发出侧 DnD（`wl_data_source` start_drag）
+* ~~自定义装饰图拖出~~ → Win：`IDragSourceHelper::InitializeFromBitmap`；
+  Linux：`start_drag` icon `wl_surface`（BGRA）；画廊/wayland-demo 已挂
+  `drawDragDecoration`
+* ~~Linux 发出侧 DnD~~ → `wl_data_device_start_drag` + `LinuxDragAndDropManager`
+  （排队 flush + `drag_poll_result`）；入站 enter/drop 已接 Compose
+* ~~Linux 富剪贴板~~ → multi-MIME：text/html、text/rtf、image/bmp、text/uri-list；
+  selftest 本地 roundtrip
 * ~~Wayland PlatformDefault / Aligned~~ → `xdg_toplevel_set_parent`（transient 提示）；
   Absolute / always-on-top 仍无标准协议（诚实 no-op / 记账）
 * ~~CI 自动跑 Linux `--selftest`~~ → `.github/workflows/linux-native-selftest.yml` +
@@ -4050,7 +4056,18 @@ v0.5.50 合成 UP 让每次手势都能进 `DoDragDrop`，暴露了潜伏问题�
 | portal FileChooser | Linux | 阻塞返回后合成 UP |
 
 托盘 `TrackPopupMenu` 走消息专用 HWND，不污染 Compose 客户区按键态，跳过。
-Linux 发出侧 DnD 尚未实现，落地时同样在 `wl_data_device.start_drag` 结束处合成。
+Linux 发出侧 DnD：`start_drag` 立即合成 UP（API 不阻塞，同 beginMove）；
+完成态经 `drag_poll_result` 回调 `onTransferCompleted`。
+
+#### Linux DnD + 富剪贴板 + 自定义拖影（v0.5.52）
+
+1. **Linux 富剪贴板**：`composekn_clipboard_set_rich` / get html·rtf·files·image；
+   MIME：text/plain、text/html、text/rtf(+application/rtf)、image/bmp、text/uri-list。
+2. **Linux DnD**：发出 `wl_data_device_start_drag`（`LinuxDragAndDropManager` 排队 flush）；
+   入站 enter/motion/leave/drop → Compose；可选 icon surface。
+3. **自定义拖影**：Win `IDragSourceHelper::InitializeFromBitmap`；
+   Linux icon `wl_surface`；两端光栅化 `drawDragDecoration` → BGRA。
+4. 画廊 / wayland-demo 已挂装饰色块；selftest 含剪贴板本地 roundtrip。
 
 #### Wayland 定位对齐 + Win beginMove UP（v0.5.49）
 

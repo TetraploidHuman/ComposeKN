@@ -3,7 +3,7 @@
     androidx.compose.ui.ExperimentalComposeUiApi::class,
 )
 
-package com.composekn.windows
+package com.composekn.linux
 
 import androidx.compose.ui.draganddrop.DragAndDropTransferData
 import androidx.compose.ui.geometry.Offset
@@ -17,24 +17,18 @@ import androidx.compose.ui.platform.PlatformDragAndDropSource
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import kotlin.math.roundToInt
-import org.jetbrains.skiko.Win32Message
-import org.jetbrains.skiko.Win32Window
-import org.jetbrains.skiko.win32Log
+import org.jetbrains.skiko.WaylandWindow
 
 /**
- * Windows OLE 拖放**发出侧**，对齐上游 `AwtDragAndDropManager`：
+ * Wayland 拖放**发出侧**，对齐 [com.composekn.windows.WindowsDragAndDropManager]：
  *
- * 1. `isRequestDragAndDropTransferRequired = true` —— foundation 的
- *    `Modifier.dragAndDropSource` 才会挂启动手势；
- * 2. `requestDragAndDropTransfer` → 源节点的 `startDragAndDropTransfer` →
- *    排入 [pendingOutgoing]；[flushPendingOutgoingDrags] 在指针派发结束后再
- *    `DoDragDrop`（避免在 Compose `handleEvent` 栈里跑 OLE 嵌套泵，IME 残留
- *    Escape / 空 keyState 会立刻 CANCEL）；
- * 3. [drawDragDecoration] 光栅化为 BGRA，经 `IDragSourceHelper::InitializeFromBitmap`
- *    作为自定义拖影（热点取装饰中心）。
+ * 1. `isRequestDragAndDropTransferRequired = true`
+ * 2. 排队后由 [flushPendingOutgoingDrags] 在指针派发结束后再 `start_drag`
+ * 3. [drawDragDecoration] → BGRA 图标 surface（热点取装饰中心）
+ * 4. 完成态经 [pollOutgoingDragResults] 读 `drag_poll_result`（非阻塞）
  */
-internal class WindowsDragAndDropManager(
-    private val windowProvider: () -> Win32Window?,
+internal class LinuxDragAndDropManager(
+    private val windowProvider: () -> WaylandWindow?,
 ) : PlatformDragAndDropManager {
 
     override val isRequestDragAndDropTransferRequired: Boolean
@@ -70,56 +64,48 @@ internal class WindowsDragAndDropManager(
         val files = transferData.files.takeIf { it.isNotEmpty() }
         val text = transferData.text?.takeIf { it.isNotEmpty() }
         if (files == null && text == null) {
-            win32Log("drag: Source 没有 files/text，跳过 DoDragDrop")
+            println("composekn: drag Source 没有 files/text，跳过 start_drag")
             transferData.onTransferCompleted?.invoke(false)
             return false
         }
         val window = windowProvider()
         if (window == null) {
-            win32Log("drag: 窗口尚未就绪，无法 DoDragDrop")
+            println("composekn: drag 窗口尚未就绪，无法 start_drag")
             transferData.onTransferCompleted?.invoke(false)
             return false
         }
 
-        val (iconW, iconH, iconBgra, hotX, hotY) = renderDragDecoration(
-            decorationSize = decorationSize,
-            drawDragDecoration = drawDragDecoration,
-        )
-
-        // 不要在 pointer 派发栈里同步 DoDragDrop：嵌套 OLE 泵会立刻吃到队列里
-        // IME 收起注入的 Escape / 空 keyState。排到 drainEvents 之后再跑。
+        val icon = renderDragDecoration(decorationSize, drawDragDecoration)
         pendingOutgoing.add(
             PendingOutgoingDrag(
                 window = window,
                 files = files,
                 text = text,
-                iconW = iconW,
-                iconH = iconH,
-                iconBgra = iconBgra,
-                hotX = hotX,
-                hotY = hotY,
+                iconW = icon.width,
+                iconH = icon.height,
+                iconBgra = icon.bgra,
+                hotX = icon.hotX,
+                hotY = icon.hotY,
                 onCompleted = transferData.onTransferCompleted,
             ),
         )
-        win32Log(
-            "drag: Source 已排队，待 drain 后 DoDragDrop" +
-                if (iconBgra != null) " (icon ${iconW}x${iconH} hot=($hotX,$hotY))" else "",
+        println(
+            "composekn: drag Source 已排队" +
+                if (icon.bgra != null) " (icon ${icon.width}x${icon.height})" else "",
         )
-        window.wake()
+        LinuxApplicationHost.wake()
         return true
     }
 
-    /**
-     * 对齐 [androidx.compose.ui.platform.AwtDragAndDropManager] / Linux
-     * `Painter.toTrayIconBgra`：画进 [ImageBitmap]，再导出自上而下 BGRA。
-     * 热点取装饰中心（相对左上角）。
-     */
     private fun renderDragDecoration(
         decorationSize: Size,
         drawDragDecoration: DrawScope.() -> Unit,
     ): DragIcon {
         val w = decorationSize.width.roundToInt().coerceAtLeast(1)
         val h = decorationSize.height.roundToInt().coerceAtLeast(1)
+        if (w <= 1 && h <= 1 && decorationSize.width < 1f) {
+            return DragIcon(0, 0, null, 0, 0)
+        }
         val imageBitmap = ImageBitmap(w, h)
         val canvas = Canvas(imageBitmap)
         CanvasDrawScope().draw(
@@ -139,13 +125,7 @@ internal class WindowsDragAndDropManager(
             bgra[i * 4 + 2] = ((color shr 16) and 0xFF).toByte()
             bgra[i * 4 + 3] = ((color shr 24) and 0xFF).toByte()
         }
-        return DragIcon(
-            width = w,
-            height = h,
-            bgra = bgra,
-            hotX = w / 2,
-            hotY = h / 2,
-        )
+        return DragIcon(w, h, bgra, w / 2, h / 2)
     }
 
     private data class DragIcon(
@@ -157,7 +137,7 @@ internal class WindowsDragAndDropManager(
     )
 
     private data class PendingOutgoingDrag(
-        val window: Win32Window,
+        val window: WaylandWindow,
         val files: List<String>?,
         val text: String?,
         val iconW: Int,
@@ -168,31 +148,61 @@ internal class WindowsDragAndDropManager(
         val onCompleted: ((Boolean) -> Unit)?,
     )
 
+    private data class ActiveOutgoingDrag(
+        val window: WaylandWindow,
+        val onCompleted: ((Boolean) -> Unit)?,
+    )
+
     companion object {
         private val pendingOutgoing = mutableListOf<PendingOutgoingDrag>()
+        private val activeOutgoing = mutableListOf<ActiveOutgoingDrag>()
 
-        /**
-         * 在共享泵 / 独占泵「本轮事件派发结束」后调用：真正进入 `DoDragDrop`。
-         */
+        /** 指针派发结束后调用：真正 `wl_data_device_start_drag`。 */
         fun flushPendingOutgoingDrags() {
             if (pendingOutgoing.isEmpty()) return
             val batch = pendingOutgoing.toList()
             pendingOutgoing.clear()
             for (pending in batch) {
-                val effect = pending.window.doDragDrop(
+                val started = pending.window.startDrag(
                     files = pending.files,
                     text = pending.text,
-                    allowedEffects = Win32Message.DROPEFFECT_COPY,
-                    iconW = pending.iconW,
-                    iconH = pending.iconH,
                     iconBgra = pending.iconBgra,
+                    iconWidth = pending.iconW,
+                    iconHeight = pending.iconH,
                     hotX = pending.hotX,
                     hotY = pending.hotY,
                 )
-                val success = effect > 0
-                win32Log("drag: Source DoDragDrop effect=$effect success=$success")
-                pending.onCompleted?.invoke(success)
+                if (started) {
+                    activeOutgoing.add(
+                        ActiveOutgoingDrag(pending.window, pending.onCompleted),
+                    )
+                    println("composekn: drag start_drag 已发起")
+                } else {
+                    println("composekn: drag start_drag 失败")
+                    pending.onCompleted?.invoke(false)
+                }
             }
+        }
+
+        /** 每轮泵结束调用：消费 `drag_poll_result`。 */
+        fun pollOutgoingDragResults() {
+            if (activeOutgoing.isEmpty()) return
+            val still = mutableListOf<ActiveOutgoingDrag>()
+            for (active in activeOutgoing) {
+                when (val result = active.window.dragPollResult()) {
+                    -1 -> still.add(active)
+                    0 -> {
+                        println("composekn: drag Source 取消")
+                        active.onCompleted?.invoke(false)
+                    }
+                    else -> {
+                        println("composekn: drag Source 成功 result=$result")
+                        active.onCompleted?.invoke(result > 0)
+                    }
+                }
+            }
+            activeOutgoing.clear()
+            activeOutgoing.addAll(still)
         }
     }
 }

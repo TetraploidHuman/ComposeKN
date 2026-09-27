@@ -2,9 +2,7 @@
 
 package org.jetbrains.skiko
 
-import kotlinx.cinterop.COpaquePointer
-import kotlinx.cinterop.cstr
-import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.*
 import org.jetbrains.skia.impl.NativePointer
 
 /**
@@ -145,6 +143,72 @@ class WaylandWindow(
     fun requestClose() = composekn_window_request_close(native)
 
     fun beginMove() = composekn_window_begin_move(native)
+
+    /**
+     * Start outbound drag-and-drop (non-blocking). Poll [dragPollResult] for
+     * completion (-1 active, 0 cancelled, 1 success). Optional BGRA drag icon.
+     */
+    fun startDrag(
+        files: List<String>? = null,
+        text: String? = null,
+        iconBgra: ByteArray? = null,
+        iconWidth: Int = 0,
+        iconHeight: Int = 0,
+        hotX: Int = 0,
+        hotY: Int = 0,
+    ): Boolean {
+        val filesJoined = files?.takeIf { it.isNotEmpty() }?.joinToString("\n")
+        return useCStringOrNull(filesJoined) { filesPtr ->
+            useCStringOrNull(text) { textPtr ->
+                if (iconBgra == null || iconWidth <= 0 || iconHeight <= 0) {
+                    composekn_window_start_drag(
+                        native, filesPtr, textPtr, 0, 0, null, hotX, hotY,
+                    )
+                } else {
+                    iconBgra.usePinned { pinned ->
+                        composekn_window_start_drag(
+                            native,
+                            filesPtr,
+                            textPtr,
+                            iconWidth,
+                            iconHeight,
+                            pinned.addressOf(0).reinterpret<UByteVar>(),
+                            hotX,
+                            hotY,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** -1 still active/none, 0 cancelled, 1 success (clears when read if finished). */
+    fun dragPollResult(): Int = composekn_window_drag_poll_result(native)
+
+    fun dndSetAccept(accept: Boolean) = composekn_window_dnd_set_accept(native, accept)
+
+    fun dndPopFiles(): List<String> {
+        val joined = dndPopString(::composekn_window_dnd_pop_files) ?: return emptyList()
+        return joined.split('\n').filter { it.isNotEmpty() }
+    }
+
+    fun dndPopText(): String? = dndPopString(::composekn_window_dnd_pop_text)
+
+    private fun dndPopString(
+        pop: (COpaquePointer?, CPointer<ByteVar>?, Int) -> Int,
+    ): String? = memScoped {
+        val probeSize = 64 * 1024
+        val probe = allocArray<ByteVar>(probeSize)
+        val needed = pop(native, probe, probeSize)
+        if (needed <= 0) return@memScoped null
+        if (needed < probeSize) {
+            return@memScoped probe.readBytes(needed).decodeToString()
+        }
+        val buffer = allocArray<ByteVar>(needed + 1)
+        val written = pop(native, buffer, needed + 1)
+        if (written <= 0) null
+        else buffer.readBytes(written).decodeToString()
+    }
 
     /**
      * `xdg_toplevel_set_parent`：Dialog / Aligned / PlatformDefault 的可移植提示。

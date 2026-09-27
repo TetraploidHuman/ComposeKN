@@ -26,6 +26,11 @@ typedef enum ComposeKNEventType {
     COMPOSEKN_EVENT_TOUCH_UP = 11,
     /** Keyboard focus: state=1 enter, state=0 leave (mirrors Win32 FocusEvent). */
     COMPOSEKN_EVENT_FOCUS = 12,
+    /** Inbound DnD (wl_data_device enter/motion/leave/drop). */
+    COMPOSEKN_EVENT_DRAG_ENTER = 13,
+    COMPOSEKN_EVENT_DRAG_OVER = 14,
+    COMPOSEKN_EVENT_DRAG_LEAVE = 15,
+    COMPOSEKN_EVENT_DRAG_DROP = 16,
 } ComposeKNEventType;
 
 /* IME (zwp_text_input_v3) event kinds, delivered via composekn_window_pop_ime_event. */
@@ -156,6 +161,59 @@ bool composekn_clipboard_get_text(char* buffer, size_t buffer_size);
 
 /** Write UTF-8 text to the system clipboard. */
 void composekn_clipboard_set_text(const char* text);
+
+/**
+ * Offer multiple MIME types on one wl_data_source (text/html/rtf/image/files).
+ * Null / zero-size args skip that format. files = '\n'-joined absolute paths.
+ */
+void composekn_clipboard_set_rich(
+    const char* utf8_text,
+    const char* utf8_html,
+    const char* utf8_rtf,
+    int32_t image_w,
+    int32_t image_h,
+    const uint8_t* bgra,
+    const char* utf8_files);
+
+/**
+ * Two-phase string getters (like Win32): return needed byte count when buffer is
+ * too small / null; return 0 when format absent; on success write bytes (no NUL)
+ * and return count written.
+ */
+int32_t composekn_clipboard_get_html(char* buf, int32_t size);
+int32_t composekn_clipboard_get_rtf(char* buf, int32_t size);
+int32_t composekn_clipboard_get_files(char* buf, int32_t size);
+
+/**
+ * Clipboard image as BGRA top-down. out_dims[0]=w, out_dims[1]=h.
+ * Returns needed byte count (w*h*4), or 0 if no image.
+ */
+int32_t composekn_clipboard_get_image(uint8_t* bgra, int32_t size, int32_t* out_dims);
+
+/**
+ * Start outbound drag (wl_data_device.start_drag). Non-blocking — compositor owns
+ * the grab; poll composekn_window_drag_poll_result. icon_bgra may be null.
+ * hot_x/hot_y are hotspot in icon pixels.
+ */
+bool composekn_window_start_drag(
+    ComposeKNWindow* window,
+    const char* utf8_files,
+    const char* utf8_text,
+    int32_t icon_w,
+    int32_t icon_h,
+    const uint8_t* icon_bgra,
+    int32_t hot_x,
+    int32_t hot_y);
+
+/** -1 still active/none, 0 cancelled, 1 success. Clears when read if finished. */
+int32_t composekn_window_drag_poll_result(ComposeKNWindow* window);
+
+/** Inbound DnD: accept/reject current offer (null mime = reject). */
+void composekn_window_dnd_set_accept(ComposeKNWindow* window, bool accept);
+
+/** After DragDrop: pop cached files ('\n' paths) / text. Two-phase like getters. */
+int32_t composekn_window_dnd_pop_files(ComposeKNWindow* window, char* buf, int32_t size);
+int32_t composekn_window_dnd_pop_text(ComposeKNWindow* window, char* buf, int32_t size);
 
 /** True when the compositor provides server-side window decorations. */
 bool composekn_window_uses_server_decoration(ComposeKNWindow* window);

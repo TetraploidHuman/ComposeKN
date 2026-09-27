@@ -6,11 +6,14 @@
 #include <wayland-egl.h>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +22,20 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef SYS_memfd_create
+#if defined(__x86_64__)
+#define SYS_memfd_create 319
+#elif defined(__aarch64__)
+#define SYS_memfd_create 279
+#endif
+#endif
+#endif
 
 #include <xkbcommon/xkbcommon.h>
 
@@ -117,12 +134,65 @@ struct ComposeKNWindow {
 
     wl_data_device_manager* data_device_manager = nullptr;
     wl_data_device* data_device = nullptr;
+    wl_shm* shm = nullptr;
     wl_data_source* clipboard_source = nullptr;
     wl_data_offer* selection_offer = nullptr;
+
+    // selection receive caches (get*)
     std::string clipboard_cache;
-    std::string clipboard_set_pending;
+    std::string clipboard_html_cache;
+    std::string clipboard_rtf_cache;
+    std::string clipboard_files_cache;
+    std::vector<uint8_t> clipboard_image_bgra;
+    int32_t clipboard_image_w = 0;
+    int32_t clipboard_image_h = 0;
     bool selection_has_text = false;
+    bool selection_has_html = false;
+    bool selection_has_rtf = false;
+    bool selection_has_image = false;
+    bool selection_has_uri = false;
+    std::vector<std::string> selection_mimes;
     bool selection_read_pending = false;
+
+    // set* pending for data_source send
+    std::string clipboard_set_pending;
+    std::string clipboard_set_html;
+    std::string clipboard_set_rtf;
+    std::string clipboard_set_files_uri;
+    std::vector<uint8_t> clipboard_set_bmp;
+    int32_t clipboard_set_image_w = 0;
+    int32_t clipboard_set_image_h = 0;
+    std::vector<uint8_t> clipboard_set_bgra;
+
+    // DnD outbound
+    wl_data_source* drag_source = nullptr;
+    std::string drag_set_text;
+    std::string drag_set_files_uri;
+    std::vector<uint8_t> drag_icon_bgra;
+    int32_t drag_icon_w = 0;
+    int32_t drag_icon_h = 0;
+    int32_t drag_hot_x = 0;
+    int32_t drag_hot_y = 0;
+    wl_surface* drag_icon_surface = nullptr;
+    wl_buffer* drag_icon_buffer = nullptr;
+    void* drag_icon_shm = nullptr;
+    size_t drag_icon_shm_size = 0;
+    int drag_icon_fd = -1;
+    int32_t drag_result = -1; // -1 pending/none, 0 cancel, 1 success
+    bool drag_active = false;
+    bool drag_drop_performed = false;
+
+    // DnD inbound
+    wl_data_offer* dnd_offer = nullptr;
+    uint32_t dnd_serial = 0;
+    double dnd_x = 0.0;
+    double dnd_y = 0.0;
+    bool dnd_has_text = false;
+    bool dnd_has_uri = false;
+    std::string dnd_files_cache;
+    std::string dnd_text_cache;
+    bool dnd_accept = false;
+
     uint32_t last_serial = 0;
 
     zwp_text_input_manager_v3* text_input_manager = nullptr;
@@ -153,6 +223,7 @@ struct ComposeKNSharedDisplay {
     wl_touch* touch = nullptr;
     wl_data_device_manager* data_device_manager = nullptr;
     wl_data_device* data_device = nullptr;
+    wl_shm* shm = nullptr;
     zxdg_decoration_manager_v1* decoration_manager = nullptr;
     zwp_text_input_manager_v3* text_input_manager = nullptr;
     zwp_text_input_v3* text_input = nullptr;
@@ -341,6 +412,7 @@ static void mark_close_requested(ComposeKNWindow* window) {
 
 static void ensure_data_device();
 static void read_selection_into_cache(ComposeKNWindow* window);
+static void composekn_process_deferred_selection(ComposeKNWindow* window);
 static bool init_egl(ComposeKNWindow* window);
 static void try_init_egl_if_needed(ComposeKNWindow* window);
 static void composekn_flush_deferred_frame(ComposeKNWindow* window);
@@ -350,6 +422,9 @@ static void refresh_all_window_shared_aliases();
 static bool acquire_shared_display();
 static void release_shared_display();
 static ComposeKNWindow* clipboard_target_window();
+static void synth_left_button_up_if_pressed(ComposeKNWindow* window, const char* reason);
+static void cleanup_drag_icon(ComposeKNWindow* window);
+static void finish_outbound_drag(ComposeKNWindow* window, int32_t result);
 
 static void alias_shared_onto_window(ComposeKNWindow* window) {
     if (window == nullptr) {
@@ -365,6 +440,7 @@ static void alias_shared_onto_window(ComposeKNWindow* window) {
     window->touch = g_shared.touch;
     window->data_device_manager = g_shared.data_device_manager;
     window->data_device = g_shared.data_device;
+    window->shm = g_shared.shm;
     window->decoration_manager = g_shared.decoration_manager;
     window->text_input_manager = g_shared.text_input_manager;
     window->text_input = g_shared.text_input;
@@ -396,6 +472,7 @@ static void clear_window_shared_aliases(ComposeKNWindow* window) {
     window->touch = nullptr;
     window->data_device_manager = nullptr;
     window->data_device = nullptr;
+    window->shm = nullptr;
     window->decoration_manager = nullptr;
     window->text_input_manager = nullptr;
     window->text_input = nullptr;
@@ -500,6 +577,11 @@ static void registry_global(
             wl_registry_bind(registry, id, &wl_data_device_manager_interface, 3)
         );
         ensure_data_device();
+    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
+        shared->shm = static_cast<wl_shm*>(
+            wl_registry_bind(registry, id, &wl_shm_interface, 1)
+        );
+        refresh_all_window_shared_aliases();
     } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
         const uint32_t bind_version = version < 2 ? version : 2;
         shared->decoration_manager = static_cast<zxdg_decoration_manager_v1*>(
@@ -1297,66 +1379,376 @@ static void keyboard_repeat_info(void* data, wl_keyboard* keyboard, int32_t rate
     (void)delay;
 }
 
-static void data_offer_offer(void* data, wl_data_offer* offer, const char* mime_type) {
-    (void)data;
-    (void)offer;
-    ComposeKNWindow* window = clipboard_target_window();
-    if (window == nullptr) {
+// ---------------------------------------------------------------------------
+// Clipboard / DnD helpers (multi-MIME wl_data_source / wl_data_offer)
+// ---------------------------------------------------------------------------
+
+struct OfferMimeState {
+    std::vector<std::string> mimes;
+    bool has_text = false;
+    bool has_html = false;
+    bool has_rtf = false;
+    bool has_image = false;
+    bool has_uri = false;
+};
+
+/** Inbound DnD target while pointer is over a surface (leave/motion/drop lack surface). */
+static ComposeKNWindow* g_dnd_target = nullptr;
+
+static void classify_mime(OfferMimeState* state, const char* mime_type) {
+    if (state == nullptr || mime_type == nullptr) {
         return;
     }
-    if (mime_type != nullptr && strstr(mime_type, "text/plain") != nullptr) {
-        window->selection_has_text = true;
+    state->mimes.emplace_back(mime_type);
+    if (strstr(mime_type, "text/plain") != nullptr) {
+        state->has_text = true;
+    }
+    if (strcmp(mime_type, "text/html") == 0) {
+        state->has_html = true;
+    }
+    if (strcmp(mime_type, "text/rtf") == 0 || strcmp(mime_type, "application/rtf") == 0) {
+        state->has_rtf = true;
+    }
+    if (strncmp(mime_type, "image/", 6) == 0) {
+        state->has_image = true;
+    }
+    if (strcmp(mime_type, "text/uri-list") == 0) {
+        state->has_uri = true;
     }
 }
 
-static const wl_data_offer_listener data_offer_listener = {
-    data_offer_offer,
-};
+static void apply_mime_state_to_selection(ComposeKNWindow* window, const OfferMimeState& state) {
+    window->selection_mimes = state.mimes;
+    window->selection_has_text = state.has_text;
+    window->selection_has_html = state.has_html;
+    window->selection_has_rtf = state.has_rtf;
+    window->selection_has_image = state.has_image;
+    window->selection_has_uri = state.has_uri;
+}
 
-static void read_selection_into_cache(ComposeKNWindow* window) {
-    if (window == nullptr || window->selection_offer == nullptr || !window->selection_has_text) {
-        return;
+static void clear_selection_caches(ComposeKNWindow* window) {
+    window->clipboard_cache.clear();
+    window->clipboard_html_cache.clear();
+    window->clipboard_rtf_cache.clear();
+    window->clipboard_files_cache.clear();
+    window->clipboard_image_bgra.clear();
+    window->clipboard_image_w = 0;
+    window->clipboard_image_h = 0;
+}
+
+static std::string percent_encode_path(const std::string& path) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(path.size() + 16);
+    for (unsigned char c : path) {
+        if (std::isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[(c >> 4) & 0xF]);
+            out.push_back(kHex[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static std::string percent_decode(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size()) {
+            const int hi = hex_nibble(in[i + 1]);
+            const int lo = hex_nibble(in[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(in[i]);
+    }
+    return out;
+}
+
+static std::string paths_to_uri_list(const char* paths_joined) {
+    if (paths_joined == nullptr || paths_joined[0] == '\0') {
+        return {};
+    }
+    std::string out;
+    const char* p = paths_joined;
+    while (*p) {
+        while (*p == '\n' || *p == '\r') ++p;
+        if (!*p) break;
+        const char* start = p;
+        while (*p && *p != '\n' && *p != '\r') ++p;
+        std::string path(start, p);
+        if (path.empty()) continue;
+        out += "file://";
+        if (!path.empty() && path[0] != '/') {
+            out += '/';
+        }
+        out += percent_encode_path(path);
+        out += "\r\n";
+    }
+    return out;
+}
+
+static std::string uri_list_to_paths(const std::string& uri_list) {
+    std::string out;
+    size_t i = 0;
+    while (i < uri_list.size()) {
+        size_t end = uri_list.find_first_of("\r\n", i);
+        if (end == std::string::npos) end = uri_list.size();
+        std::string line = uri_list.substr(i, end - i);
+        i = end;
+        while (i < uri_list.size() && (uri_list[i] == '\r' || uri_list[i] == '\n')) ++i;
+        if (line.empty() || line[0] == '#') continue;
+        // Trim trailing whitespace
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        std::string path;
+        if (line.compare(0, 8, "file:///") == 0) {
+            path = percent_decode(line.substr(7)); // keep leading /
+        } else if (line.compare(0, 7, "file://") == 0) {
+            // file://host/path or file://path
+            size_t slash = line.find('/', 7);
+            if (slash == std::string::npos) continue;
+            path = percent_decode(line.substr(slash));
+        } else if (!line.empty() && line[0] == '/') {
+            path = percent_decode(line);
+        } else {
+            continue;
+        }
+        if (path.empty()) continue;
+        if (!out.empty()) out.push_back('\n');
+        out += path;
+    }
+    return out;
+}
+
+#pragma pack(push, 1)
+struct ComposeKNBmpFileHeader {
+    uint16_t bfType;
+    uint32_t bfSize;
+    uint16_t bfReserved1;
+    uint16_t bfReserved2;
+    uint32_t bfOffBits;
+};
+struct ComposeKNBmpInfoHeader {
+    uint32_t biSize;
+    int32_t biWidth;
+    int32_t biHeight;
+    uint16_t biPlanes;
+    uint16_t biBitCount;
+    uint32_t biCompression;
+    uint32_t biSizeImage;
+    int32_t biXPelsPerMeter;
+    int32_t biYPelsPerMeter;
+    uint32_t biClrUsed;
+    uint32_t biClrImportant;
+};
+#pragma pack(pop)
+
+static std::vector<uint8_t> encode_bmp_bgra(int32_t w, int32_t h, const uint8_t* bgra) {
+    std::vector<uint8_t> empty;
+    if (w <= 0 || h <= 0 || bgra == nullptr) return empty;
+    const int32_t stride = ((w * 3 + 3) / 4) * 4; // 24bpp row padded
+    const uint32_t pixel_bytes = static_cast<uint32_t>(stride) * static_cast<uint32_t>(h);
+    const uint32_t off = sizeof(ComposeKNBmpFileHeader) + sizeof(ComposeKNBmpInfoHeader);
+    std::vector<uint8_t> out(off + pixel_bytes, 0);
+    auto* fh = reinterpret_cast<ComposeKNBmpFileHeader*>(out.data());
+    fh->bfType = 0x4D42;
+    fh->bfSize = static_cast<uint32_t>(out.size());
+    fh->bfOffBits = off;
+    auto* ih = reinterpret_cast<ComposeKNBmpInfoHeader*>(out.data() + sizeof(ComposeKNBmpFileHeader));
+    ih->biSize = sizeof(ComposeKNBmpInfoHeader);
+    ih->biWidth = w;
+    ih->biHeight = h; // bottom-up
+    ih->biPlanes = 1;
+    ih->biBitCount = 24;
+    ih->biCompression = 0;
+    ih->biSizeImage = pixel_bytes;
+    for (int32_t y = 0; y < h; ++y) {
+        const uint8_t* src = bgra + static_cast<size_t>(y) * static_cast<size_t>(w) * 4u;
+        uint8_t* dst = out.data() + off + static_cast<size_t>(h - 1 - y) * static_cast<size_t>(stride);
+        for (int32_t x = 0; x < w; ++x) {
+            dst[x * 3 + 0] = src[x * 4 + 0]; // B
+            dst[x * 3 + 1] = src[x * 4 + 1]; // G
+            dst[x * 3 + 2] = src[x * 4 + 2]; // R
+        }
+    }
+    return out;
+}
+
+static bool decode_bmp_to_bgra(
+    const uint8_t* bytes,
+    size_t len,
+    std::vector<uint8_t>& out_bgra,
+    int32_t& out_w,
+    int32_t& out_h
+) {
+    out_bgra.clear();
+    out_w = 0;
+    out_h = 0;
+    if (bytes == nullptr || len < sizeof(ComposeKNBmpFileHeader) + sizeof(ComposeKNBmpInfoHeader)) {
+        return false;
+    }
+    const auto* fh = reinterpret_cast<const ComposeKNBmpFileHeader*>(bytes);
+    if (fh->bfType != 0x4D42) return false;
+    const auto* ih = reinterpret_cast<const ComposeKNBmpInfoHeader*>(bytes + sizeof(ComposeKNBmpFileHeader));
+    if (ih->biSize < 40) return false;
+    int32_t w = ih->biWidth;
+    int32_t h_raw = ih->biHeight;
+    bool top_down = h_raw < 0;
+    int32_t h = top_down ? -h_raw : h_raw;
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384) return false;
+    const uint16_t bpp = ih->biBitCount;
+    if (bpp != 24 && bpp != 32) return false;
+    if (ih->biCompression != 0 && !(bpp == 32 && ih->biCompression == 3)) return false;
+    uint32_t off = fh->bfOffBits;
+    if (off == 0) off = static_cast<uint32_t>(sizeof(ComposeKNBmpFileHeader) + ih->biSize);
+    if (off >= len) return false;
+    const int32_t row_bytes = ((w * (bpp / 8) + 3) / 4) * 4;
+    if (off + static_cast<uint32_t>(row_bytes) * static_cast<uint32_t>(h) > len) return false;
+    out_bgra.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
+    for (int32_t y = 0; y < h; ++y) {
+        const int32_t src_y = top_down ? y : (h - 1 - y);
+        const uint8_t* src = bytes + off + static_cast<size_t>(src_y) * static_cast<size_t>(row_bytes);
+        uint8_t* dst = out_bgra.data() + static_cast<size_t>(y) * static_cast<size_t>(w) * 4u;
+        for (int32_t x = 0; x < w; ++x) {
+            if (bpp == 24) {
+                dst[x * 4 + 0] = src[x * 3 + 0];
+                dst[x * 4 + 1] = src[x * 3 + 1];
+                dst[x * 4 + 2] = src[x * 3 + 2];
+                dst[x * 4 + 3] = 255;
+            } else {
+                dst[x * 4 + 0] = src[x * 4 + 0];
+                dst[x * 4 + 1] = src[x * 4 + 1];
+                dst[x * 4 + 2] = src[x * 4 + 2];
+                dst[x * 4 + 3] = src[x * 4 + 3];
+            }
+        }
+    }
+    out_w = w;
+    out_h = h;
+    return true;
+}
+
+static std::string receive_offer_mime(
+    ComposeKNWindow* window,
+    wl_data_offer* offer,
+    const char* mime
+) {
+    std::string result;
+    if (window == nullptr || offer == nullptr || mime == nullptr || window->display == nullptr) {
+        return result;
     }
     int fds[2];
     if (pipe(fds) != 0) {
-        return;
+        return result;
     }
-    wl_data_offer_receive(window->selection_offer, "text/plain;charset=utf-8", fds[1]);
+    wl_data_offer_receive(offer, mime, fds[1]);
     wl_display_flush(window->display);
     close(fds[1]);
 
     struct pollfd pfd{};
     pfd.fd = fds[0];
     pfd.events = POLLIN;
-    if (poll(&pfd, 1, 1000) <= 0) {
+    if (poll(&pfd, 1, 2000) <= 0) {
         close(fds[0]);
-        return;
+        return result;
     }
-
-    std::string result;
     char buf[4096];
     ssize_t bytes_read;
     while ((bytes_read = read(fds[0], buf, sizeof(buf))) > 0) {
         result.append(buf, static_cast<size_t>(bytes_read));
     }
     close(fds[0]);
+    return result;
+}
 
-    if (result.empty()) {
-        if (pipe(fds) != 0) {
-            return;
+static void data_offer_offer(void* data, wl_data_offer* offer, const char* mime_type) {
+    (void)offer;
+    classify_mime(static_cast<OfferMimeState*>(data), mime_type);
+}
+
+static void data_offer_source_actions(void* data, wl_data_offer* offer, uint32_t source_actions) {
+    (void)data;
+    (void)offer;
+    (void)source_actions;
+}
+
+static void data_offer_action(void* data, wl_data_offer* offer, uint32_t dnd_action) {
+    (void)data;
+    (void)offer;
+    (void)dnd_action;
+}
+
+static const wl_data_offer_listener data_offer_listener = {
+    data_offer_offer,
+    data_offer_source_actions,
+    data_offer_action,
+};
+
+static void read_selection_into_cache(ComposeKNWindow* window) {
+    if (window == nullptr || window->selection_offer == nullptr) {
+        return;
+    }
+    clear_selection_caches(window);
+
+    if (window->selection_has_text) {
+        std::string text = receive_offer_mime(window, window->selection_offer, "text/plain;charset=utf-8");
+        if (text.empty()) {
+            text = receive_offer_mime(window, window->selection_offer, "text/plain");
         }
-        wl_data_offer_receive(window->selection_offer, "text/plain", fds[1]);
-        wl_display_flush(window->display);
-        close(fds[1]);
-        pfd.fd = fds[0];
-        if (poll(&pfd, 1, 1000) > 0) {
-            while ((bytes_read = read(fds[0], buf, sizeof(buf))) > 0) {
-                result.append(buf, static_cast<size_t>(bytes_read));
+        window->clipboard_cache = std::move(text);
+    }
+    if (window->selection_has_html) {
+        window->clipboard_html_cache =
+            receive_offer_mime(window, window->selection_offer, "text/html");
+    }
+    if (window->selection_has_rtf) {
+        std::string rtf = receive_offer_mime(window, window->selection_offer, "text/rtf");
+        if (rtf.empty()) {
+            rtf = receive_offer_mime(window, window->selection_offer, "application/rtf");
+        }
+        window->clipboard_rtf_cache = std::move(rtf);
+    }
+    if (window->selection_has_uri) {
+        const std::string uri =
+            receive_offer_mime(window, window->selection_offer, "text/uri-list");
+        window->clipboard_files_cache = uri_list_to_paths(uri);
+    }
+    if (window->selection_has_image) {
+        // Prefer BMP (what we offer); also try png bytes only if labeled image/bmp miss.
+        std::string bmp = receive_offer_mime(window, window->selection_offer, "image/bmp");
+        if (bmp.empty()) {
+            // Some apps offer image/png — skip decode (no png decoder here).
+            for (const auto& mime : window->selection_mimes) {
+                if (mime == "image/bmp" || mime == "image/x-bmp" || mime == "image/x-ms-bmp") {
+                    bmp = receive_offer_mime(window, window->selection_offer, mime.c_str());
+                    if (!bmp.empty()) break;
+                }
             }
         }
-        close(fds[0]);
+        if (!bmp.empty()) {
+            int32_t w = 0, h = 0;
+            std::vector<uint8_t> bgra;
+            if (decode_bmp_to_bgra(
+                    reinterpret_cast<const uint8_t*>(bmp.data()), bmp.size(), bgra, w, h
+                )) {
+                window->clipboard_image_bgra = std::move(bgra);
+                window->clipboard_image_w = w;
+                window->clipboard_image_h = h;
+            }
+        }
     }
-    window->clipboard_cache = result;
 }
 
 static void composekn_process_deferred_selection(ComposeKNWindow* window) {
@@ -1364,7 +1756,8 @@ static void composekn_process_deferred_selection(ComposeKNWindow* window) {
         return;
     }
     window->selection_read_pending = false;
-    if (window->selection_has_text) {
+    if (window->selection_has_text || window->selection_has_html || window->selection_has_rtf ||
+        window->selection_has_image || window->selection_has_uri) {
         read_selection_into_cache(window);
     }
 }
@@ -1372,7 +1765,38 @@ static void composekn_process_deferred_selection(ComposeKNWindow* window) {
 static void data_device_data_offer(void* data, wl_data_device* data_device, wl_data_offer* id) {
     (void)data;
     (void)data_device;
-    (void)id;
+    if (id == nullptr) return;
+    // Attach listener immediately so offer MIME events in this dispatch are captured.
+    auto* state = new OfferMimeState();
+    wl_data_offer_add_listener(id, &data_offer_listener, state);
+}
+
+static OfferMimeState* take_offer_mime_state(wl_data_offer* offer) {
+    if (offer == nullptr) return nullptr;
+    // Re-bind listener with null state would lose data; instead we rely on the
+    // listener user pointer still being the OfferMimeState allocated in data_offer.
+    // wayland-client stores it on the proxy — recover via wl_proxy_get_user_data.
+    void* ud = wl_proxy_get_user_data(reinterpret_cast<wl_proxy*>(offer));
+    auto* state = static_cast<OfferMimeState*>(ud);
+    // Keep pointer on proxy for destroy cleanup; caller deletes after copy.
+    return state;
+}
+
+static void free_offer_mime_state(wl_data_offer* offer) {
+    if (offer == nullptr) return;
+    void* ud = wl_proxy_get_user_data(reinterpret_cast<wl_proxy*>(offer));
+    delete static_cast<OfferMimeState*>(ud);
+    wl_proxy_set_user_data(reinterpret_cast<wl_proxy*>(offer), nullptr);
+}
+
+static void dnd_accept_preferred(ComposeKNWindow* window) {
+    if (window == nullptr || window->dnd_offer == nullptr) return;
+    const char* mime = nullptr;
+    if (window->dnd_accept) {
+        if (window->dnd_has_uri) mime = "text/uri-list";
+        else if (window->dnd_has_text) mime = "text/plain;charset=utf-8";
+    }
+    wl_data_offer_accept(window->dnd_offer, window->dnd_serial, mime);
 }
 
 static void data_device_enter(
@@ -1386,29 +1810,130 @@ static void data_device_enter(
 ) {
     (void)data;
     (void)data_device;
-    (void)serial;
-    (void)surface;
-    (void)x;
-    (void)y;
-    (void)id;
+    ComposeKNWindow* window = surface_map_lookup(surface);
+    if (window == nullptr) {
+        if (id != nullptr) {
+            free_offer_mime_state(id);
+            wl_data_offer_destroy(id);
+        }
+        return;
+    }
+    if (window->dnd_offer != nullptr && window->dnd_offer != id) {
+        free_offer_mime_state(window->dnd_offer);
+        wl_data_offer_destroy(window->dnd_offer);
+        window->dnd_offer = nullptr;
+    }
+    window->dnd_offer = id;
+    window->dnd_serial = serial;
+    window->dnd_x = wl_fixed_to_double(x);
+    window->dnd_y = wl_fixed_to_double(y);
+    window->dnd_has_text = false;
+    window->dnd_has_uri = false;
+    window->dnd_files_cache.clear();
+    window->dnd_text_cache.clear();
+    window->dnd_accept = false;
+    g_dnd_target = window;
+
+    OfferMimeState* state = take_offer_mime_state(id);
+    if (state != nullptr) {
+        window->dnd_has_text = state->has_text;
+        window->dnd_has_uri = state->has_uri;
+    }
+    // Optimistic accept when payload looks usable (mirrors Win32 DropTarget).
+    if (window->dnd_has_uri || window->dnd_has_text) {
+        window->dnd_accept = true;
+    }
+    if (id != nullptr) {
+        wl_data_offer_set_actions(
+            id,
+            WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+            WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY
+        );
+        dnd_accept_preferred(window);
+    }
+
+    ComposeKNEvent event{};
+    event.type = COMPOSEKN_EVENT_DRAG_ENTER;
+    event.x = static_cast<float>(window->dnd_x);
+    event.y = static_cast<float>(window->dnd_y);
+    // button bits: 1=uri-list, 2=text (payload only on Drop)
+    event.button = (window->dnd_has_uri ? 1u : 0u) | (window->dnd_has_text ? 2u : 0u);
+    push_event(window, event);
 }
 
 static void data_device_leave(void* data, wl_data_device* data_device) {
     (void)data;
     (void)data_device;
+    ComposeKNWindow* window = g_dnd_target;
+    if (window == nullptr) return;
+    if (window->dnd_offer != nullptr) {
+        free_offer_mime_state(window->dnd_offer);
+        wl_data_offer_destroy(window->dnd_offer);
+        window->dnd_offer = nullptr;
+    }
+    ComposeKNEvent event{};
+    event.type = COMPOSEKN_EVENT_DRAG_LEAVE;
+    event.x = static_cast<float>(window->dnd_x);
+    event.y = static_cast<float>(window->dnd_y);
+    push_event(window, event);
+    g_dnd_target = nullptr;
 }
 
-static void data_device_motion(void* data, wl_data_device* data_device, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+static void data_device_motion(
+    void* data,
+    wl_data_device* data_device,
+    uint32_t time,
+    wl_fixed_t x,
+    wl_fixed_t y
+) {
     (void)data;
     (void)data_device;
     (void)time;
-    (void)x;
-    (void)y;
+    ComposeKNWindow* window = g_dnd_target;
+    if (window == nullptr) return;
+    window->dnd_x = wl_fixed_to_double(x);
+    window->dnd_y = wl_fixed_to_double(y);
+    ComposeKNEvent event{};
+    event.type = COMPOSEKN_EVENT_DRAG_OVER;
+    event.x = static_cast<float>(window->dnd_x);
+    event.y = static_cast<float>(window->dnd_y);
+    event.button = (window->dnd_has_uri ? 1u : 0u) | (window->dnd_has_text ? 2u : 0u);
+    push_event(window, event);
 }
 
 static void data_device_drop(void* data, wl_data_device* data_device) {
     (void)data;
     (void)data_device;
+    ComposeKNWindow* window = g_dnd_target;
+    if (window == nullptr || window->dnd_offer == nullptr) return;
+
+    if (window->dnd_has_uri) {
+        const std::string uri =
+            receive_offer_mime(window, window->dnd_offer, "text/uri-list");
+        window->dnd_files_cache = uri_list_to_paths(uri);
+    }
+    if (window->dnd_has_text) {
+        std::string text =
+            receive_offer_mime(window, window->dnd_offer, "text/plain;charset=utf-8");
+        if (text.empty()) {
+            text = receive_offer_mime(window, window->dnd_offer, "text/plain");
+        }
+        window->dnd_text_cache = std::move(text);
+    }
+
+    wl_data_offer_finish(window->dnd_offer);
+
+    ComposeKNEvent event{};
+    event.type = COMPOSEKN_EVENT_DRAG_DROP;
+    event.x = static_cast<float>(window->dnd_x);
+    event.y = static_cast<float>(window->dnd_y);
+    event.button = (window->dnd_has_uri ? 1u : 0u) | (window->dnd_has_text ? 2u : 0u);
+    push_event(window, event);
+
+    free_offer_mime_state(window->dnd_offer);
+    wl_data_offer_destroy(window->dnd_offer);
+    window->dnd_offer = nullptr;
+    g_dnd_target = nullptr;
 }
 
 static void data_device_selection(
@@ -1421,21 +1946,31 @@ static void data_device_selection(
     ComposeKNWindow* window = clipboard_target_window();
     if (window == nullptr) {
         if (offer != nullptr) {
+            free_offer_mime_state(offer);
             wl_data_offer_destroy(offer);
         }
         return;
     }
     if (window->selection_offer != nullptr && window->selection_offer != offer) {
+        free_offer_mime_state(window->selection_offer);
         wl_data_offer_destroy(window->selection_offer);
     }
     window->selection_offer = offer;
     window->selection_has_text = false;
+    window->selection_has_html = false;
+    window->selection_has_rtf = false;
+    window->selection_has_image = false;
+    window->selection_has_uri = false;
+    window->selection_mimes.clear();
     window->selection_read_pending = false;
     if (offer != nullptr) {
-        wl_data_offer_add_listener(offer, &data_offer_listener, nullptr);
+        OfferMimeState* state = take_offer_mime_state(offer);
+        if (state != nullptr) {
+            apply_mime_state_to_selection(window, *state);
+        }
         window->selection_read_pending = true;
     } else {
-        window->clipboard_cache.clear();
+        clear_selection_caches(window);
     }
 }
 
@@ -1447,6 +1982,26 @@ static const wl_data_device_listener data_device_listener = {
     data_device_drop,
     data_device_selection,
 };
+
+static void write_fd_bytes(int32_t fd, const void* data, size_t size) {
+    if (fd < 0 || data == nullptr || size == 0) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    size_t left = size;
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        p += static_cast<size_t>(n);
+        left -= static_cast<size_t>(n);
+    }
+    close(fd);
+}
 
 static void data_source_handle_target(void* data, wl_data_source* source, const char* mime_type) {
     (void)data;
@@ -1460,28 +2015,115 @@ static void data_source_handle_send(
     const char* mime_type,
     int32_t fd
 ) {
-    (void)mime_type;
-    (void)source;
     auto* window = static_cast<ComposeKNWindow*>(data);
-    const std::string& text = window->clipboard_set_pending;
-    if (!text.empty()) {
-        (void)write(fd, text.data(), text.size());
+    if (window == nullptr || mime_type == nullptr) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+    const bool is_drag = (window->drag_source == source);
+
+    if (strstr(mime_type, "text/plain") != nullptr) {
+        const std::string& text = is_drag ? window->drag_set_text : window->clipboard_set_pending;
+        write_fd_bytes(fd, text.data(), text.size());
+        return;
+    }
+    if (strcmp(mime_type, "text/html") == 0) {
+        write_fd_bytes(fd, window->clipboard_set_html.data(), window->clipboard_set_html.size());
+        return;
+    }
+    if (strcmp(mime_type, "text/rtf") == 0 || strcmp(mime_type, "application/rtf") == 0) {
+        write_fd_bytes(fd, window->clipboard_set_rtf.data(), window->clipboard_set_rtf.size());
+        return;
+    }
+    if (strcmp(mime_type, "text/uri-list") == 0) {
+        const std::string& uri = is_drag ? window->drag_set_files_uri : window->clipboard_set_files_uri;
+        write_fd_bytes(fd, uri.data(), uri.size());
+        return;
+    }
+    if (strcmp(mime_type, "image/bmp") == 0 || strcmp(mime_type, "image/x-bmp") == 0 ||
+        strcmp(mime_type, "image/x-ms-bmp") == 0) {
+        write_fd_bytes(fd, window->clipboard_set_bmp.data(), window->clipboard_set_bmp.size());
+        return;
     }
     close(fd);
 }
 
+static void cleanup_drag_icon(ComposeKNWindow* window) {
+    if (window == nullptr) return;
+    if (window->drag_icon_buffer != nullptr) {
+        wl_buffer_destroy(window->drag_icon_buffer);
+        window->drag_icon_buffer = nullptr;
+    }
+    if (window->drag_icon_surface != nullptr) {
+        wl_surface_destroy(window->drag_icon_surface);
+        window->drag_icon_surface = nullptr;
+    }
+    if (window->drag_icon_shm != nullptr && window->drag_icon_shm_size > 0) {
+        munmap(window->drag_icon_shm, window->drag_icon_shm_size);
+        window->drag_icon_shm = nullptr;
+        window->drag_icon_shm_size = 0;
+    }
+    if (window->drag_icon_fd >= 0) {
+        close(window->drag_icon_fd);
+        window->drag_icon_fd = -1;
+    }
+}
+
+static void finish_outbound_drag(ComposeKNWindow* window, int32_t result) {
+    if (window == nullptr) return;
+    cleanup_drag_icon(window);
+    if (window->drag_source != nullptr) {
+        wl_data_source_destroy(window->drag_source);
+        window->drag_source = nullptr;
+    }
+    window->drag_active = false;
+    window->drag_drop_performed = false;
+    window->drag_result = result;
+    window->drag_set_text.clear();
+    window->drag_set_files_uri.clear();
+    window->drag_icon_bgra.clear();
+    // Button release often swallowed by compositor grab — match beginMove.
+    synth_left_button_up_if_pressed(window, "dragEnd");
+}
+
 static void data_source_handle_cancelled(void* data, wl_data_source* source) {
     auto* window = static_cast<ComposeKNWindow*>(data);
+    if (window == nullptr) return;
+    if (window->drag_source == source) {
+        finish_outbound_drag(window, 0);
+        return;
+    }
     if (window->clipboard_source == source) {
         wl_data_source_destroy(source);
         window->clipboard_source = nullptr;
     }
 }
 
+static void data_source_handle_dnd_drop_performed(void* data, wl_data_source* source) {
+    auto* window = static_cast<ComposeKNWindow*>(data);
+    if (window == nullptr || window->drag_source != source) return;
+    window->drag_drop_performed = true;
+}
+
+static void data_source_handle_dnd_finished(void* data, wl_data_source* source) {
+    auto* window = static_cast<ComposeKNWindow*>(data);
+    if (window == nullptr || window->drag_source != source) return;
+    finish_outbound_drag(window, 1);
+}
+
+static void data_source_handle_action(void* data, wl_data_source* source, uint32_t dnd_action) {
+    (void)data;
+    (void)source;
+    (void)dnd_action;
+}
+
 static const wl_data_source_listener data_source_listener = {
     data_source_handle_target,
     data_source_handle_send,
     data_source_handle_cancelled,
+    data_source_handle_dnd_drop_performed,
+    data_source_handle_dnd_finished,
+    data_source_handle_action,
 };
 
 static void ensure_data_device() {
@@ -1495,6 +2137,98 @@ static void ensure_data_device() {
         wl_data_device_manager_get_data_device(g_shared.data_device_manager, g_shared.seat);
     wl_data_device_add_listener(g_shared.data_device, &data_device_listener, &g_shared);
     refresh_all_window_shared_aliases();
+}
+
+static int create_shm_file(size_t size) {
+#if defined(__linux__) && defined(SYS_memfd_create)
+    {
+        int fd = static_cast<int>(syscall(SYS_memfd_create, "composekn-dnd-icon", MFD_CLOEXEC));
+        if (fd >= 0) {
+            if (ftruncate(fd, static_cast<off_t>(size)) == 0) return fd;
+            close(fd);
+        }
+    }
+#endif
+    char template_path[] = "/tmp/composekn-shm-XXXXXX";
+    int fd = mkstemp(template_path);
+    if (fd < 0) return -1;
+    unlink(template_path);
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool create_drag_icon_surface(ComposeKNWindow* window) {
+    if (window == nullptr || window->compositor == nullptr || window->shm == nullptr) {
+        return false;
+    }
+    if (window->drag_icon_w <= 0 || window->drag_icon_h <= 0 || window->drag_icon_bgra.empty()) {
+        return false;
+    }
+    const int32_t w = window->drag_icon_w;
+    const int32_t h = window->drag_icon_h;
+    const size_t stride = static_cast<size_t>(w) * 4u;
+    const size_t size = stride * static_cast<size_t>(h);
+    if (window->drag_icon_bgra.size() < size) return false;
+
+    int fd = create_shm_file(size);
+    if (fd < 0) return false;
+    void* map = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        return false;
+    }
+    // Wayland ARGB8888 little-endian == BGRA byte order.
+    std::memcpy(map, window->drag_icon_bgra.data(), size);
+
+    wl_shm_pool* pool = wl_shm_create_pool(window->shm, fd, static_cast<int32_t>(size));
+    if (pool == nullptr) {
+        munmap(map, size);
+        close(fd);
+        return false;
+    }
+    wl_buffer* buffer = wl_shm_pool_create_buffer(
+        pool, 0, w, h, static_cast<int32_t>(stride), WL_SHM_FORMAT_ARGB8888
+    );
+    wl_shm_pool_destroy(pool);
+    if (buffer == nullptr) {
+        munmap(map, size);
+        close(fd);
+        return false;
+    }
+    wl_surface* surface = wl_compositor_create_surface(window->compositor);
+    if (surface == nullptr) {
+        wl_buffer_destroy(buffer);
+        munmap(map, size);
+        close(fd);
+        return false;
+    }
+    // Hotspot = surface origin: attach buffer so (hot_x, hot_y) maps to (0, 0).
+    // compositor is bound at v4 (attach x/y still valid; offset req is v5+).
+    wl_surface_attach(surface, buffer, -window->drag_hot_x, -window->drag_hot_y);
+    wl_surface_damage(surface, 0, 0, w, h);
+    wl_surface_commit(surface);
+
+    window->drag_icon_fd = fd;
+    window->drag_icon_shm = map;
+    window->drag_icon_shm_size = size;
+    window->drag_icon_buffer = buffer;
+    window->drag_icon_surface = surface;
+    return true;
+}
+
+static int32_t copy_bytes_result(const void* src, size_t len, char* buf, int32_t size) {
+    if (len == 0) return 0;
+    const int32_t needed = static_cast<int32_t>(len);
+    if (buf == nullptr || size < needed) return needed;
+    std::memcpy(buf, src, len);
+    return needed;
+}
+
+static int32_t copy_string_result(const std::string& s, char* buf, int32_t size) {
+    return copy_bytes_result(s.data(), s.size(), buf, size);
 }
 
 /* ---- IME (zwp_text_input_v3) event handlers ---- */
@@ -1669,7 +2403,6 @@ static int64_t monotonic_ns() {
 }
 
 static void composekn_request_frame_internal(ComposeKNWindow* window);
-static void composekn_process_deferred_selection(ComposeKNWindow* window);
 
 /**
  * Headless / 慢 WSI：wl_surface_frame 可能永不回调（空 commit 无 buffer）。
@@ -1914,6 +2647,10 @@ static void release_shared_display() {
         wl_data_device_manager_destroy(g_shared.data_device_manager);
         g_shared.data_device_manager = nullptr;
     }
+    if (g_shared.shm != nullptr) {
+        wl_shm_destroy(g_shared.shm);
+        g_shared.shm = nullptr;
+    }
     if (g_shared.pointer != nullptr) {
         wl_pointer_destroy(g_shared.pointer);
         g_shared.pointer = nullptr;
@@ -2067,9 +2804,26 @@ extern "C" void composekn_window_destroy(ComposeKNWindow* window) {
         wl_data_source_destroy(window->clipboard_source);
         window->clipboard_source = nullptr;
     }
+    if (window->drag_source != nullptr) {
+        cleanup_drag_icon(window);
+        wl_data_source_destroy(window->drag_source);
+        window->drag_source = nullptr;
+        window->drag_active = false;
+    } else {
+        cleanup_drag_icon(window);
+    }
     if (window->selection_offer != nullptr) {
+        free_offer_mime_state(window->selection_offer);
         wl_data_offer_destroy(window->selection_offer);
         window->selection_offer = nullptr;
+    }
+    if (window->dnd_offer != nullptr) {
+        free_offer_mime_state(window->dnd_offer);
+        wl_data_offer_destroy(window->dnd_offer);
+        window->dnd_offer = nullptr;
+    }
+    if (g_dnd_target == window) {
+        g_dnd_target = nullptr;
     }
 
     if (window->frame_callback != nullptr) {
@@ -2383,35 +3137,261 @@ extern "C" int composekn_gl_get_draw_framebuffer_binding(void) {
 }
 
 extern "C" bool composekn_clipboard_get_text(char* buffer, size_t buffer_size) {
-    if (g_primary_window == nullptr || buffer == nullptr || buffer_size == 0) {
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr || buffer == nullptr || buffer_size == 0) {
         return false;
     }
-    const std::string& text = g_primary_window->clipboard_cache;
+    composekn_process_deferred_selection(window);
+    const std::string& text = window->clipboard_cache;
     strncpy(buffer, text.c_str(), buffer_size - 1);
     buffer[buffer_size - 1] = '\0';
     return true;
 }
 
-extern "C" void composekn_clipboard_set_text(const char* text) {
-    if (g_primary_window == nullptr || g_primary_window->data_device_manager == nullptr) {
+extern "C" void composekn_clipboard_set_rich(
+    const char* utf8_text,
+    const char* utf8_html,
+    const char* utf8_rtf,
+    int32_t image_w,
+    int32_t image_h,
+    const uint8_t* bgra,
+    const char* utf8_files
+) {
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr || window->data_device_manager == nullptr) {
         return;
     }
-    auto* window = g_primary_window;
-    window->clipboard_set_pending = text != nullptr ? text : "";
+
+    window->clipboard_set_pending = utf8_text != nullptr ? utf8_text : "";
+    window->clipboard_set_html = utf8_html != nullptr ? utf8_html : "";
+    window->clipboard_set_rtf = utf8_rtf != nullptr ? utf8_rtf : "";
+    window->clipboard_set_files_uri = paths_to_uri_list(utf8_files);
+    window->clipboard_set_bmp.clear();
+    window->clipboard_set_bgra.clear();
+    window->clipboard_set_image_w = 0;
+    window->clipboard_set_image_h = 0;
+
+    // Local caches so get* works without a round-trip.
     window->clipboard_cache = window->clipboard_set_pending;
+    window->clipboard_html_cache = window->clipboard_set_html;
+    window->clipboard_rtf_cache = window->clipboard_set_rtf;
+    window->clipboard_files_cache = utf8_files != nullptr ? utf8_files : "";
+    // Normalize files cache to '\n' paths (uri_list round-trip strips empties).
+    if (!window->clipboard_set_files_uri.empty()) {
+        window->clipboard_files_cache = uri_list_to_paths(window->clipboard_set_files_uri);
+    }
+    window->clipboard_image_bgra.clear();
+    window->clipboard_image_w = 0;
+    window->clipboard_image_h = 0;
+    // Avoid a deferred selection receive overwriting the local caches we just set.
+    window->selection_read_pending = false;
+
+    if (image_w > 0 && image_h > 0 && bgra != nullptr) {
+        const size_t nbytes = static_cast<size_t>(image_w) * static_cast<size_t>(image_h) * 4u;
+        window->clipboard_set_bgra.assign(bgra, bgra + nbytes);
+        window->clipboard_set_bmp = encode_bmp_bgra(image_w, image_h, bgra);
+        window->clipboard_set_image_w = image_w;
+        window->clipboard_set_image_h = image_h;
+        window->clipboard_image_bgra = window->clipboard_set_bgra;
+        window->clipboard_image_w = image_w;
+        window->clipboard_image_h = image_h;
+    }
+
     if (window->clipboard_source != nullptr) {
         wl_data_source_destroy(window->clipboard_source);
         window->clipboard_source = nullptr;
     }
-    window->clipboard_source = wl_data_device_manager_create_data_source(window->data_device_manager);
+    window->clipboard_source =
+        wl_data_device_manager_create_data_source(window->data_device_manager);
+    if (window->clipboard_source == nullptr) return;
     wl_data_source_add_listener(window->clipboard_source, &data_source_listener, window);
-    wl_data_source_offer(window->clipboard_source, "text/plain;charset=utf-8");
-    wl_data_source_offer(window->clipboard_source, "text/plain");
+
+    if (utf8_text != nullptr) {
+        wl_data_source_offer(window->clipboard_source, "text/plain;charset=utf-8");
+        wl_data_source_offer(window->clipboard_source, "text/plain");
+    }
+    if (!window->clipboard_set_html.empty()) {
+        wl_data_source_offer(window->clipboard_source, "text/html");
+    }
+    if (!window->clipboard_set_rtf.empty()) {
+        wl_data_source_offer(window->clipboard_source, "text/rtf");
+        wl_data_source_offer(window->clipboard_source, "application/rtf");
+    }
+    if (!window->clipboard_set_files_uri.empty()) {
+        wl_data_source_offer(window->clipboard_source, "text/uri-list");
+    }
+    if (!window->clipboard_set_bmp.empty()) {
+        wl_data_source_offer(window->clipboard_source, "image/bmp");
+    }
+
     ensure_data_device();
     alias_shared_onto_window(window);
     if (window->data_device != nullptr) {
-        wl_data_device_set_selection(window->data_device, window->clipboard_source, window->last_serial);
+        wl_data_device_set_selection(
+            window->data_device, window->clipboard_source, window->last_serial
+        );
     }
+}
+
+extern "C" void composekn_clipboard_set_text(const char* text) {
+    composekn_clipboard_set_rich(text, nullptr, nullptr, 0, 0, nullptr, nullptr);
+}
+
+extern "C" int32_t composekn_clipboard_get_html(char* buf, int32_t size) {
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr) return 0;
+    composekn_process_deferred_selection(window);
+    return copy_string_result(window->clipboard_html_cache, buf, size);
+}
+
+extern "C" int32_t composekn_clipboard_get_rtf(char* buf, int32_t size) {
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr) return 0;
+    composekn_process_deferred_selection(window);
+    return copy_string_result(window->clipboard_rtf_cache, buf, size);
+}
+
+extern "C" int32_t composekn_clipboard_get_files(char* buf, int32_t size) {
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr) return 0;
+    composekn_process_deferred_selection(window);
+    return copy_string_result(window->clipboard_files_cache, buf, size);
+}
+
+extern "C" int32_t composekn_clipboard_get_image(uint8_t* bgra, int32_t size, int32_t* out_dims) {
+    ComposeKNWindow* window = clipboard_target_window();
+    if (window == nullptr) return 0;
+    composekn_process_deferred_selection(window);
+    const auto& pixels = window->clipboard_image_bgra;
+    if (pixels.empty() || window->clipboard_image_w <= 0 || window->clipboard_image_h <= 0) {
+        return 0;
+    }
+    if (out_dims != nullptr) {
+        out_dims[0] = window->clipboard_image_w;
+        out_dims[1] = window->clipboard_image_h;
+    }
+    const int32_t needed = static_cast<int32_t>(pixels.size());
+    if (bgra == nullptr || size < needed) return needed;
+    std::memcpy(bgra, pixels.data(), pixels.size());
+    return needed;
+}
+
+extern "C" bool composekn_window_start_drag(
+    ComposeKNWindow* window,
+    const char* utf8_files,
+    const char* utf8_text,
+    int32_t icon_w,
+    int32_t icon_h,
+    const uint8_t* icon_bgra,
+    int32_t hot_x,
+    int32_t hot_y
+) {
+    window = resolve_window(window);
+    if (window == nullptr || window->data_device_manager == nullptr || window->surface == nullptr) {
+        return false;
+    }
+    ensure_data_device();
+    alias_shared_onto_window(window);
+    if (window->data_device == nullptr) return false;
+    if (window->drag_active) return false;
+
+    window->drag_set_text = utf8_text != nullptr ? utf8_text : "";
+    window->drag_set_files_uri = paths_to_uri_list(utf8_files);
+    if (window->drag_set_text.empty() && window->drag_set_files_uri.empty()) {
+        return false;
+    }
+
+    if (window->drag_source != nullptr) {
+        wl_data_source_destroy(window->drag_source);
+        window->drag_source = nullptr;
+    }
+    cleanup_drag_icon(window);
+
+    window->drag_source =
+        wl_data_device_manager_create_data_source(window->data_device_manager);
+    if (window->drag_source == nullptr) return false;
+    wl_data_source_add_listener(window->drag_source, &data_source_listener, window);
+
+    if (!window->drag_set_text.empty()) {
+        wl_data_source_offer(window->drag_source, "text/plain;charset=utf-8");
+        wl_data_source_offer(window->drag_source, "text/plain");
+    }
+    if (!window->drag_set_files_uri.empty()) {
+        wl_data_source_offer(window->drag_source, "text/uri-list");
+    }
+    wl_data_source_set_actions(window->drag_source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+
+    window->drag_icon_w = 0;
+    window->drag_icon_h = 0;
+    window->drag_hot_x = hot_x;
+    window->drag_hot_y = hot_y;
+    window->drag_icon_bgra.clear();
+    wl_surface* icon_surface = nullptr;
+    if (icon_w > 0 && icon_h > 0 && icon_bgra != nullptr) {
+        const size_t nbytes = static_cast<size_t>(icon_w) * static_cast<size_t>(icon_h) * 4u;
+        window->drag_icon_bgra.assign(icon_bgra, icon_bgra + nbytes);
+        window->drag_icon_w = icon_w;
+        window->drag_icon_h = icon_h;
+        if (create_drag_icon_surface(window)) {
+            icon_surface = window->drag_icon_surface;
+        }
+    }
+
+    window->drag_result = -1;
+    window->drag_drop_performed = false;
+    window->drag_active = true;
+
+    wl_data_device_start_drag(
+        window->data_device,
+        window->drag_source,
+        window->surface,
+        icon_surface,
+        window->last_serial
+    );
+    wl_display_flush(window->display);
+
+    // start_drag returns immediately while compositor owns the grab — clear
+    // primaryPressed like beginMove (Windows synths after DoDragDrop returns).
+    synth_left_button_up_if_pressed(window, "startDrag");
+    return true;
+}
+
+extern "C" int32_t composekn_window_drag_poll_result(ComposeKNWindow* window) {
+    window = resolve_window(window);
+    if (window == nullptr) return -1;
+    if (window->drag_active) return -1;
+    const int32_t result = window->drag_result;
+    if (result == 0 || result == 1) {
+        window->drag_result = -1; // clear once consumed
+    }
+    return result;
+}
+
+extern "C" void composekn_window_dnd_set_accept(ComposeKNWindow* window, bool accept) {
+    window = resolve_window(window);
+    if (window == nullptr) return;
+    window->dnd_accept = accept;
+    dnd_accept_preferred(window);
+}
+
+extern "C" int32_t composekn_window_dnd_pop_files(ComposeKNWindow* window, char* buf, int32_t size) {
+    window = resolve_window(window);
+    if (window == nullptr) return 0;
+    const int32_t n = copy_string_result(window->dnd_files_cache, buf, size);
+    if (buf != nullptr && n > 0 && size >= n) {
+        window->dnd_files_cache.clear();
+    }
+    return n;
+}
+
+extern "C" int32_t composekn_window_dnd_pop_text(ComposeKNWindow* window, char* buf, int32_t size) {
+    window = resolve_window(window);
+    if (window == nullptr) return 0;
+    const int32_t n = copy_string_result(window->dnd_text_cache, buf, size);
+    if (buf != nullptr && n > 0 && size >= n) {
+        window->dnd_text_cache.clear();
+    }
+    return n;
 }
 
 extern "C" bool composekn_window_uses_server_decoration(ComposeKNWindow* window) {

@@ -377,12 +377,21 @@ bool composekn_win32_test_simulate_drag(
 /**
  * 发起 OLE 拖放（模态）。utf8_files / utf8_text 用 '\n' 分隔路径 / 纯文本。
  * allowed_effects：DROPEFFECT_COPY=1 等。返回最终 effect；失败 -1；取消 0。
+ *
+ * 可选自定义拖影（IDragSourceHelper::InitializeFromBitmap）：
+ * icon_bgra = 自上而下紧密 BGRA（可空）；icon_w/icon_h <= 0 或 icon_bgra==null 则跳过装饰。
+ * hot_x/hot_y = 热点相对拖影左上角的偏移（通常为中心）。
  */
 int32_t composekn_win32_do_drag_drop(
     ComposeKNWin32Window* window,
     const char* utf8_files,
     const char* utf8_text,
-    int32_t allowed_effects);
+    int32_t allowed_effects,
+    int32_t icon_w,
+    int32_t icon_h,
+    const uint8_t* icon_bgra,
+    int32_t hot_x,
+    int32_t hot_y);
 
 /**
  * 自检：SourceDataObject 的 QueryGetData/GetData。

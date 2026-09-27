@@ -1204,7 +1204,12 @@ private fun DragAndDropDemoBox() {
                 modifier = Modifier
                     .size(160.dp, 72.dp)
                     .background(MaterialTheme.colorScheme.primaryContainer)
-                    .dragAndDropSource { _ ->
+                    .dragAndDropSource(
+                        drawDragDecoration = {
+                            drawRect(Color(0xFF1B6AC9), size = size)
+                            // 简易拖影：色块即可验证 IDragSourceHelper / wl icon
+                        },
+                    ) { _ ->
                         DragAndDropTransferData(
                             files = paths,
                             onTransferCompleted = { ok ->
@@ -1220,7 +1225,11 @@ private fun DragAndDropDemoBox() {
                 modifier = Modifier
                     .size(160.dp, 72.dp)
                     .background(MaterialTheme.colorScheme.secondaryContainer)
-                    .dragAndDropSource { _ ->
+                    .dragAndDropSource(
+                        drawDragDecoration = {
+                            drawRect(Color(0xFF2E7D32), size = size)
+                        },
+                    ) { _ ->
                         DragAndDropTransferData(
                             text = "ComposeKN Gallery 拖出的文本",
                             onTransferCompleted = { ok ->

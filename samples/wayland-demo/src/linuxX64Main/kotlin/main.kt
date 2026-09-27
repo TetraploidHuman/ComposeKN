@@ -4,6 +4,8 @@ package main
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.draganddrop.dragAndDropSource
+import androidx.compose.foundation.draganddrop.dragAndDropTarget
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,6 +29,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -35,12 +38,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draganddrop.DragAndDropEvent
+import androidx.compose.ui.draganddrop.DragAndDropTarget
+import androidx.compose.ui.draganddrop.DragAndDropTransferData
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -64,6 +73,7 @@ import com.composekn.linux.registerComposeKnLinuxBackend
 import kotlinx.coroutines.delay
 import org.jetbrains.skiko.ComposeKNFileDialog
 import org.jetbrains.skiko.ComposeKNTray
+import org.jetbrains.skiko.WaylandClipboard
 import org.jetbrains.skiko.initLinuxMainThread
 import platform.posix.getenv
 import kotlinx.cinterop.toKString
@@ -267,6 +277,7 @@ private fun runLinuxSelfTest() {
     var failed = false
     var dualOk = false
     var dialogOk = false
+    var clipboardOk = false
     application(exitProcessOnExit = false) {
         val state = rememberWindowState(size = DpSize(640.dp, 400.dp))
         var openSecond by remember { mutableStateOf(false) }
@@ -279,6 +290,24 @@ private fun runLinuxSelfTest() {
             LaunchedEffect(Unit) {
                 try {
                     delay(400)
+                    // Rich clipboard roundtrip (local cache; no compositor required)
+                    WaylandClipboard.setRich(
+                        text = "composekn-selftest",
+                        html = "<b>composekn</b>",
+                        rtf = null,
+                        image = null,
+                        files = listOf("/tmp/composekn-selftest.txt"),
+                    )
+                    val gotText = WaylandClipboard.getText()
+                    val gotHtml = WaylandClipboard.getHtml()
+                    val gotFiles = WaylandClipboard.getFiles()
+                    clipboardOk = gotText == "composekn-selftest" &&
+                        gotHtml?.contains("composekn") == true &&
+                        gotFiles.contains("/tmp/composekn-selftest.txt")
+                    println(
+                        "SELFTEST: clipboard text=${gotText != null} html=${gotHtml != null} " +
+                            "files=${gotFiles.size} ok=$clipboardOk",
+                    )
                     // weston headless 对 maximized geometry 很严；CI/RELAX 只测双窗。
                     if (selftestExtrasRequired()) {
                         state.placement = WindowPlacement.Maximized
@@ -327,7 +356,7 @@ private fun runLinuxSelfTest() {
             }
         }
     }
-    val passCore = !failed && frames > 0 && dualOk && dialogOk
+    val passCore = !failed && frames > 0 && dualOk && dialogOk && clipboardOk
     val extrasRequired = selftestExtrasRequired()
     val extrasOk = !extrasRequired || (trayOk && fdOk)
     if (!extrasRequired && !(trayOk && fdOk)) {
@@ -336,7 +365,7 @@ private fun runLinuxSelfTest() {
     val pass = passCore && extrasOk
     println(
         "SELFTEST: ${if (pass) "PASS" else "FAIL"} " +
-            "tray=$trayOk filedialog=$fdOk dual=$dualOk dialog=$dialogOk",
+            "tray=$trayOk filedialog=$fdOk dual=$dualOk dialog=$dialogOk clipboard=$clipboardOk",
     )
     exitProcess(if (pass) 0 else 1)
 }
@@ -432,7 +461,13 @@ private fun ShowcaseSections() {
             Text(if (checked) "checked" else "unchecked")
         }
     }
-    Section("6 · Scroll") {
+    Section("6 · Clipboard (rich)") {
+        ClipboardDemoBox()
+    }
+    Section("7 · Drag & Drop") {
+        DragAndDropDemoBox()
+    }
+    Section("8 · Scroll") {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             for (i in 1..40) {
                 Text(
@@ -444,6 +479,122 @@ private fun ShowcaseSections() {
                         .padding(8.dp),
                 )
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun ClipboardDemoBox() {
+    @Suppress("DEPRECATION")
+    val clipboard = LocalClipboardManager.current
+    var status by remember { mutableStateOf("复制 HTML / 粘贴读回") }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = {
+            clipboard.setClip(
+                ClipEntry.withHtml(
+                    html = "<b>ComposeKN</b> Linux clipboard",
+                    plainText = "ComposeKN Linux clipboard",
+                ),
+            )
+            status = "已写入 HTML+plain"
+            println("composekn: clipboard setRich html")
+        }) { Text("复制 HTML") }
+        Button(onClick = {
+            val entry = clipboard.getClip()
+            val html = entry?.getHtml()
+            val plain = entry?.getPlainText()
+            status = when {
+                html != null -> "HTML: ${html.take(40)}"
+                !plain.isNullOrEmpty() -> "文本: ${plain.take(40)}"
+                else -> "空"
+            }
+            println("composekn: clipboard get -> $status")
+        }) { Text("粘贴") }
+    }
+    Text(status, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+}
+
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun DragAndDropDemoBox() {
+    val paths = remember {
+        listOf("/tmp/composekn-gallery-drag-1.txt", "/tmp/composekn-gallery-drag-2.txt")
+    }
+    var dropStatus by remember { mutableStateOf("把文件/文本拖到虚线框") }
+    var hovering by remember { mutableStateOf(false) }
+    val dropTarget = remember {
+        object : DragAndDropTarget {
+            override fun onStarted(event: DragAndDropEvent) { hovering = true }
+            override fun onEntered(event: DragAndDropEvent) { hovering = true }
+            override fun onExited(event: DragAndDropEvent) { hovering = false }
+            override fun onEnded(event: DragAndDropEvent) { hovering = false }
+            override fun onDrop(event: DragAndDropEvent): Boolean {
+                hovering = false
+                dropStatus = when {
+                    event.files.isNotEmpty() && event.files.first().isNotEmpty() ->
+                        "文件 ${event.files.size}: ${event.files.first()}"
+                    !event.text.isNullOrEmpty() -> "文本: ${event.text!!.take(48)}"
+                    else -> "放下了，但没有文件/文本"
+                }
+                println("composekn: drag drop -> $dropStatus")
+                return true
+            }
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(
+                modifier = Modifier
+                    .size(140.dp, 64.dp)
+                    .background(Color(0xFF1B6AC9))
+                    .dragAndDropSource(
+                        drawDragDecoration = { drawRect(Color(0xFF1B6AC9), size = size) },
+                    ) { _ ->
+                        DragAndDropTransferData(
+                            files = paths,
+                            onTransferCompleted = { ok ->
+                                println("composekn: drag files done success=$ok")
+                            },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) { Text("拖出文件", color = Color.White) }
+            Box(
+                modifier = Modifier
+                    .size(140.dp, 64.dp)
+                    .background(Color(0xFF2E7D32))
+                    .dragAndDropSource(
+                        drawDragDecoration = { drawRect(Color(0xFF2E7D32), size = size) },
+                    ) { _ ->
+                        DragAndDropTransferData(
+                            text = "ComposeKN Wayland 拖出的文本",
+                            onTransferCompleted = { ok ->
+                                println("composekn: drag text done success=$ok")
+                            },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) { Text("拖出文本", color = Color.White) }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(72.dp)
+                .background(if (hovering) Color(0xFF455A64) else Color(0xFF37474F))
+                .dragAndDropTarget(
+                    shouldStartDragAndDrop = { e ->
+                        e.files.isNotEmpty() || e.text != null
+                    },
+                    target = dropTarget,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                if (hovering) "松开即可放下" else dropStatus,
+                color = Color.White,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }

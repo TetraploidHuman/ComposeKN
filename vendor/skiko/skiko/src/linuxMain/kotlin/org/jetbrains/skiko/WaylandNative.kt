@@ -3,19 +3,7 @@
 package org.jetbrains.skiko
 
 import org.jetbrains.skia.impl.NativePointer
-import kotlinx.cinterop.ByteVar
-import kotlinx.cinterop.COpaquePointer
-import kotlinx.cinterop.CPointer
-import kotlinx.cinterop.allocArray
-import kotlinx.cinterop.cstr
-import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.toKString
-import kotlinx.cinterop.FloatVar
-import kotlinx.cinterop.IntVar
-import kotlinx.cinterop.UIntVar
-import kotlinx.cinterop.alloc
-import kotlinx.cinterop.ptr
-import kotlinx.cinterop.value
+import kotlinx.cinterop.*
 import kotlin.native.SymbolName
 
 /** Wayland input / frame events from native event queue. */
@@ -33,6 +21,11 @@ enum class WaylandEventType(val nativeValue: Int) {
     TouchUp(11),
     /** Keyboard focus enter/leave; [WaylandEvent.pressed] = hasFocus. */
     Focus(12),
+    /** Inbound DnD (wl_data_device). */
+    DragEnter(13),
+    DragOver(14),
+    DragLeave(15),
+    DragDrop(16),
 }
 
 data class WaylandEvent(
@@ -129,6 +122,65 @@ internal external fun composekn_clipboard_get_text(buffer: CPointer<ByteVar>, si
 
 @SymbolName("composekn_clipboard_set_text")
 internal external fun composekn_clipboard_set_text(text: CPointer<ByteVar>)
+
+@SymbolName("composekn_clipboard_set_rich")
+internal external fun composekn_clipboard_set_rich(
+    utf8Text: CPointer<ByteVar>?,
+    utf8Html: CPointer<ByteVar>?,
+    utf8Rtf: CPointer<ByteVar>?,
+    imageW: Int,
+    imageH: Int,
+    bgra: CPointer<UByteVar>?,
+    utf8Files: CPointer<ByteVar>?,
+)
+
+@SymbolName("composekn_clipboard_get_html")
+internal external fun composekn_clipboard_get_html(buf: CPointer<ByteVar>?, size: Int): Int
+
+@SymbolName("composekn_clipboard_get_rtf")
+internal external fun composekn_clipboard_get_rtf(buf: CPointer<ByteVar>?, size: Int): Int
+
+@SymbolName("composekn_clipboard_get_files")
+internal external fun composekn_clipboard_get_files(buf: CPointer<ByteVar>?, size: Int): Int
+
+@SymbolName("composekn_clipboard_get_image")
+internal external fun composekn_clipboard_get_image(
+    bgra: CPointer<UByteVar>?,
+    size: Int,
+    outDims: CPointer<IntVar>?,
+): Int
+
+@SymbolName("composekn_window_start_drag")
+internal external fun composekn_window_start_drag(
+    window: COpaquePointer?,
+    utf8Files: CPointer<ByteVar>?,
+    utf8Text: CPointer<ByteVar>?,
+    iconW: Int,
+    iconH: Int,
+    iconBgra: CPointer<UByteVar>?,
+    hotX: Int,
+    hotY: Int,
+): Boolean
+
+@SymbolName("composekn_window_drag_poll_result")
+internal external fun composekn_window_drag_poll_result(window: COpaquePointer?): Int
+
+@SymbolName("composekn_window_dnd_set_accept")
+internal external fun composekn_window_dnd_set_accept(window: COpaquePointer?, accept: Boolean)
+
+@SymbolName("composekn_window_dnd_pop_files")
+internal external fun composekn_window_dnd_pop_files(
+    window: COpaquePointer?,
+    buf: CPointer<ByteVar>?,
+    size: Int,
+): Int
+
+@SymbolName("composekn_window_dnd_pop_text")
+internal external fun composekn_window_dnd_pop_text(
+    window: COpaquePointer?,
+    buf: CPointer<ByteVar>?,
+    size: Int,
+): Int
 
 @SymbolName("composekn_window_uses_server_decoration")
 internal external fun composekn_window_uses_server_decoration(window: COpaquePointer): Boolean
@@ -244,6 +296,7 @@ internal external fun composekn_window_set_vulkan_preferred(window: COpaquePoint
 /** Wayland wl_data_device clipboard bridge (ComposeKN window). */
 object WaylandClipboard {
     private const val BUFFER_SIZE = 65536
+    private const val PROBE_SIZE = 64 * 1024
 
     fun getText(): String? = memScoped {
         val buffer = allocArray<ByteVar>(BUFFER_SIZE)
@@ -257,21 +310,38 @@ object WaylandClipboard {
         composekn_clipboard_set_text(text.cstr.ptr)
     }
 
-    // ---- 富文本格式：Wayland 侧**还没实现** ----
-    //
-    // 不是"忘了写"：Wayland 的剪贴板是 `wl_data_source` 一次声明**多个 MIME 类型**
-    // （text/plain;charset=utf-8、text/html、image/png…），然后在 `send` 回调里按
-    // 对方要的 MIME 回数据；接收侧是 `wl_data_offer.receive(mime)`。现在的 C 桥
-    // （wayland_window.cc）只实现了单一 text/plain 那条路，所以这里先把接口留出来、
-    // 让 compose-core 那份**共享**的 PlatformClipboard 两边都能编过：
-    //   * 读：回 null（= 没有这个格式）；
-    //   * 写：只写文本，HTML/RTF/位图**忽略**。
-    // 补齐要动 C 侧协议（多 MIME + send 回调），单独一轮做 —— 见 HANDOVER §17.34。
-    /** 文件列表（Wayland 侧是 `text/uri-list` 那条，还没接）。 */
-    fun getFiles(): List<String> = emptyList()
-    fun getHtml(): String? = null
-    fun getRtf(): String? = null
-    fun getImage(): ClipboardImage? = null
+    fun getFiles(): List<String> {
+        val joined = popString(::composekn_clipboard_get_files) ?: return emptyList()
+        return joined.split('\n').filter { it.isNotEmpty() }
+    }
+
+    fun getHtml(): String? = popString(::composekn_clipboard_get_html)
+
+    fun getRtf(): String? = popString(::composekn_clipboard_get_rtf)
+
+    fun getImage(): ClipboardImage? = memScoped {
+        val out = allocArray<IntVar>(2)
+        val needed = composekn_clipboard_get_image(null, 0, out)
+        if (needed <= 0) return@memScoped null
+        val width = out[0]
+        val height = out[1]
+        if (width <= 0 || height <= 0) return@memScoped null
+        val pixels = ByteArray(needed)
+        val written = pixels.usePinned { pinned ->
+            composekn_clipboard_get_image(
+                pinned.addressOf(0).reinterpret<UByteVar>(),
+                needed,
+                out,
+            )
+        }
+        if (written != needed) return@memScoped null
+        ClipboardImage(width, height, pixels)
+    }
+
+    /**
+     * Offer multiple MIME types in one wl_data_source transaction
+     * (text / html / rtf / image/bmp / text/uri-list).
+     */
     fun setRich(
         text: String?,
         html: String?,
@@ -279,12 +349,56 @@ object WaylandClipboard {
         image: ClipboardImage?,
         files: List<String>? = null,
     ) {
-        // files / html / rtf / image：Wayland 多 MIME 尚未接，见上。
-        if (text != null) setText(text)
-        else if (!files.isNullOrEmpty()) {
-            // 暂无 text/uri-list；至少别让调用方以为写入了。
+        val imagePixels = image?.pixels
+        val filesJoined = files?.takeIf { it.isNotEmpty() }?.joinToString("\n")
+        useCStringOrNull(text) { textPtr ->
+            useCStringOrNull(html) { htmlPtr ->
+                useCStringOrNull(rtf) { rtfPtr ->
+                    useCStringOrNull(filesJoined) { filesPtr ->
+                        if (imagePixels == null) {
+                            composekn_clipboard_set_rich(
+                                textPtr, htmlPtr, rtfPtr, 0, 0, null, filesPtr,
+                            )
+                        } else {
+                            imagePixels.usePinned { pinned ->
+                                composekn_clipboard_set_rich(
+                                    textPtr, htmlPtr, rtfPtr,
+                                    image!!.width, image.height,
+                                    pinned.addressOf(0).reinterpret<UByteVar>(),
+                                    filesPtr,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+
+    private fun popString(pop: (CPointer<ByteVar>?, Int) -> Int): String? = memScoped {
+        val probe = allocArray<ByteVar>(PROBE_SIZE)
+        val needed = pop(probe, PROBE_SIZE)
+        if (needed <= 0) return@memScoped null
+        if (needed < PROBE_SIZE) {
+            return@memScoped byteArrayFrom(probe, needed).decodeToString()
+        }
+        val buffer = allocArray<ByteVar>(needed + 1)
+        val written = pop(buffer, needed + 1)
+        if (written <= 0) null else byteArrayFrom(buffer, written).decodeToString()
+    }
+}
+
+internal inline fun <R> useCStringOrNull(value: String?, block: (CPointer<ByteVar>?) -> R): R {
+    if (value == null) return block(null)
+    val bytes = value.encodeToByteArray()
+    val buf = ByteArray(bytes.size + 1)
+    bytes.copyInto(buf)
+    return buf.usePinned { block(it.addressOf(0)) }
+}
+
+private fun byteArrayFrom(ptr: CPointer<ByteVar>, length: Int): ByteArray {
+    if (length <= 0) return ByteArray(0)
+    return ptr.readBytes(length)
 }
 
 internal fun COpaquePointer.drainWaylandEvents(): List<WaylandEvent> = memScoped {

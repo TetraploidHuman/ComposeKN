@@ -1,7 +1,11 @@
-@file:OptIn(androidx.compose.ui.InternalComposeUiApi::class)
+@file:OptIn(
+    androidx.compose.ui.InternalComposeUiApi::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
+)
 
 package com.composekn.linux
 
+import androidx.compose.ui.draganddrop.DragAndDropEvent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -17,6 +21,7 @@ import androidx.compose.ui.input.pointer.isShiftPressed
 import androidx.compose.ui.scene.ComposeScene
 import org.jetbrains.skiko.WaylandEvent
 import org.jetbrains.skiko.WaylandEventType
+import org.jetbrains.skiko.WaylandWindow
 
 internal class WaylandInputState {
     var pointerX = 0f
@@ -168,7 +173,76 @@ internal fun ComposeScene.dispatchWaylandEvent(
         }
         WaylandEventType.Key -> Unit
         WaylandEventType.Focus -> Unit
+        WaylandEventType.DragEnter,
+        WaylandEventType.DragOver,
+        WaylandEventType.DragLeave,
+        WaylandEventType.DragDrop -> Unit
         WaylandEventType.Scale,
         WaylandEventType.Frame -> Unit
+    }
+}
+
+/**
+ * 入站拖放：对齐 Windows `dispatchWindowsDragEvent`。
+ *
+ * Enter/Over 时尚无真实负载（Wayland 只在 drop 时 receive），用 event.button 位
+ * （1=uri 2=text）填占位，让 `shouldStartDragAndDrop` 能接受；Drop 时再 pop 真数据。
+ *
+ * @return 是否接受（写回 `dnd_set_accept`）。
+ */
+@Suppress("DEPRECATION")
+internal fun ComposeScene.dispatchWaylandDragEvent(
+    event: WaylandEvent,
+    contentScale: Float,
+    window: WaylandWindow,
+): Boolean {
+    val root = rootDragAndDropNode
+    val position = Offset(event.x * contentScale, event.y * contentScale)
+    val hasUri = (event.button and 1) != 0
+    val hasText = (event.button and 2) != 0
+
+    val files: List<String>
+    val text: String?
+    if (event.type == WaylandEventType.DragDrop) {
+        files = window.dndPopFiles()
+        text = window.dndPopText()
+    } else {
+        // 占位：非空 list / 非 null text，真实路径/内容在 Drop 才有
+        files = if (hasUri) listOf("") else emptyList()
+        text = if (hasText) "" else null
+    }
+
+    val dragEvent = DragAndDropEvent.forPlatformDrop(
+        position = position,
+        files = files,
+        text = text,
+    )
+    return when (event.type) {
+        WaylandEventType.DragEnter -> {
+            val accepted = root.acceptDragAndDropTransfer(dragEvent)
+            if (accepted) {
+                root.onStarted(dragEvent)
+                root.onEntered(dragEvent)
+            }
+            accepted
+        }
+        WaylandEventType.DragOver -> {
+            root.onMoved(dragEvent)
+            root.hasEligibleDropTarget
+        }
+        WaylandEventType.DragLeave -> {
+            root.onExited(dragEvent)
+            root.onEnded(dragEvent)
+            false
+        }
+        WaylandEventType.DragDrop -> {
+            val consumed = root.onDrop(dragEvent)
+            root.onEnded(dragEvent)
+            if (!consumed) {
+                println("composekn: drag onDrop 未被任何 dragAndDropTarget 消费")
+            }
+            false
+        }
+        else -> false
     }
 }

@@ -92,8 +92,8 @@ private fun platformClipEntry(): ClipEntry? {
  * [ClipEntry] -> 平台剪贴板：**一次事务**把条目里有的格式全放上去。
  *
  * 为什么强调"一次"：Windows 那边 `EmptyClipboard` + 多次 `SetClipboardData` 才是一个
- * 事务，分开写会把前一次的格式擦掉；Wayland 那边则是一个 `wl_data_source` 声明多个
- * MIME（目前只实现了 text/plain，见 skiko 的 `WaylandClipboard`）。
+ * 事务，分开写会把前一次的格式擦掉；Wayland 侧是一个 `wl_data_source` 声明多个 MIME
+ * （text/plain、text/html、text/rtf、image/bmp、text/uri-list）。
  *
  * `clipEntry == null`（上游语义是"清空剪贴板"）暂时不做任何事 —— 与之前的实现一致。
  */

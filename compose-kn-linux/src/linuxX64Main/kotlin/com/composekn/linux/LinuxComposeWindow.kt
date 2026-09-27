@@ -245,6 +245,8 @@ class LinuxComposeWindow(
                 }
             }
             flushMainUIDispatcher()
+            LinuxDragAndDropManager.flushPendingOutgoingDrags()
+            LinuxDragAndDropManager.pollOutgoingDragResults()
             if (window.consumeResized()) {
                 layer.needRender()
                 onGeometryHint?.invoke()

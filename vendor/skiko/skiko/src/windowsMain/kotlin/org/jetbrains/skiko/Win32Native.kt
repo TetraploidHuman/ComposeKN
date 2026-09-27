@@ -472,6 +472,11 @@ internal external fun composekn_win32_do_drag_drop(
     utf8Files: CPointer<ByteVar>?,
     utf8Text: CPointer<ByteVar>?,
     allowedEffects: Int,
+    iconW: Int,
+    iconH: Int,
+    iconBgra: CPointer<UByteVar>?,
+    hotX: Int,
+    hotY: Int,
 ): Int
 
 @SymbolName("composekn_win32_test_source_data_formats")
@@ -987,13 +992,54 @@ class Win32Window internal constructor(internal val native: COpaquePointer) : Au
     /**
      * 发起 OLE 拖放（模态，对齐 AWT `TransferHandler.exportAsDrag`）。
      *
+     * [iconBgra] 可选：自上而下紧密 BGRA 拖影像素；null / [iconW]<=0 跳过自定义装饰。
+     * [hotX]/[hotY] 热点相对拖影左上角（通常为中心）。
+     *
      * @return 最终 effect（COPY=1 / NONE=0）；失败 -1。
      */
-    fun doDragDrop(files: List<String>?, text: String?, allowedEffects: Int = Win32Message.DROPEFFECT_COPY): Int {
+    fun doDragDrop(
+        files: List<String>?,
+        text: String?,
+        allowedEffects: Int = Win32Message.DROPEFFECT_COPY,
+        iconW: Int = 0,
+        iconH: Int = 0,
+        iconBgra: ByteArray? = null,
+        hotX: Int = 0,
+        hotY: Int = 0,
+    ): Int {
         val filesJoined = files?.takeIf { it.isNotEmpty() }?.joinToString("\n")
+        val pixels = iconBgra
+        val useIcon = pixels != null && iconW > 0 && iconH > 0 &&
+            pixels.size >= iconW * iconH * 4
         return useCStringOrNull(filesJoined) { filesPtr ->
             useCStringOrNull(text) { textPtr ->
-                composekn_win32_do_drag_drop(native, filesPtr, textPtr, allowedEffects)
+                if (useIcon && pixels != null) {
+                    pixels.usePinned { pinned ->
+                        composekn_win32_do_drag_drop(
+                            native,
+                            filesPtr,
+                            textPtr,
+                            allowedEffects,
+                            iconW,
+                            iconH,
+                            pinned.addressOf(0).reinterpret<UByteVar>(),
+                            hotX,
+                            hotY,
+                        )
+                    }
+                } else {
+                    composekn_win32_do_drag_drop(
+                        native,
+                        filesPtr,
+                        textPtr,
+                        allowedEffects,
+                        0,
+                        0,
+                        null,
+                        0,
+                        0,
+                    )
+                }
             }
         }
     }

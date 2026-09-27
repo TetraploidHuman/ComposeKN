@@ -2,7 +2,7 @@
 
 Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES）+ Skia 上的 Compose Multiplatform。
 
-当前文档基线：**v0.5.51**（详见仓库根 `HANDOVER.md`）。
+当前文档基线：**v0.5.52**（详见仓库根 `HANDOVER.md`）。
 
 ## Status
 
@@ -16,7 +16,7 @@ Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES�
 - [x] Skia OpenGL ES 回退（单线程共用一份 EGLContext + `GrDirectContext`）
 - [x] 指针 / 键盘（xkbcommon）/ 触摸；IME（zwp_text_input_v3）
 - [x] SSD/CSD；Fullscreen；`setResizable`（min=max 锁尺寸）
-- [x] 剪贴板（wl_data_device）
+- [x] 剪贴板（wl_data_device：text/plain、text/html、text/rtf、image/bmp、text/uri-list）
 - [x] Tray：StatusNotifierItem + DBusMenu；通知 `notify-send`（无 SNI 时亦算 available）
 - [x] FileDialog：xdg-desktop-portal FileChooser
 - [x] Dialog 软模态；eventfd 唤醒共享泵
@@ -26,7 +26,8 @@ Kotlin/Native **linuxX64** 宿主：Wayland + Graphite/Vulkan（回退 EGL/GLES�
 - [x] 自定义装饰拖移：`WindowDraggableArea` → `beginMove`（xdg_toplevel_move；立即合成左键 UP）
 - [x] CSD 缩放：`beginResize` 后同样合成左键 UP（合成器吃掉抬起）
 - [x] FileDialog（portal）返回后合成左键 UP（对齐 Win32）
-- [ ] 自定义装饰图拖出未做
+- [x] 发出 / 接收 DnD：`wl_data_device_start_drag` + enter/drop；自定义拖影 → icon surface
+- [x] 自定义装饰图拖出（`drawDragDecoration` → BGRA icon）
 
 ## Requirements
 
@@ -97,7 +98,7 @@ COMPOSEKN_VK_HARDWARE=1 nix-shell ./shell.nix --run './scripts/run-linux-native.
 - **always-on-top**：无标准协议（记账 + 一次日志）；layer-shell / 厂商扩展另议
 - 无 SNI watcher 的会话：Tray 菜单不可用，通知仍可走 `notify-send`
 - weston headless 对 maximized geometry 较严（CI selftest 在 RELAX 下跳过 maximize）
-- 自定义装饰图拖出未做（beginMove / beginResize / FileDialog 已合成左键 UP）
+- 位图剪贴板跨应用：本机 offer/receive 走 `image/bmp`；外部 PNG-only 源可能读不到
 
 ## License
 
