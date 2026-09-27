@@ -82,22 +82,47 @@ class ComposeKnResourcesPlugin : Plugin<Project> {
                     dependsOn(binary.linkTaskProvider)
                     doLast {
                         val outParent = binary.outputFile.parentFile
-                        val fontOut = File(outParent, "composeResources/font")
+                        val rootOut = File(outParent, "composeResources")
+                        val fontOut = File(rootOut, "font")
+                        val drawableOut = File(rootOut, "drawable")
                         fontOut.mkdirs()
+                        drawableOut.mkdirs()
                         val fontFiles = linkedMapOf<String, File>()
-                        fun add(dir: File?) {
+                        val drawableFiles = linkedMapOf<String, File>()
+                        fun addFonts(dir: File?) {
                             if (dir == null || !dir.isDirectory) return
                             dir.listFiles()
                                 ?.filter { it.isFile && it.extension.lowercase() in setOf("ttf", "otf") }
                                 ?.forEach { fontFiles[it.name] = it }
                         }
-                        add(ext.resourcesDir.orNull?.asFile?.resolve("font"))
-                        ext.extraFontDirs.get().forEach { add(File(it)) }
+                        fun addDrawables(dir: File?) {
+                            if (dir == null || !dir.isDirectory) return
+                            dir.listFiles()
+                                ?.filter {
+                                    it.isFile && it.extension.lowercase() in setOf(
+                                        "png", "webp", "jpg", "jpeg", "svg", "xml",
+                                    )
+                                }
+                                ?.forEach { drawableFiles[it.name] = it }
+                        }
+                        val resRoot = ext.resourcesDir.orNull?.asFile
+                        addFonts(resRoot?.resolve("font"))
+                        addDrawables(resRoot?.resolve("drawable"))
+                        ext.extraFontDirs.get().forEach { addFonts(File(it)) }
                         fontFiles.values.forEach { src ->
                             src.copyTo(File(fontOut, src.name), overwrite = true)
                         }
+                        drawableFiles.values.forEach { src ->
+                            src.copyTo(File(drawableOut, src.name), overwrite = true)
+                        }
+                        resRoot?.resolve("values")?.takeIf { it.isDirectory }?.let { values ->
+                            val valuesOut = File(rootOut, "values")
+                            valuesOut.mkdirs()
+                            values.copyRecursively(valuesOut, overwrite = true)
+                        }
                         logger.lifecycle(
-                            "ComposeKN resources: copied ${fontFiles.size} font(s) → $fontOut",
+                            "ComposeKN resources: copied fonts=${fontFiles.size} " +
+                                "drawables=${drawableFiles.size} → $rootOut",
                         )
                     }
                 }
@@ -133,6 +158,8 @@ abstract class GenerateComposeKnResourcesTask : DefaultTask() {
             resourcesDirectory.orNull?.asFile,
             extraFontDirectories.get(),
         )
+        val drawables = collectDrawables(resourcesDirectory.orNull?.asFile)
+        val strings = collectStrings(resourcesDirectory.orNull?.asFile)
         val outRoot = outputDirectory.get().asFile
         outRoot.deleteRecursively()
         val pkg = packageName.get()
@@ -150,19 +177,50 @@ abstract class GenerateComposeKnResourcesTask : DefaultTask() {
             |        )
             """.trimMargin()
         }
+        val drawableProps = drawables.entries.sortedBy { it.key }.joinToString("\n") { (id, file) ->
+            val rel = "drawable/${file.name}"
+            val dev = file.absolutePath.replace("\\", "\\\\").replace("\"", "\\\"")
+            """
+            |        val $id: DrawableResource = drawableResource(
+            |            identity = "$id",
+            |            relativePath = "$rel",
+            |            developmentPath = "$dev",
+            |        )
+            """.trimMargin()
+        }
+        val stringProps = strings.entries.sortedBy { it.key }.joinToString("\n") { (id, value) ->
+            val escaped = value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+            """
+            |        val $id: StringResource = stringResource(
+            |            identity = "$id",
+            |            relativePath = "values/strings.xml",
+            |            defaultValue = "$escaped",
+            |        )
+            """.trimMargin()
+        }
 
         File(dir, "Res.kt").writeText(
             """
             |package $pkg
             |
+            |import com.composekn.resources.DrawableResource
             |import com.composekn.resources.FontResource
+            |import com.composekn.resources.StringResource
+            |import com.composekn.resources.drawableResource
             |import com.composekn.resources.fontResource
+            |import com.composekn.resources.stringResource
             |
-            |// ComposeKN 生成的资源入口（对齐官方 Res.font.* 用法）。
+            |// ComposeKN 生成的资源入口（对齐官方 Res.font / string / drawable）。
             |// 由 generateComposeKnResources 生成 —— 勿手改。
             |object Res {
             |    object font {
             |$fontProps
+            |    }
+            |    object string {
+            |$stringProps
+            |    }
+            |    object drawable {
+            |$drawableProps
             |    }
             |}
             |
@@ -170,7 +228,8 @@ abstract class GenerateComposeKnResourcesTask : DefaultTask() {
         )
 
         logger.lifecycle(
-            "ComposeKN resources: generated Res.font (${fonts.size}) → ${dir.resolve("Res.kt")}",
+            "ComposeKN resources: Res.font=${fonts.size} string=${strings.size} " +
+                "drawable=${drawables.size} → ${dir.resolve("Res.kt")}",
         )
     }
 
@@ -187,6 +246,38 @@ abstract class GenerateComposeKnResourcesTask : DefaultTask() {
             addDir(resourcesRoot?.resolve("font"))
             extraDirs.forEach { addDir(File(it)) }
             return fonts
+        }
+
+        fun collectDrawables(resourcesRoot: File?): Map<String, File> {
+            val out = linkedMapOf<String, File>()
+            val dir = resourcesRoot?.resolve("drawable") ?: return out
+            if (!dir.isDirectory) return out
+            dir.listFiles()
+                ?.filter {
+                    it.isFile && it.extension.lowercase() in setOf(
+                        "png", "webp", "jpg", "jpeg", "svg", "xml",
+                    )
+                }
+                ?.sortedBy { it.name }
+                ?.forEach { out[it.nameWithoutExtension] = it }
+            return out
+        }
+
+        /** 极简 strings.xml：`<string name="x">y</string>` */
+        fun collectStrings(resourcesRoot: File?): Map<String, String> {
+            val out = linkedMapOf<String, String>()
+            val file = resourcesRoot?.resolve("values/strings.xml") ?: return out
+            if (!file.isFile) return out
+            val text = file.readText()
+            val re = Regex("""<string\s+name\s*=\s*"([^"]+)"\s*>([^<]*)</string>""")
+            re.findAll(text).forEach { m ->
+                out[m.groupValues[1]] = m.groupValues[2]
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&")
+                    .replace("&quot;", "\"")
+            }
+            return out
         }
     }
 }

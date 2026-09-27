@@ -20,6 +20,7 @@ import org.jetbrains.skiko.initLinuxMainThread
  * `androidx.compose.ui.window.application { Window(...) }` 调用。
  *
  * 幂等；[LinuxComposeApplication] 构造时也会自动调用。
+ * 依赖本模块时，[installComposeKnLinuxAutoRegister] 会把自动登记挂到 Registry。
  */
 fun registerComposeKnLinuxBackend() {
     if (ComposeNativeWindowBackendRegistry.backend != null) return
@@ -29,6 +30,22 @@ fun registerComposeKnLinuxBackend() {
 
 /** 供 Application.init / 测试调用的别名。 */
 internal fun ensureLinuxComposeBackendRegistered() = registerComposeKnLinuxBackend()
+
+/**
+ * 挂到 [ComposeNativeWindowBackendRegistry.autoRegister]，使 `application { }` 无需手写 register。
+ * 由宿主插件生成的 bootstrap / 本文件顶层初始化调用。
+ */
+fun installComposeKnLinuxAutoRegister() {
+    ComposeNativeWindowBackendRegistry.autoRegister = { registerComposeKnLinuxBackend() }
+}
+
+// 只要本 klib 被链接且本文件进最终二进制，application 即可自动登记。
+// （宿主插件还会生成显式 bootstrap，防止 DCE 掉未引用符号。）
+@Suppress("unused")
+private val composeKnLinuxAutoRegisterInstall: Boolean = run {
+    installComposeKnLinuxAutoRegister()
+    true
+}
 
 private object LinuxComposeNativeBackend : ComposeNativeWindowBackend {
     override fun initMainThread() {

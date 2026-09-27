@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.compose)
     id("com.composekn.linux-native-linker")
+    id("com.composekn.publish")
 }
 
 kotlin {

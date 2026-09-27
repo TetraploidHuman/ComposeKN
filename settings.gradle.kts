@@ -49,6 +49,7 @@ includeBuild("vendor/compose-core") {
 include(":compose-kn-linux")
 include(":compose-kn-windows")
 include(":compose-kn-resources")
+include(":compose-kn-bom")
 include(":compose-kn-tests")
 include(":samples:wayland-demo")
 include(":samples:link-smoke")

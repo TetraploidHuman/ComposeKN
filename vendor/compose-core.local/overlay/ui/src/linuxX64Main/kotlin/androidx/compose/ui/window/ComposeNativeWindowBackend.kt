@@ -97,23 +97,32 @@ interface ComposeNativeWindowBackend {
 }
 
 /**
- * 后端登记表。compose-kn-windows 调用 [register]；[Window] / [application] 读 [backend]。
+ * 后端登记表。compose-kn-windows / linux 调用 [register]；[Window] / [application] 读 [backend]。
+ *
+ * [autoRegister]：宿主库在链入时挂上，[requireBackend] 会先尝试自动登记，
+ * 消费者不必在 main 里手写 `registerComposeKn*Backend()`。
  */
 object ComposeNativeWindowBackendRegistry {
     @kotlin.concurrent.Volatile
     var backend: ComposeNativeWindowBackend? = null
         private set
 
+    @kotlin.concurrent.Volatile
+    var autoRegister: (() -> Unit)? = null
+
     fun register(impl: ComposeNativeWindowBackend) {
         backend = impl
     }
 
-    fun requireBackend(): ComposeNativeWindowBackend =
-        backend
+    fun requireBackend(): ComposeNativeWindowBackend {
+        if (backend == null) {
+            autoRegister?.invoke()
+        }
+        return backend
             ?: error(
-                "ComposeNativeWindowBackend 未注册。请在 main 里调用平台登记函数：" +
-                    "Windows → com.composekn.windows.registerComposeKnWindowsBackend()；" +
-                    "Linux/Wayland → com.composekn.linux.registerComposeKnLinuxBackend()。" +
-                    "（构造 WindowsComposeApplication / LinuxComposeApplication 时也会自动登记。）",
+                "ComposeNativeWindowBackend 未注册。请依赖 compose-kn-linux / compose-kn-windows，" +
+                    "或显式调用 registerComposeKnLinuxBackend() / registerComposeKnWindowsBackend()。" +
+                    "（构造 *ComposeApplication 时也会自动登记。）",
             )
+    }
 }

@@ -1,7 +1,7 @@
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.compose)
-    id("com.composekn.linux-native-linker")
+    id("com.composekn.host")
     id("com.composekn.resources")
 }
 
@@ -24,7 +24,7 @@ kotlin {
     sourceSets {
         val linuxX64Main by getting {
             dependencies {
-                implementation(project(":compose-kn-linux"))
+                // compose-kn-linux 由 com.composekn.host 注入
                 implementation(project(":compose-kn-resources"))
             }
         }
