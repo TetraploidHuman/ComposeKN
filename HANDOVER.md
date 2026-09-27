@@ -3,11 +3,10 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.54**（BOM / host 插件 / resources 官方包名；
-> v0.5.53 Res.font；compose-core UI **1.12.1**；见 `CONSUMING.md`）。
-> **compose-core 源码基线：`v1.12.1`**（唯一 UI 基线；Maven `compose_deps=1.11.1`
-> 仅 runtime 等未顶掉坐标，**不要**当 UI 版本）。
-> **本轮已补**：消费指南、BOM、一键 host、resources string/drawable。
+> **当前平台宿主基线：v0.5.55**（GitHub Packages + settings 顶 UI；
+> host/register 含 `init*MainThread`；BOM/host 见 `CONSUMING.md`）。
+> **compose-core UI：`1.12.1`** → 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.55`。
+> **本轮已补**：三点消费闭环（init 自动 / Packages CI / UI 坐标）。
 
 ## 0. 一句话背景
 

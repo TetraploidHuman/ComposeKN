@@ -1,0 +1,127 @@
+# Publish ComposeKN Maven packages to GitHub Packages on version tags.
+#
+# Triggers: push tag v0.5.55 / v1.0.0 / …
+# Artifacts:
+#   com.composekn:compose-kn-bom|linux|windows|resources
+#   com.composekn.compose:ui|foundation|material3|…  (optional compose UI job)
+#   com.composekn:skiko                              (from vendor/skiko when enabled)
+#
+# Consumers: see CONSUMING.md + plugins { id("com.composekn.settings") }
+
+name: Publish GitHub Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_compose_ui:
+        description: 'Also publish com.composekn.compose:* (UI klibs)'
+        type: boolean
+        default: true
+      publish_skiko:
+        description: 'Also publish com.composekn:skiko'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-hosts:
+    name: Publish compose-kn-* hosts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Fetch mingw Skia prebuilt (for mingwX64 klib)
+        run: ./scripts/fetch-skia-mingw.sh /tmp/composekn-skia-mingw
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish hosts + BOM + resources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
+        run: |
+          set -euo pipefail
+          # Ensure Windows native bridges can configure (prebuilt path for linker props)
+          if [ -d "$SKIA_MINGW_PREBUILT" ]; then
+            echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
+          fi
+          ./gradlew \
+            -Pcomposekn.publish.github=true \
+            :compose-kn-bom:publish \
+            :compose-kn-resources:publish \
+            :compose-kn-linux:publish \
+            :compose-kn-windows:publish \
+            --no-daemon
+
+  publish-compose-ui:
+    name: Publish com.composekn.compose:*
+    runs-on: ubuntu-latest
+    needs: publish-hosts
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_compose_ui || github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish compose-core UI modules
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          CKN_VER=$(grep '^composekn.version=' gradle.properties | cut -d= -f2)
+          ./gradlew -p vendor/compose-core \
+            -Pcomposekn.publish.composeUi=true \
+            -Pcomposekn.version="$CKN_VER" \
+            publish \
+            --no-daemon
+
+  publish-skiko:
+    name: Publish com.composekn:skiko
+    runs-on: ubuntu-latest
+    needs: publish-hosts
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_skiko || github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish skiko under com.composekn
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: ./scripts/publish-skiko-composekn.sh

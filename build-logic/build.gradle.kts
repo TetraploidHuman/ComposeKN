@@ -33,5 +33,9 @@ gradlePlugin {
             id = "com.composekn.publish"
             implementationClass = "com.composekn.gradle.ComposeKnPublishPlugin"
         }
+        create("composeKnSettings") {
+            id = "com.composekn.settings"
+            implementationClass = "com.composekn.gradle.ComposeKnSettingsPlugin"
+        }
     }
 }
