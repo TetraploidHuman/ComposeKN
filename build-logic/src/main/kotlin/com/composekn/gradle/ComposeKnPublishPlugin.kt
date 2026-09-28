@@ -19,7 +19,7 @@ import org.gradle.kotlin.dsl.create
 class ComposeKnPublishPlugin : Plugin<Project> {
     override fun apply(project: Project) {
         project.pluginManager.apply("maven-publish")
-        val version = project.findProperty("composekn.version")?.toString() ?: "0.5.56"
+        val version = project.findProperty("composekn.version")?.toString() ?: "0.5.58"
         project.group = project.findProperty("composekn.group")?.toString() ?: "com.composekn"
         project.version = version
 
