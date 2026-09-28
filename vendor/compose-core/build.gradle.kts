@@ -27,7 +27,7 @@ val skipMetadata =
 val usePublishedSkiko =
     providers.gradleProperty("composekn.usePublishedSkiko").orNull == "true"
 val composeknVer =
-    providers.gradleProperty("composekn.version").orElse("0.5.63")
+    providers.gradleProperty("composekn.version").orElse("0.5.64")
 val composeUiVer =
     providers.gradleProperty("composekn.compose.ui.version")
         .orElse(composeknVer.map { "1.12.1-ckn.$it" })
@@ -44,11 +44,25 @@ if (skipMetadata) {
 }
 
 if (usePublishedSkiko) {
+    // 按 configuration 名直接顶到平台坐标，避开合成根 .module 的 available-at 解析问题。
+    val skikoVer = composeknVer.get()
     allprojects {
         configurations.configureEach {
-            resolutionStrategy.dependencySubstitution {
-                substitute(module("org.jetbrains.skiko:skiko"))
-                    .using(module("com.composekn:skiko:${composeknVer.get()}"))
+            val confName = name
+            val target =
+                when {
+                    confName.contains("linuxX64", ignoreCase = true) ||
+                        confName.contains("linuxx64", ignoreCase = true) ->
+                        "com.composekn:skiko-linuxx64:$skikoVer"
+                    confName.contains("mingwX64", ignoreCase = true) ||
+                        confName.contains("mingwx64", ignoreCase = true) ->
+                        "com.composekn:skiko-mingwx64:$skikoVer"
+                    else -> null
+                }
+            if (target != null) {
+                resolutionStrategy.dependencySubstitution {
+                    substitute(module("org.jetbrains.skiko:skiko")).using(module(target))
+                }
             }
         }
     }

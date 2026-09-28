@@ -41,6 +41,7 @@ synthesize() {
       \"name\": \"${p}ApiElements-published\",
       \"attributes\": {
         \"org.gradle.category\": \"library\",
+        \"org.gradle.jvm.environment\": \"non-jvm\",
         \"org.gradle.usage\": \"kotlin-api\",
         \"org.jetbrains.kotlin.platform.type\": \"native\",
         \"org.jetbrains.kotlin.native.target\": \"${native_target}\"
@@ -56,6 +57,7 @@ synthesize() {
       \"name\": \"${p}MetadataElements-published\",
       \"attributes\": {
         \"org.gradle.category\": \"library\",
+        \"org.gradle.jvm.environment\": \"non-jvm\",
         \"org.gradle.usage\": \"kotlin-metadata\",
         \"org.jetbrains.kotlin.platform.type\": \"native\",
         \"org.jetbrains.kotlin.native.target\": \"${native_target}\"
