@@ -25,6 +25,10 @@ on:
         description: 'Also publish com.composekn:skiko'
         type: boolean
         default: true
+      pack_release_from_run:
+        description: '仅从已有 Actions run 重打 Release zip（填 run id，跳过 publish）'
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -38,6 +42,7 @@ jobs:
   publish-hosts:
     name: Publish compose-kn-* hosts
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.pack_release_from_run == '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -108,7 +113,7 @@ jobs:
     name: Publish com.composekn:skiko
     runs-on: ubuntu-latest
     needs: publish-hosts
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_skiko || github.event_name == 'push' }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.pack_release_from_run == '') && (github.event_name == 'workflow_dispatch' && inputs.publish_skiko || github.event_name == 'push') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -182,7 +187,7 @@ jobs:
     name: Publish com.composekn.compose:*
     runs-on: ubuntu-latest
     needs: publish-skiko
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_compose_ui || github.event_name == 'push' }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.pack_release_from_run == '') && (github.event_name == 'workflow_dispatch' && inputs.publish_compose_ui || github.event_name == 'push') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -205,7 +210,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: composekn-skiko-maven
-          path: build/maven-repo/com/composekn
+          path: build/maven-skiko-wrap
 
       - name: Publish compose-core UI modules
         env:
@@ -215,6 +220,15 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          mkdir -p build/maven-repo/com/composekn
+          # 摊平 upload-artifact 可能多包的一层 composekn/
+          if [ -d build/maven-skiko-wrap/composekn ]; then
+            cp -a build/maven-skiko-wrap/composekn/. build/maven-repo/com/composekn/
+          elif [ -d build/maven-skiko-wrap/com/composekn ]; then
+            cp -a build/maven-skiko-wrap/com/composekn/. build/maven-repo/com/composekn/
+          else
+            cp -a build/maven-skiko-wrap/. build/maven-repo/com/composekn/
+          fi
           ls -la build/maven-repo/com/composekn/
           test -d build/maven-repo/com/composekn/skiko
           test -d build/maven-repo/com/composekn/skiko-linuxx64
@@ -232,6 +246,7 @@ jobs:
   publish-plugins:
     name: Publish Gradle plugins + catalog
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.pack_release_from_run == '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -267,29 +282,30 @@ jobs:
     name: Pack Release maven zip
     runs-on: ubuntu-latest
     needs: [publish-hosts, publish-skiko, publish-compose-ui, publish-plugins]
-    # hosts+plugins 必成；skiko/UI 在 dispatch 关闭时可能 skipped
-    if: ${{ always() && needs.publish-hosts.result == 'success' && needs.publish-plugins.result == 'success' && (needs.publish-skiko.result == 'success' || needs.publish-skiko.result == 'skipped') && (needs.publish-compose-ui.result == 'success' || needs.publish-compose-ui.result == 'skipped') }}
+    # hosts+plugins 必成；skiko/UI 在 dispatch 关闭时可能 skipped；pack_release_from_run 走独立 job
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.pack_release_from_run == '') && needs.publish-hosts.result == 'success' && needs.publish-plugins.result == 'success' && (needs.publish-skiko.result == 'success' || needs.publish-skiko.result == 'skipped') && (needs.publish-compose-ui.result == 'success' || needs.publish-compose-ui.result == 'skipped') }}
     steps:
       - uses: actions/checkout@v4
 
+      # upload-artifact@v4 把目录名作为 artifact 根；下到 build/ 即可还原 build/maven-repo/
       - name: Download hosts maven
         uses: actions/download-artifact@v4
         with:
           name: composekn-hosts-maven
-          path: build/maven-repo
+          path: build
 
       - name: Download UI maven (optional)
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: composekn-ui-maven
-          path: build/maven-merge-ui
+          path: build/maven-merge-ui-wrap
 
       - name: Download plugins maven
         uses: actions/download-artifact@v4
         with:
           name: composekn-plugins-maven
-          path: build/maven-merge-plugins
+          path: build/maven-merge-plugins-wrap
 
       - name: Merge maven trees + upload Release
         env:
@@ -297,13 +313,84 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 摊平：hosts 可能是 build/maven-repo/… 或 build/maven-repo/maven-repo/…
+          flatten_into() {
+            local src="$1" dest="$2"
+            mkdir -p "$dest"
+            if [ -d "$src/maven-repo/com" ]; then
+              cp -a "$src/maven-repo/." "$dest/"
+            elif [ -d "$src/com" ]; then
+              cp -a "$src/." "$dest/"
+            elif [ -d "$src" ]; then
+              cp -a "$src/." "$dest/"
+            fi
+          }
           mkdir -p build/maven-repo
-          if [ -d build/maven-merge-ui ]; then
-            cp -a build/maven-merge-ui/. build/maven-repo/
+          # hosts 已下到 build/；若直接是 maven-repo 则已就位
+          if [ -d build/maven-repo/maven-repo/com ]; then
+            shopt -s dotglob
+            mv build/maven-repo/maven-repo/* build/maven-repo/
+            rm -rf build/maven-repo/maven-repo
+            shopt -u dotglob
           fi
-          if [ -d build/maven-merge-plugins ]; then
-            cp -a build/maven-merge-plugins/. build/maven-repo/
-          fi
+          flatten_into build/maven-merge-ui-wrap build/maven-repo
+          flatten_into build/maven-merge-plugins-wrap build/maven-repo
+          echo "=== maven-repo tree (top) ==="
+          ls -la build/maven-repo/ | head -30
+          find build/maven-repo -name '*.klib' | wc -l
+          test -d build/maven-repo/com/composekn
           chmod +x ./scripts/publish-composekn-packages.sh
-          # 仅打包上传，不重建
+          # 纯打包，不跑 gradle
+          ./scripts/publish-composekn-packages.sh --release
+
+  # 从已有成功 publish 的 run 重打 Release zip（不重编）
+  pack-release-from-run:
+    name: Pack Release from prior run
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.pack_release_from_run != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts from prior run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ inputs.pack_release_from_run }}"
+          mkdir -p build/art
+          gh run download "$RUN_ID" -n composekn-hosts-maven -D build/art/hosts
+          gh run download "$RUN_ID" -n composekn-plugins-maven -D build/art/plugins || true
+          gh run download "$RUN_ID" -n composekn-ui-maven -D build/art/ui || true
+          ls -laR build/art | head -80
+
+      - name: Merge + upload Release zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          flatten_into() {
+            local src="$1" dest="$2"
+            mkdir -p "$dest"
+            if [ -d "$src/maven-repo/com" ]; then
+              cp -a "$src/maven-repo/." "$dest/"
+            elif [ -d "$src/com" ]; then
+              cp -a "$src/." "$dest/"
+            elif [ -d "$src" ]; then
+              cp -a "$src/." "$dest/"
+            fi
+          }
+          mkdir -p build/maven-repo
+          flatten_into build/art/hosts build/maven-repo
+          flatten_into build/art/ui build/maven-repo
+          flatten_into build/art/plugins build/maven-repo
+          if [ -d build/maven-repo/maven-repo/com ]; then
+            shopt -s dotglob
+            mv build/maven-repo/maven-repo/* build/maven-repo/
+            rm -rf build/maven-repo/maven-repo
+            shopt -u dotglob
+          fi
+          echo "klibs: $(find build/maven-repo -name '*.klib' | wc -l)"
+          test -d build/maven-repo/com/composekn
+          chmod +x ./scripts/publish-composekn-packages.sh
           ./scripts/publish-composekn-packages.sh --release

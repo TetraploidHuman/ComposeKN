@@ -8,7 +8,7 @@
 #   ./scripts/publish-composekn-packages.sh
 #   SKIA_MINGW_PREBUILT=/tmp/.../skia-mingw-TAG ./scripts/publish-composekn-packages.sh
 #   GITHUB_TOKEN=… ./scripts/publish-composekn-packages.sh --github
-#   ./scripts/publish-composekn-packages.sh --release   # 挂到 tag v$VER
+#   ./scripts/publish-composekn-packages.sh --release   # 只打包上传，绝不重建
 #   ./scripts/publish-composekn-packages.sh --compose-ui --skiko
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -78,14 +78,13 @@ upload_roots() {
   done
 }
 
-# 仅 --release 且本地已有 klib：跳过重建，直接打包上传
+# 纯 --release：只打包已有 maven-repo，绝不触发 gradle 重建
+# （finalize-release job 无 Wayland/pkg-config，重建必挂）
 NEED_BUILD=1
 if [ "$DO_RELEASE" = 1 ] && [ "$DO_GITHUB" = 0 ] && [ "$DO_UI" = 0 ] \
     && [ "$DO_SKIKO" = 0 ] && [ "$DO_PLUGINS" = 0 ]; then
-  if find "$REPO/build/maven-repo/com/composekn" -name '*.klib' 2>/dev/null | grep -q .; then
-    NEED_BUILD=0
-    info "Reuse existing build/maven-repo (add --github/--compose-ui/--skiko to rebuild)"
-  fi
+  NEED_BUILD=0
+  info "Pack-only mode (--release)：跳过 publish/rebuild"
 fi
 
 if [ "$NEED_BUILD" = 1 ]; then
@@ -207,7 +206,19 @@ if [ "$DO_RELEASE" = 1 ]; then
   CKN_VER="$(grep '^composekn.version=' gradle.properties | cut -d= -f2)"
   TAG="v${CKN_VER}"
   ZIP="$REPO/build/composekn-maven-${CKN_VER}.zip"
+  # upload-artifact@v4 可能多包一层 maven-repo/；摊平后再检查
+  if [ ! -d "$REPO/build/maven-repo/com/composekn" ] \
+      && [ -d "$REPO/build/maven-repo/maven-repo/com/composekn" ]; then
+    info "Flatten nested build/maven-repo/maven-repo → build/maven-repo"
+    shopt -s dotglob
+    mv "$REPO/build/maven-repo/maven-repo"/* "$REPO/build/maven-repo/"
+    rmdir "$REPO/build/maven-repo/maven-repo" 2>/dev/null || rm -rf "$REPO/build/maven-repo/maven-repo"
+    shopt -u dotglob
+  fi
   [ -d "$REPO/build/maven-repo/com/composekn" ] || die "build/maven-repo empty — publish first"
+  KLIB_N="$(find "$REPO/build/maven-repo" -name '*.klib' 2>/dev/null | wc -l | tr -d ' ')"
+  info "maven-repo klibs: $KLIB_N"
+  [ "$KLIB_N" -gt 0 ] || die "no .klib under build/maven-repo — artifact merge failed?"
   info "Pack $ZIP for Release $TAG"
   rm -f "$ZIP"
   if command -v zip >/dev/null 2>&1; then
