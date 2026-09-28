@@ -1,6 +1,6 @@
 # Publish ComposeKN Maven packages to GitHub Packages on version tags.
 #
-# Triggers: push tag v0.5.62 / v1.0.0 / …
+# Triggers: push tag v0.5.63 / v1.0.0 / …
 # Artifacts:
 #   com.composekn:compose-kn-bom|linux|windows|resources
 #   com.composekn.compose:ui|foundation|material3|…  (optional compose UI job)
@@ -163,6 +163,15 @@ jobs:
             ./scripts/publish-skiko-composekn.sh
           '
 
+      # UI job 直接用本地 maven-repo，不依赖 Packages 解析同 workflow 刚发的坐标
+      - name: Upload skiko maven-repo for UI job
+        uses: actions/upload-artifact@v4
+        with:
+          name: composekn-skiko-maven
+          path: build/maven-repo/com/composekn
+          if-no-files-found: error
+          retention-days: 3
+
   publish-compose-ui:
     name: Publish com.composekn.compose:*
     runs-on: ubuntu-latest
@@ -187,6 +196,12 @@ jobs:
           path: ~/.konan
           key: konan-${{ runner.os }}-${{ hashFiles('vendor/skiko/dependencies.toml', 'gradle.properties') }}
 
+      - name: Download skiko maven-repo from publish-skiko
+        uses: actions/download-artifact@v4
+        with:
+          name: composekn-skiko-maven
+          path: build/maven-repo/com/composekn
+
       - name: Publish compose-core UI modules
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -195,5 +210,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          ls -la build/maven-repo/com/composekn/
+          test -d build/maven-repo/com/composekn/skiko
+          test -d build/maven-repo/com/composekn/skiko-linuxx64
           chmod +x ./scripts/publish-compose-ui-composekn.sh
           ./scripts/publish-compose-ui-composekn.sh

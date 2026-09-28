@@ -55,6 +55,7 @@ fi
 
 info "Publishing com.composekn:skiko:$CKN_VER (linuxX64+mingwX64; skip *KotlinMetadata)"
 
+# afterEvaluate 再盖 groupId：skiko 自己的 publishing.kt 会把 group 设回 org.jetbrains.skiko
 INIT="$(mktemp)"
 trap 'rm -f "$INIT"' EXIT
 cat > "$INIT" <<EOF
@@ -67,10 +68,6 @@ gradle.projectsLoaded {
         }
         p.pluginManager.withPlugin("maven-publish") {
             p.extensions.configure(org.gradle.api.publish.PublishingExtension) { pub ->
-                pub.publications.withType(org.gradle.api.publish.maven.MavenPublication).configureEach {
-                    groupId = "com.composekn"
-                    version = "$CKN_VER"
-                }
                 pub.repositories.maven {
                     name = "GitHubPackages"
                     url = uri("https://maven.pkg.github.com/$OWNER/$GH_REPO_NAME")
@@ -82,6 +79,17 @@ gradle.projectsLoaded {
                 pub.repositories.maven {
                     name = "ComposeKnLocal"
                     url = uri(new File("$REPO/build/maven-repo"))
+                }
+            }
+        }
+        p.afterEvaluate {
+            p.group = "com.composekn"
+            p.version = "$CKN_VER"
+            def publishing = p.extensions.findByType(org.gradle.api.publish.PublishingExtension)
+            if (publishing != null) {
+                publishing.publications.withType(org.gradle.api.publish.maven.MavenPublication).configureEach { mp ->
+                    mp.groupId = "com.composekn"
+                    mp.version = "$CKN_VER"
                 }
             }
         }
@@ -98,33 +106,39 @@ cd "$REPO/vendor/skiko/skiko"
   publishLinuxX64PublicationToGitHubPackagesRepository \
   publishMingwX64PublicationToGitHubPackagesRepository
 
+info "Local maven-repo after skiko publish:"
+find "$REPO/build/maven-repo" -type f \( -iname '*skiko*' -o -path '*/jetbrains/skiko/*' \) 2>/dev/null | sort | head -80 || true
+
+[ -d "$REPO/build/maven-repo/com/composekn/skiko-linuxx64/$CKN_VER" ] \
+  || die "missing com/composekn/skiko-linuxx64/$CKN_VER (groupId override failed?)"
+[ -d "$REPO/build/maven-repo/com/composekn/skiko-mingwx64/$CKN_VER" ] \
+  || die "missing com/composekn/skiko-mingwx64/$CKN_VER (groupId override failed?)"
+
 info "Synthesize com.composekn:skiko root"
 chmod +x "$REPO/scripts/synthesize-kmp-root-modules.sh"
 "$REPO/scripts/synthesize-kmp-root-modules.sh" "$REPO/build/maven-repo"
 
 ROOT="$REPO/build/maven-repo/com/composekn/skiko/$CKN_VER"
-if [ -f "$ROOT/skiko-$CKN_VER.module" ]; then
-  info "Upload synthesized skiko root → GitHub Packages"
-  BASE="https://maven.pkg.github.com/$OWNER/$GH_REPO_NAME/com/composekn/skiko/$CKN_VER"
-  for f in "$ROOT"/*; do
-    [ -f "$f" ] || continue
-    bn="$(basename "$f")"
-    code="$(curl -sS -o /tmp/gh-pkg-up.out -w '%{http_code}' \
-      -X PUT \
-      -H "Authorization: Bearer $GITHUB_TOKEN" \
-      -H "Content-Type: application/octet-stream" \
-      --data-binary @"$f" \
-      "$BASE/$bn" || true)"
-    case "$code" in
-      200|201|204) info "  $bn → $code" ;;
-      409) warn "  $bn → 409 (exists)" ;;
-      *) warn "  $bn → HTTP $code $(head -c 160 /tmp/gh-pkg-up.out 2>/dev/null || true)" ;;
-    esac
-  done
-else
-  warn "no synthesized $ROOT/skiko-$CKN_VER.module (check platform artifact names)"
-  find "$REPO/build/maven-repo/com/composekn" -iname '*skiko*' 2>/dev/null | head -40 || true
-fi
+[ -f "$ROOT/skiko-$CKN_VER.module" ] \
+  || die "no synthesized $ROOT/skiko-$CKN_VER.module"
+
+info "Upload synthesized skiko root → GitHub Packages"
+BASE="https://maven.pkg.github.com/$OWNER/$GH_REPO_NAME/com/composekn/skiko/$CKN_VER"
+for f in "$ROOT"/*; do
+  [ -f "$f" ] || continue
+  bn="$(basename "$f")"
+  code="$(curl -sS -o /tmp/gh-pkg-up.out -w '%{http_code}' \
+    -X PUT \
+    -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary @"$f" \
+    "$BASE/$bn" || true)"
+  case "$code" in
+    200|201|204) info "  $bn → $code" ;;
+    409) warn "  $bn → 409 (exists)" ;;
+    *) die "  $bn → HTTP $code $(head -c 200 /tmp/gh-pkg-up.out 2>/dev/null || true)" ;;
+  esac
+done
 
 info "done"
 find "$REPO/build/maven-repo/com/composekn" -iname '*skiko*' -name '*.klib' 2>/dev/null | sort || true
