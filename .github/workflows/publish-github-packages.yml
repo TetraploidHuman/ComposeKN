@@ -1,6 +1,6 @@
 # Publish ComposeKN Maven packages to GitHub Packages on version tags.
 #
-# Triggers: push tag v0.5.59 / v1.0.0 / …
+# Triggers: push tag v0.5.60 / v1.0.0 / …
 # Artifacts:
 #   com.composekn:compose-kn-bom|linux|windows|resources
 #   com.composekn.compose:ui|foundation|material3|…  (optional compose UI job)
@@ -88,13 +88,12 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
           NIXPKGS_URL: ${{ env.NIXPKGS_URL }}
         run: |
           set -euo pipefail
-          if [ -d "$SKIA_MINGW_PREBUILT" ]; then
-            echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
-          fi
+          export SKIA_MINGW_PREBUILT="/tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)"
+          echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
+          test -f "$SKIA_MINGW_PREBUILT/libs/libskia.a"
           ./scripts/publish-composekn-packages.sh --github --release
 
   publish-skiko:
@@ -149,15 +148,18 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
           NIXPKGS_URL: ${{ env.NIXPKGS_URL }}
         run: |
           set -euo pipefail
-          # 整段进 nix-shell，确保 mingw g++ 在 PATH（勿只在脚本里嵌套调用）
-          nix-shell ./shell.nix -I "nixpkgs=$NIXPKGS_URL" --run '
+          export SKIA_MINGW_PREBUILT="/tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)"
+          echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
+          test -f "$SKIA_MINGW_PREBUILT/libs/libskia.a"
+          # 整段进 nix-shell，确保 mingw g++ 在 PATH；--keep 传入 PREBUILT
+          nix-shell ./shell.nix -I "nixpkgs=$NIXPKGS_URL" --keep SKIA_MINGW_PREBUILT --keep GITHUB_TOKEN --keep GITHUB_ACTOR --keep GITHUB_REPOSITORY_OWNER --keep GITHUB_REPOSITORY --run '
             set -euo pipefail
             which x86_64-w64-mingw32-g++
             x86_64-w64-mingw32-g++ --version | head -1
+            test -f "$SKIA_MINGW_PREBUILT/libs/libskia.a"
             ./scripts/publish-skiko-composekn.sh
           '
 
@@ -214,13 +216,14 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
           NIXPKGS_URL: ${{ env.NIXPKGS_URL }}
         run: |
           set -euo pipefail
           CKN_VER=$(grep '^composekn.version=' gradle.properties | cut -d= -f2)
-          PREBUILT="$SKIA_MINGW_PREBUILT"
-          nix-shell ./shell.nix -I "nixpkgs=$NIXPKGS_URL" --run "
+          export SKIA_MINGW_PREBUILT="/tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)"
+          echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
+          test -f "$SKIA_MINGW_PREBUILT/libs/libskia.a"
+          nix-shell ./shell.nix -I "nixpkgs=$NIXPKGS_URL" --keep SKIA_MINGW_PREBUILT --keep GITHUB_TOKEN --keep GITHUB_ACTOR --keep GITHUB_REPOSITORY_OWNER --keep GITHUB_REPOSITORY --run "
             set -euo pipefail
             which x86_64-w64-mingw32-g++
             ./gradlew -p vendor/compose-core \
@@ -228,7 +231,7 @@ jobs:
               -Pcomposekn.publish.composeUi=true \
               -Pcomposekn.version='$CKN_VER' \
               -Pcomposekn.publish.skipMetadata=true \
-              -Pskiko.skia.mingw.dir='$PREBUILT/libs' \
+              -Pskiko.skia.mingw.dir=\"\$SKIA_MINGW_PREBUILT/libs\" \
               publishAllPublicationsToComposeKnLocalRepository \
               publishAllPublicationsToGitHubPackagesRepository \
               --continue --no-daemon

@@ -25,7 +25,7 @@ val publishComposeUi =
 val skipMetadata =
     providers.gradleProperty("composekn.publish.skipMetadata").orNull == "true"
 val composeknVer =
-    providers.gradleProperty("composekn.version").orElse("0.5.59")
+    providers.gradleProperty("composekn.version").orElse("0.5.60")
 val composeUiVer =
     providers.gradleProperty("composekn.compose.ui.version")
         .orElse(composeknVer.map { "1.12.1-ckn.$it" })
