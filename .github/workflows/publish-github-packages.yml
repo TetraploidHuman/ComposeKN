@@ -1,6 +1,6 @@
 # Publish ComposeKN Maven packages to GitHub Packages on version tags.
 #
-# Triggers: push tag v0.5.61 / v1.0.0 / …
+# Triggers: push tag v0.5.62 / v1.0.0 / …
 # Artifacts:
 #   com.composekn:compose-kn-bom|linux|windows|resources
 #   com.composekn.compose:ui|foundation|material3|…  (optional compose UI job)

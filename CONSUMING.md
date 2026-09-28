@@ -6,9 +6,9 @@
 
 | 分量 | 版本 | 说明 |
 |------|------|------|
-| ComposeKN | **0.5.61** | `com.composekn:compose-kn-*` / `com.composekn:skiko` |
+| ComposeKN | **0.5.62** | `com.composekn:compose-kn-*` / `com.composekn:skiko` |
 | Kotlin | **2.4.0** | 与宿主一致 |
-| Compose **UI** | **1.12.1** | 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.61` |
+| Compose **UI** | **1.12.1** | 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.62` |
 | Maven `compose_deps` | 1.11.1 | 仅 runtime 等未顶掉坐标；**不是** UI 版本 |
 
 ### 仓库怎么拿（按优先级）
@@ -61,7 +61,7 @@ pluginManagement {
 }
 
 plugins {
-    id("com.composekn.settings") version "0.5.61"
+    id("com.composekn.settings") version "0.5.62"
 }
 
 dependencyResolutionManagement {
@@ -72,7 +72,7 @@ dependencyResolutionManagement {
     }
     versionCatalogs {
         create("composekn") {
-            from("com.composekn:composekn-catalog:0.5.61") // 或拷贝 gradle/composekn.versions.toml
+            from("com.composekn:composekn-catalog:0.5.62") // 或拷贝 gradle/composekn.versions.toml
         }
     }
 }

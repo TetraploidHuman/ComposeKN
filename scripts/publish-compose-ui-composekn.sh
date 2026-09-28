@@ -15,7 +15,7 @@ CKN_VER="$(grep '^composekn.version=' "$REPO/gradle.properties" | cut -d= -f2)"
 info() { printf '\033[36m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[31m!!\033[0m %s\n' "$1" >&2; exit 1; }
 
-INIT="$REPO/scripts/disable-kotlin-metadata.init.gradle.kts"
+INIT="$REPO/scripts/disable-kotlin-metadata.init.gradle"
 [ -f "$INIT" ] || die "missing $INIT"
 
 MODULES=(
