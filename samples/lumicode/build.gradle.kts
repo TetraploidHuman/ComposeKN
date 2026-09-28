@@ -60,7 +60,7 @@ kotlin {
         }
 
         val linuxX64Main by getting {
-            kotlin.srcDir("src/nativeMain/kotlin")
+            kotlin.srcDir("src/knShared/kotlin")
             dependencies {
                 // compose-kn-linux 由 com.composekn.host 注入
                 implementation(project(":compose-kn-resources"))
@@ -68,7 +68,7 @@ kotlin {
         }
 
         val mingwX64Main by getting {
-            kotlin.srcDir("src/nativeMain/kotlin")
+            kotlin.srcDir("src/knShared/kotlin")
             dependencies {
                 // compose-kn-windows 由 com.composekn.host 注入
                 implementation(project(":compose-kn-resources"))

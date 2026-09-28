@@ -18,7 +18,7 @@ import platform.posix.SEEK_END
 
 /**
  * Tiny key=value file store for ComposeKN (no JVM Preferences).
- * Shared by linuxX64 + mingwX64 via [nativeMain] srcDir.
+ * Shared by linuxX64 + mingwX64 via [knShared] srcDir.
  */
 internal class FileKvStore(private val pathProvider: () -> String?) {
     private val cache = linkedMapOf<String, String>()
