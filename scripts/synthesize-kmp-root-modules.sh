@@ -130,4 +130,5 @@ EOF
 synthesize compose-kn-linux linuxx64
 synthesize compose-kn-windows mingwx64
 synthesize compose-kn-resources linuxx64 mingwx64
+synthesize skiko linuxx64 mingwx64
 info "done"

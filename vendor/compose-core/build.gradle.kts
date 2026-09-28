@@ -22,13 +22,22 @@ plugins {
  */
 val publishComposeUi =
     providers.gradleProperty("composekn.publish.composeUi").orNull == "true"
+val skipMetadata =
+    providers.gradleProperty("composekn.publish.skipMetadata").orNull == "true"
 val composeknVer =
-    providers.gradleProperty("composekn.version").orElse("0.5.58")
+    providers.gradleProperty("composekn.version").orElse("0.5.59")
 val composeUiVer =
     providers.gradleProperty("composekn.compose.ui.version")
         .orElse(composeknVer.map { "1.12.1-ckn.$it" })
 
 subprojects {
+    if (skipMetadata) {
+        tasks.configureEach {
+            if (name.contains("KotlinMetadata")) {
+                enabled = false
+            }
+        }
+    }
     plugins.withId("org.jetbrains.kotlin.multiplatform") {
         extensions.configure<KotlinMultiplatformExtension> {
             linuxX64()

@@ -17,7 +17,7 @@ import java.net.URI
 class ComposeKnSettingsPlugin : Plugin<Settings> {
     override fun apply(settings: Settings) {
         val composeknVer = settings.providers.gradleProperty("composekn.version")
-            .orElse("0.5.58").get()
+            .orElse("0.5.59").get()
         val uiVer = settings.providers.gradleProperty("composekn.compose.ui.version")
             .orElse("1.12.1-ckn.$composeknVer").get()
         val skipSub = settings.providers.gradleProperty("composekn.settings.skipSubstitution")
