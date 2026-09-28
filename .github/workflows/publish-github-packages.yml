@@ -336,8 +336,8 @@ jobs:
           flatten_into build/maven-merge-ui-wrap build/maven-repo
           flatten_into build/maven-merge-plugins-wrap build/maven-repo
           echo "=== maven-repo tree (top) ==="
-          ls -la build/maven-repo/ | head -30
-          find build/maven-repo -name '*.klib' | wc -l
+          ls -la build/maven-repo/ || true
+          echo "klibs: $(find build/maven-repo -name '*.klib' | wc -l)"
           test -d build/maven-repo/com/composekn
           chmod +x ./scripts/publish-composekn-packages.sh
           # 纯打包，不跑 gradle
@@ -361,7 +361,8 @@ jobs:
           gh run download "$RUN_ID" -n composekn-hosts-maven -D build/art/hosts
           gh run download "$RUN_ID" -n composekn-plugins-maven -D build/art/plugins || true
           gh run download "$RUN_ID" -n composekn-ui-maven -D build/art/ui || true
-          ls -laR build/art | head -80
+          echo "=== art layout ==="
+          find build/art -maxdepth 3 -type d || true
 
       - name: Merge + upload Release zip
         env:
