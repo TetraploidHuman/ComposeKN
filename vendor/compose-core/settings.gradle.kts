@@ -19,13 +19,37 @@ dependencyResolutionManagement {
 rootProject.name = "compose-core"
 
 // 仅当独立启动（CI: -p vendor/compose-core -Pcomposekn.compose.standalone=true）
-// 时挂上 skiko；被 ComposeKN 根 settings includeBuild 时不要重复注册。
 val composeStandalone =
     settings.startParameter.projectProperties["composekn.compose.standalone"] == "true"
+val usePublishedSkiko =
+    settings.startParameter.projectProperties["composekn.usePublishedSkiko"] == "true"
+
 if (composeStandalone) {
-    includeBuild("../skiko/skiko") {
-        dependencySubstitution {
-            substitute(module("org.jetbrains.skiko:skiko")).using(project(":"))
+    // 解析已发布的 com.composekn:skiko（上一 job / 本机 maven-repo）
+    dependencyResolutionManagement.repositories.apply {
+        maven {
+            name = "ComposeKnLocal"
+            url = uri(settings.rootDir.resolve("../../build/maven-repo"))
+        }
+        val ghToken = System.getenv("GITHUB_TOKEN")
+        if (!ghToken.isNullOrBlank()) {
+            val owner = System.getenv("GITHUB_REPOSITORY_OWNER") ?: "TetraploidHuman"
+            val repo = System.getenv("GITHUB_REPOSITORY")?.substringAfter('/') ?: "ComposeKN"
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/$owner/$repo")
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR") ?: "github"
+                    password = ghToken
+                }
+            }
+        }
+    }
+    if (!usePublishedSkiko) {
+        includeBuild("../skiko/skiko") {
+            dependencySubstitution {
+                substitute(module("org.jetbrains.skiko:skiko")).using(project(":"))
+            }
         }
     }
 }

@@ -24,11 +24,35 @@ val publishComposeUi =
     providers.gradleProperty("composekn.publish.composeUi").orNull == "true"
 val skipMetadata =
     providers.gradleProperty("composekn.publish.skipMetadata").orNull == "true"
+val usePublishedSkiko =
+    providers.gradleProperty("composekn.usePublishedSkiko").orNull == "true"
 val composeknVer =
-    providers.gradleProperty("composekn.version").orElse("0.5.60")
+    providers.gradleProperty("composekn.version").orElse("0.5.61")
 val composeUiVer =
     providers.gradleProperty("composekn.compose.ui.version")
         .orElse(composeknVer.map { "1.12.1-ckn.$it" })
+
+// 覆盖 includeBuild 进来的 skiko：禁用其 metadata（init-script 是双保险）
+if (skipMetadata) {
+    gradle.beforeProject {
+        tasks.configureEach {
+            if (name.contains("KotlinMetadata")) {
+                enabled = false
+            }
+        }
+    }
+}
+
+if (usePublishedSkiko) {
+    allprojects {
+        configurations.configureEach {
+            resolutionStrategy.dependencySubstitution {
+                substitute(module("org.jetbrains.skiko:skiko"))
+                    .using(module("com.composekn:skiko:${composeknVer.get()}"))
+            }
+        }
+    }
+}
 
 subprojects {
     if (skipMetadata) {
