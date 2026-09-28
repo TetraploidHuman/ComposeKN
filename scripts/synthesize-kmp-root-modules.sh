@@ -1,30 +1,40 @@
 #!/usr/bin/env bash
-# 为只发了平台 variant 的 KMP 模块合成根坐标（com.composekn:compose-kn-linux 等），
-# 让 implementation("com.composekn:compose-kn-linux:$VER") 能按 native target 解析。
+# 为只发了平台 variant 的 KMP 模块合成根坐标，
+# 让 implementation("com.composekn:compose-kn-linux:$VER") /
+# implementation("com.composekn.compose:ui:$UI_VER") 能按 native target 解析。
 #
 # 用法：./scripts/synthesize-kmp-root-modules.sh [maven-repo-root]
+#
+# 只写 ApiElements（不写 MetadataElements）：发布默认 skipMetadata，
+# 虚假 metadata variant 会干扰解析。
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 M2="${1:-$REPO/build/maven-repo}"
 VER="$(grep '^composekn.version=' "$REPO/gradle.properties" | cut -d= -f2)"
-GROUP_PATH="com/composekn"
+UI_VER="$(grep '^composekn.compose.ui.version=' "$REPO/gradle.properties" | cut -d= -f2)"
+UI_VER="${UI_VER:-1.12.1-ckn.$VER}"
 
 info() { printf '\033[36m==>\033[0m %s\n' "$1"; }
 
+# synthesize <group.path> <artifact> <version> <platform...>
+# group.path 例：com/composekn 或 com/composekn/compose
 synthesize() {
-  local name="$1"          # compose-kn-linux
-  shift
-  local -a platforms=("$@") # linuxx64 mingwx64
-  local root="$M2/$GROUP_PATH/$name/$VER"
+  local group_path="$1"
+  local name="$2"
+  local version="$3"
+  shift 3
+  local -a platforms=("$@")
+  local group_id="${group_path//\//.}"
+  local root="$M2/$group_path/$name/$version"
   mkdir -p "$root"
 
   local variants=""
   local first=1
   for p in "${platforms[@]}"; do
     local plat_mod="${name}-${p}"
-    local plat_dir="$M2/$GROUP_PATH/$plat_mod/$VER"
+    local plat_dir="$M2/$group_path/$plat_mod/$version"
     if [ ! -d "$plat_dir" ]; then
-      info "skip $plat_mod (not published)"
+      info "skip $group_id:$plat_mod:$version (not published)"
       continue
     fi
     local native_target
@@ -47,42 +57,26 @@ synthesize() {
         \"org.jetbrains.kotlin.native.target\": \"${native_target}\"
       },
       \"available-at\": {
-        \"url\": \"../../${plat_mod}/${VER}/${plat_mod}-${VER}.module\",
-        \"group\": \"com.composekn\",
+        \"url\": \"../../${plat_mod}/${version}/${plat_mod}-${version}.module\",
+        \"group\": \"${group_id}\",
         \"module\": \"${plat_mod}\",
-        \"version\": \"${VER}\"
-      }
-    },
-    {
-      \"name\": \"${p}MetadataElements-published\",
-      \"attributes\": {
-        \"org.gradle.category\": \"library\",
-        \"org.gradle.jvm.environment\": \"non-jvm\",
-        \"org.gradle.usage\": \"kotlin-metadata\",
-        \"org.jetbrains.kotlin.platform.type\": \"native\",
-        \"org.jetbrains.kotlin.native.target\": \"${native_target}\"
-      },
-      \"available-at\": {
-        \"url\": \"../../${plat_mod}/${VER}/${plat_mod}-${VER}.module\",
-        \"group\": \"com.composekn\",
-        \"module\": \"${plat_mod}\",
-        \"version\": \"${VER}\"
+        \"version\": \"${version}\"
       }
     }"
   done
 
   if [ "$first" = 1 ]; then
-    info "nothing to synthesize for $name"
+    info "nothing to synthesize for $group_id:$name:$version"
     return 0
   fi
 
-  cat > "$root/$name-$VER.module" <<EOF
+  cat > "$root/$name-$version.module" <<EOF
 {
   "formatVersion": "1.1",
   "component": {
-    "group": "com.composekn",
+    "group": "$group_id",
     "module": "$name",
-    "version": "$VER",
+    "version": "$version",
     "attributes": {
       "org.gradle.status": "release"
     }
@@ -96,41 +90,54 @@ $variants
 }
 EOF
 
-  cat > "$root/$name-$VER.pom" <<EOF
+  cat > "$root/$name-$version.pom" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>com.composekn</groupId>
+  <groupId>$group_id</groupId>
   <artifactId>$name</artifactId>
-  <version>$VER</version>
+  <version>$version</version>
   <packaging>pom</packaging>
   <name>$name</name>
   <description>ComposeKN KMP root (platform variants via Gradle Module Metadata)</description>
 </project>
 EOF
 
-  # maven-metadata.xml
-  cat > "$M2/$GROUP_PATH/$name/maven-metadata.xml" <<EOF
+  cat > "$M2/$group_path/$name/maven-metadata.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <metadata>
-  <groupId>com.composekn</groupId>
+  <groupId>$group_id</groupId>
   <artifactId>$name</artifactId>
   <versioning>
-    <latest>$VER</latest>
-    <release>$VER</release>
-    <versions><version>$VER</version></versions>
+    <latest>$version</latest>
+    <release>$version</release>
+    <versions><version>$version</version></versions>
     <lastUpdated>$(date -u +%Y%m%d%H%M%S)</lastUpdated>
   </versioning>
 </metadata>
 EOF
 
-  info "synthesized com.composekn:$name:$VER → $root"
+  info "synthesized $group_id:$name:$version → $root"
 }
 
-synthesize compose-kn-linux linuxx64
-synthesize compose-kn-windows mingwx64
-synthesize compose-kn-resources linuxx64 mingwx64
-synthesize skiko linuxx64 mingwx64
+# —— host / skiko（com.composekn）——
+synthesize com/composekn compose-kn-linux "$VER" linuxx64
+synthesize com/composekn compose-kn-windows "$VER" mingwx64
+synthesize com/composekn compose-kn-resources "$VER" linuxx64 mingwx64
+synthesize com/composekn skiko "$VER" linuxx64 mingwx64
+
+# —— compose UI（com.composekn.compose，版本 = composekn.compose.ui.version）——
+UI_MODULES=(
+  ui-util ui-geometry ui-unit ui-graphics ui-text ui-backhandler
+  lifecycle-viewmodel-compose ui
+  animation-core animation
+  foundation-layout foundation
+  material-ripple material3
+)
+for m in "${UI_MODULES[@]}"; do
+  synthesize com/composekn/compose "$m" "$UI_VER" linuxx64 mingwx64
+done
+
 info "done"

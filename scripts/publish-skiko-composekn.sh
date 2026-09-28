@@ -123,22 +123,12 @@ ROOT="$REPO/build/maven-repo/com/composekn/skiko/$CKN_VER"
   || die "no synthesized $ROOT/skiko-$CKN_VER.module"
 
 info "Upload synthesized skiko root → GitHub Packages"
-BASE="https://maven.pkg.github.com/$OWNER/$GH_REPO_NAME/com/composekn/skiko/$CKN_VER"
-for f in "$ROOT"/*; do
-  [ -f "$f" ] || continue
-  bn="$(basename "$f")"
-  code="$(curl -sS -o /tmp/gh-pkg-up.out -w '%{http_code}' \
-    -X PUT \
-    -H "Authorization: Bearer $GITHUB_TOKEN" \
-    -H "Content-Type: application/octet-stream" \
-    --data-binary @"$f" \
-    "$BASE/$bn" || true)"
-  case "$code" in
-    200|201|204) info "  $bn → $code" ;;
-    409) warn "  $bn → 409 (exists)" ;;
-    *) die "  $bn → HTTP $code $(head -c 200 /tmp/gh-pkg-up.out 2>/dev/null || true)" ;;
-  esac
-done
+chmod +x "$REPO/scripts/upload-maven-artifacts-to-gh-packages.sh"
+"$REPO/scripts/upload-maven-artifacts-to-gh-packages.sh" "$ROOT"
+if [ -f "$REPO/build/maven-repo/com/composekn/skiko/maven-metadata.xml" ]; then
+  "$REPO/scripts/upload-maven-artifacts-to-gh-packages.sh" \
+    "$REPO/build/maven-repo/com/composekn/skiko/maven-metadata.xml"
+fi
 
 info "done"
 find "$REPO/build/maven-repo/com/composekn" -iname '*skiko*' -name '*.klib' 2>/dev/null | sort || true

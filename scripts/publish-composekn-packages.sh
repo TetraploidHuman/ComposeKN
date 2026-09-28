@@ -3,11 +3,13 @@
 #
 # -Pcomposekn.publish.skipMetadata=true：禁用 *KotlinMetadata（避开 KN 2.4 OptionalExpectation）
 # mingw 需要 SKIA_MINGW_PREBUILT（或 CI 里 fetch-skia-mingw）；缺则跳过 mingw、只发 linux。
+# CI / 设 REQUIRE_MINGW=1 时 mingw 失败即退出。
 #
 #   ./scripts/publish-composekn-packages.sh
 #   SKIA_MINGW_PREBUILT=/tmp/.../skia-mingw-TAG ./scripts/publish-composekn-packages.sh
 #   GITHUB_TOKEN=… ./scripts/publish-composekn-packages.sh --github
-#   ./scripts/publish-composekn-packages.sh --release   # 挂到 tag v$VER（绕过 Packages Billing）
+#   ./scripts/publish-composekn-packages.sh --release   # 挂到 tag v$VER
+#   ./scripts/publish-composekn-packages.sh --compose-ui --skiko
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
@@ -16,13 +18,15 @@ DO_GITHUB=0
 DO_RELEASE=0
 DO_UI=0
 DO_SKIKO=0
+DO_PLUGINS=0
 for a in "$@"; do
   case "$a" in
     --github) DO_GITHUB=1 ;;
     --release) DO_RELEASE=1 ;;
     --compose-ui) DO_UI=1 ;;
     --skiko) DO_SKIKO=1 ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    --plugins) DO_PLUGINS=1 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
   esac
 done
 
@@ -44,7 +48,11 @@ info() { printf '\033[36m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[33m!!\033[0m %s\n' "$1"; }
 die() { printf '\033[31m!!\033[0m %s\n' "$1" >&2; exit 1; }
 
-# mingw bridges 交叉编译：优先用 pinned nixpkgs（CI 设 NIXPKGS_URL）
+REQUIRE_MINGW="${REQUIRE_MINGW:-0}"
+if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "$PREBUILT" ]; then
+  REQUIRE_MINGW=1
+fi
+
 nix_run() {
   local args=( )
   if [ -n "${NIXPKGS_URL:-}" ]; then
@@ -53,9 +61,27 @@ nix_run() {
   nix-shell "$REPO/shell.nix" "${args[@]}" --run "$1"
 }
 
+upload_roots() {
+  local up="$REPO/scripts/upload-maven-artifacts-to-gh-packages.sh"
+  chmod +x "$up"
+  local CKN_VER
+  CKN_VER="$(grep '^composekn.version=' gradle.properties | cut -d= -f2)"
+  for m in compose-kn-linux compose-kn-windows compose-kn-resources; do
+    local d="$REPO/build/maven-repo/com/composekn/$m/$CKN_VER"
+    if [ -d "$d" ]; then
+      info "Upload synthesized root com.composekn:$m:$CKN_VER"
+      "$up" "$d"
+      if [ -f "$REPO/build/maven-repo/com/composekn/$m/maven-metadata.xml" ]; then
+        "$up" "$REPO/build/maven-repo/com/composekn/$m/maven-metadata.xml"
+      fi
+    fi
+  done
+}
+
 # 仅 --release 且本地已有 klib：跳过重建，直接打包上传
 NEED_BUILD=1
-if [ "$DO_RELEASE" = 1 ] && [ "$DO_GITHUB" = 0 ] && [ "$DO_UI" = 0 ] && [ "$DO_SKIKO" = 0 ]; then
+if [ "$DO_RELEASE" = 1 ] && [ "$DO_GITHUB" = 0 ] && [ "$DO_UI" = 0 ] \
+    && [ "$DO_SKIKO" = 0 ] && [ "$DO_PLUGINS" = 0 ]; then
   if find "$REPO/build/maven-repo/com/composekn" -name '*.klib' 2>/dev/null | grep -q .; then
     NEED_BUILD=0
     info "Reuse existing build/maven-repo (add --github/--compose-ui/--skiko to rebuild)"
@@ -75,9 +101,6 @@ if [ "$NEED_BUILD" = 1 ]; then
 
   if [ -n "$PREBUILT" ] && [ -f "$PREBUILT/libs/libskia.a" ]; then
     info "Publish mingwX64 (PREBUILT=$PREBUILT)"
-    # 必须传 -Pskiko.skia.mingw.dir：否则 skiko 会把 JetBrains MSVC .lib 写进 klib，
-    # 而 windows 预编译包没有 skia_graphite_ext.lib → compileKotlinMingwX64 直接炸。
-    # bridges 交叉编译需要 nix-shell 里的 x86_64-w64-mingw32-g++。
     GEN_ICU="$REPO/vendor/skiko/skiko/src/windowsMain/cpp/win32/win32_icu_data.generated.cpp"
     if [ ! -f "$GEN_ICU" ] && [ -f "$PREBUILT/icudtl.dat" ]; then
       ICUDTL_ABS="$(cd "$(dirname "$PREBUILT/icudtl.dat")" && pwd)/$(basename "$PREBUILT/icudtl.dat")"
@@ -111,18 +134,24 @@ EOF
           :compose-kn-windows:publishMingwX64PublicationToComposeKnLocalRepository"; then
       :
     else
+      if [ "$REQUIRE_MINGW" = 1 ]; then
+        die "mingwX64 publication failed (REQUIRE_MINGW=1)"
+      fi
       warn "mingwX64 publication failed; linux artifacts still OK"
     fi
   else
+    if [ "$REQUIRE_MINGW" = 1 ]; then
+      die "SKIA_MINGW_PREBUILT required (REQUIRE_MINGW=1)"
+    fi
     warn "SKIA_MINGW_PREBUILT not set / no libskia.a — skip mingwX64 publish"
   fi
 
-  info "Synthesize root KMP coordinates"
+  info "Synthesize root KMP coordinates (hosts/resources/skiko if present)"
   chmod +x "$REPO/scripts/synthesize-kmp-root-modules.sh"
   "$REPO/scripts/synthesize-kmp-root-modules.sh" "$REPO/build/maven-repo"
 
   if [ "$DO_GITHUB" = 1 ]; then
-    info "Upload to GitHub Packages"
+    info "Upload platforms + BOM to GitHub Packages"
     ./gradlew "${ARGS[@]}" \
       :compose-kn-bom:publishMavenPublicationToGitHubPackagesRepository \
       :compose-kn-resources:publishLinuxX64PublicationToGitHubPackagesRepository \
@@ -130,33 +159,47 @@ EOF
       || die "GitHub Packages linux upload failed"
     if [ -d "$REPO/build/maven-repo/com/composekn/compose-kn-windows-mingwx64" ]; then
       if [ -n "${PREBUILT:-}" ] && [ -d "$PREBUILT/libs" ]; then
-        nix_run \
-          "./gradlew --no-daemon -Pcomposekn.publish.skipMetadata=true \
-            -Pcomposekn.publish.github=true \
-            -Pskiko.skia.mingw.dir='$PREBUILT/libs' \
-            :compose-kn-resources:publishMingwX64PublicationToGitHubPackagesRepository \
-            :compose-kn-windows:publishMingwX64PublicationToGitHubPackagesRepository" \
-          || warn "GitHub Packages mingw upload failed"
+        if nix_run \
+            "./gradlew --no-daemon -Pcomposekn.publish.skipMetadata=true \
+              -Pcomposekn.publish.github=true \
+              -Pskiko.skia.mingw.dir='$PREBUILT/libs' \
+              :compose-kn-resources:publishMingwX64PublicationToGitHubPackagesRepository \
+              :compose-kn-windows:publishMingwX64PublicationToGitHubPackagesRepository"; then
+          :
+        else
+          if [ "$REQUIRE_MINGW" = 1 ]; then
+            die "GitHub Packages mingw upload failed"
+          fi
+          warn "GitHub Packages mingw upload failed"
+        fi
       else
         warn "skip GitHub mingw upload (no PREBUILT)"
       fi
     fi
-  fi
-
-  if [ "$DO_UI" = 1 ]; then
-    CKN_VER="$(grep '^composekn.version=' gradle.properties | cut -d= -f2)"
-    info "Publish com.composekn.compose:* ($CKN_VER)"
-    ./gradlew -p vendor/compose-core \
-      -Pcomposekn.publish.composeUi=true \
-      -Pcomposekn.version="$CKN_VER" \
-      -Pcomposekn.publish.skipMetadata=true \
-      publishAllPublicationsToComposeKnLocalRepository \
-      --continue --no-daemon || warn "compose UI publish partial"
+    upload_roots
   fi
 
   if [ "$DO_SKIKO" = 1 ]; then
     info "Publish com.composekn:skiko"
-    "$REPO/scripts/publish-skiko-composekn.sh" || warn "skiko publish partial"
+    chmod +x "$REPO/scripts/publish-skiko-composekn.sh"
+    "$REPO/scripts/publish-skiko-composekn.sh" || die "skiko publish failed"
+  fi
+
+  if [ "$DO_UI" = 1 ]; then
+    info "Publish com.composekn.compose:* (platform + synthesized roots)"
+    chmod +x "$REPO/scripts/publish-compose-ui-composekn.sh"
+    # 无 token 时仅本地：临时绕过脚本里的 GITHUB_TOKEN 检查
+    if [ -z "${GITHUB_TOKEN:-}" ]; then
+      export GITHUB_TOKEN="local-only"
+      export COMPOSEKN_UI_LOCAL_ONLY=1
+    fi
+    "$REPO/scripts/publish-compose-ui-composekn.sh" || die "compose UI publish failed"
+  fi
+
+  if [ "$DO_PLUGINS" = 1 ]; then
+    info "Publish Gradle plugins + version catalog"
+    chmod +x "$REPO/scripts/publish-composekn-plugins.sh"
+    "$REPO/scripts/publish-composekn-plugins.sh" || die "plugins publish failed"
   fi
 fi
 
@@ -182,7 +225,8 @@ PY
   fi
   ls -lh "$ZIP"
   if ! gh release view "$TAG" >/dev/null 2>&1; then
-    gh release create "$TAG" --title "$TAG" --notes "ComposeKN $CKN_VER host/BOM/resources Maven repo"
+    gh release create "$TAG" --title "$TAG" \
+      --notes "ComposeKN $CKN_VER — hosts/BOM/resources/skiko/UI/plugins Maven repo"
   fi
   gh release delete-asset "$TAG" "composekn-maven-${CKN_VER}.zip" -y 2>/dev/null || true
   gh release upload "$TAG" "$ZIP" --clobber
@@ -194,6 +238,6 @@ info "Local repo: $REPO/build/maven-repo"
 echo "--- klibs ---"
 find build/maven-repo/com/composekn -name '*.klib' 2>/dev/null | sort || true
 echo "--- root modules ---"
-for m in compose-kn-linux compose-kn-windows compose-kn-resources compose-kn-bom; do
+for m in compose-kn-linux compose-kn-windows compose-kn-resources compose-kn-bom skiko; do
   ls -la "build/maven-repo/com/composekn/$m/"*/ 2>/dev/null | head -15 || true
 done

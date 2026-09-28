@@ -1,6 +1,10 @@
 plugins {
     `kotlin-dsl`
+    `maven-publish`
 }
+
+group = "com.composekn"
+version = providers.gradleProperty("composekn.version").orElse("0.5.65").get()
 
 dependencies {
     implementation(gradleApi())
@@ -36,6 +40,29 @@ gradlePlugin {
         create("composeKnSettings") {
             id = "com.composekn.settings"
             implementationClass = "com.composekn.gradle.ComposeKnSettingsPlugin"
+        }
+    }
+}
+
+publishing {
+    repositories {
+        maven {
+            name = "ComposeKnLocal"
+            url = uri(rootProject.layout.projectDirectory.dir("../build/maven-repo"))
+        }
+        val ghToken = System.getenv("GITHUB_TOKEN")
+        val wantGh = providers.gradleProperty("composekn.publish.github").orNull == "true"
+        if (wantGh && !ghToken.isNullOrBlank()) {
+            val owner = System.getenv("GITHUB_REPOSITORY_OWNER") ?: "TetraploidHuman"
+            val repo = System.getenv("GITHUB_REPOSITORY")?.substringAfter('/') ?: "ComposeKN"
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/$owner/$repo")
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR") ?: "github"
+                    password = ghToken
+                }
+            }
         }
     }
 }

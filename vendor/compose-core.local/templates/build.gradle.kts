@@ -1,3 +1,8 @@
+import org.gradle.api.publish.PublishingExtension
+import org.gradle.api.publish.maven.MavenPublication
+import org.gradle.kotlin.dsl.configure
+import org.gradle.kotlin.dsl.create
+import org.gradle.kotlin.dsl.getByType
 import org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension
 
 plugins {
@@ -6,7 +11,71 @@ plugins {
     id("org.jetbrains.compose") version "1.11.1" apply false
 }
 
+/**
+ * 发布到 ComposeKN 坐标（默认关；`-Pcomposekn.publish.composeUi=true` 打开）：
+ *   group = com.composekn.compose
+ *   version = 1.12.1-ckn.<composekn.version>
+ *   artifactId = 子工程名（ui / foundation / material3 / …）
+ *
+ * 消费者用 settings 插件 `com.composekn.settings` 把
+ * `org.jetbrains.compose.*` 顶成这些坐标，无需 includeBuild。
+ */
+val publishComposeUi =
+    providers.gradleProperty("composekn.publish.composeUi").orNull == "true"
+val skipMetadata =
+    providers.gradleProperty("composekn.publish.skipMetadata").orNull == "true"
+val usePublishedSkiko =
+    providers.gradleProperty("composekn.usePublishedSkiko").orNull == "true"
+val composeknVer =
+    providers.gradleProperty("composekn.version").orElse("0.5.65")
+val composeUiVer =
+    providers.gradleProperty("composekn.compose.ui.version")
+        .orElse(composeknVer.map { "1.12.1-ckn.$it" })
+
+// 覆盖 includeBuild 进来的 skiko：禁用其 metadata（init-script 是双保险）
+if (skipMetadata) {
+    gradle.beforeProject {
+        tasks.configureEach {
+            if (name.contains("KotlinMetadata")) {
+                enabled = false
+            }
+        }
+    }
+}
+
+if (usePublishedSkiko) {
+    // 按 configuration 名直接顶到平台坐标，避开合成根 .module 的 available-at 解析问题。
+    val skikoVer = composeknVer.get()
+    allprojects {
+        configurations.configureEach {
+            val confName = name
+            val target =
+                when {
+                    confName.contains("linuxX64", ignoreCase = true) ||
+                        confName.contains("linuxx64", ignoreCase = true) ->
+                        "com.composekn:skiko-linuxx64:$skikoVer"
+                    confName.contains("mingwX64", ignoreCase = true) ||
+                        confName.contains("mingwx64", ignoreCase = true) ->
+                        "com.composekn:skiko-mingwx64:$skikoVer"
+                    else -> null
+                }
+            if (target != null) {
+                resolutionStrategy.dependencySubstitution {
+                    substitute(module("org.jetbrains.skiko:skiko")).using(module(target))
+                }
+            }
+        }
+    }
+}
+
 subprojects {
+    if (skipMetadata) {
+        tasks.configureEach {
+            if (name.contains("KotlinMetadata")) {
+                enabled = false
+            }
+        }
+    }
     plugins.withId("org.jetbrains.kotlin.multiplatform") {
         extensions.configure<KotlinMultiplatformExtension> {
             linuxX64()
@@ -28,6 +97,37 @@ subprojects {
                     "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
                 )
             }
+        }
+
+        if (publishComposeUi) {
+            pluginManager.apply("maven-publish")
+            group = "com.composekn.compose"
+            version = composeUiVer.get()
+            extensions.configure<PublishingExtension> {
+                repositories {
+                    maven {
+                        name = "ComposeKnLocal"
+                        // 发到 ComposeKN 仓库根的 build/maven-repo（本工程在 vendor/compose-core）
+                        url = uri(rootProject.projectDir.resolve("../../build/maven-repo"))
+                    }
+                    val ghToken = System.getenv("GITHUB_TOKEN")
+                    if (!ghToken.isNullOrBlank()) {
+                        val owner = System.getenv("GITHUB_REPOSITORY_OWNER") ?: "TetraploidHuman"
+                        val repo = System.getenv("GITHUB_REPOSITORY")?.substringAfter('/') ?: "ComposeKN"
+                        maven {
+                            name = "GitHubPackages"
+                            url = uri("https://maven.pkg.github.com/$owner/$repo")
+                            credentials {
+                                username = System.getenv("GITHUB_ACTOR") ?: "github"
+                                password = ghToken
+                            }
+                        }
+                    }
+                }
+            }
+            logger.lifecycle(
+                "ComposeKN: will publish ${project.path} as com.composekn.compose:${project.name}:$version",
+            )
         }
     }
 }

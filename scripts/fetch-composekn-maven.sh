@@ -3,13 +3,13 @@
 #
 #   ./scripts/fetch-composekn-maven.sh                 # → build/maven-repo
 #   ./scripts/fetch-composekn-maven.sh /path/to/m2     # 自定义目录
-#   COMPOSEKN_VERSION=0.5.55 ./scripts/fetch-composekn-maven.sh
+#   COMPOSEKN_VERSION=0.5.65 ./scripts/fetch-composekn-maven.sh
 #
 # 消费方 settings：
 #   maven { url = uri("/path/to/m2") }
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VER="${COMPOSEKN_VERSION:-$(grep '^composekn.version=' "$REPO/gradle.properties" 2>/dev/null | cut -d= -f2 || echo 0.5.55)}"
+VER="${COMPOSEKN_VERSION:-$(grep '^composekn.version=' "$REPO/gradle.properties" 2>/dev/null | cut -d= -f2 || echo 0.5.65)}"
 DEST="${1:-$REPO/build/maven-repo}"
 OWNER="${COMPOSEKN_GH_OWNER:-TetraploidHuman}"
 REPO_NAME="${COMPOSEKN_GH_REPO:-ComposeKN}"

@@ -3,10 +3,12 @@
 > 写于 2026-09-08。给下一个有完整文件系统权限的 AI / 开发者。
 > 用户用中文交流，回复请用中文。
 >
-> **当前平台宿主基线：v0.5.64**（GitHub Packages + settings 顶 UI；
+> **当前平台宿主基线：v0.5.65**（GitHub Packages + settings 顶 UI；
 > host/register 含 `init*MainThread`；BOM/host 见 `CONSUMING.md`）。
-> **compose-core UI：`1.12.1`** → 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.64`。
-> **本轮已补**：三点消费闭环（init 自动 / Packages CI / UI 坐标）。
+> **compose-core UI：`1.12.1`** → 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.65`。
+> **本轮已补**：三点消费闭环（init 自动 / Packages CI / UI 坐标）+
+> 合成根上传 / UI 根坐标 / settings 按 target 顶 skiko / plugins+catalog 发布 /
+> Release zip 含 skiko+UI+plugins。
 
 ## 0. 一句话背景
 

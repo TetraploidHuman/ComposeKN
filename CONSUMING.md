@@ -6,9 +6,9 @@
 
 | 分量 | 版本 | 说明 |
 |------|------|------|
-| ComposeKN | **0.5.64** | `com.composekn:compose-kn-*` / `com.composekn:skiko` |
+| ComposeKN | **0.5.65** | `com.composekn:compose-kn-*` / `com.composekn:skiko` |
 | Kotlin | **2.4.0** | 与宿主一致 |
-| Compose **UI** | **1.12.1** | 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.64` |
+| Compose **UI** | **1.12.1** | 发布坐标 `com.composekn.compose:*:1.12.1-ckn.0.5.65` |
 | Maven `compose_deps` | 1.11.1 | 仅 runtime 等未顶掉坐标；**不是** UI 版本 |
 
 ### 仓库怎么拿（按优先级）
@@ -47,6 +47,8 @@ pluginManagement {
     repositories {
         gradlePluginPortal()
         mavenCentral()
+        // Release zip / 本机 maven-repo（优先，不依赖 Packages Billing）
+        // maven { url = uri("${System.getProperty("user.home")}/composekn-m2") }
         maven {
             url = uri("https://maven.pkg.github.com/TetraploidHuman/ComposeKN")
             credentials {
@@ -61,7 +63,7 @@ pluginManagement {
 }
 
 plugins {
-    id("com.composekn.settings") version "0.5.64"
+    id("com.composekn.settings") version "0.5.65"
 }
 
 dependencyResolutionManagement {
@@ -72,7 +74,7 @@ dependencyResolutionManagement {
     }
     versionCatalogs {
         create("composekn") {
-            from("com.composekn:composekn-catalog:0.5.64") // 或拷贝 gradle/composekn.versions.toml
+            from("com.composekn:composekn-catalog:0.5.65") // 或拷贝 gradle/composekn.versions.toml
         }
     }
 }
@@ -81,12 +83,13 @@ dependencyResolutionManagement {
 `com.composekn.settings` 会：
 
 1. 加入 GitHub Packages 仓库  
-2. 把 `org.jetbrains.compose.ui|foundation|material3|…` → `com.composekn.compose:*:1.12.1-ckn.<ver>`  
-3. `org.jetbrains.skiko:skiko` → `com.composekn:skiko:<ver>`  
+2. 把 `org.jetbrains.compose.ui|foundation|material3|ui-backhandler|…` → `com.composekn.compose:*:1.12.1-ckn.<ver>`  
+3. `org.jetbrains.skiko:skiko` → 按 configuration 顶到 `skiko-linuxx64` / `skiko-mingwx64`（其余配置回落到合成根 `com.composekn:skiko`）  
 4. `components-resources` → `compose-kn-resources`
 
 仍用 includeBuild 时：`-Pcomposekn.settings.skipSubstitution=true`。
 
+Release zip（`v<ver>` / `composekn-maven-<ver>.zip`）含 hosts、skiko、UI、plugins、catalog。
 ### 2. 模块
 
 ```kotlin
@@ -134,8 +137,10 @@ gpr.token=ghp_…   # packages:read
 | `com.composekn:compose-kn-linux` | Wayland 宿主 |
 | `com.composekn:compose-kn-windows` | Win32 宿主 |
 | `com.composekn:compose-kn-resources` | Res.font / string / drawable + 官方包名兼容层 |
-| `com.composekn:skiko` | KN 用 Skiko（linuxX64 / mingwX64） |
-| `com.composekn.compose:ui` 等 | 打过 ComposeKN 补丁的 UI **1.12.1** |
+| `com.composekn:skiko` | KN 用 Skiko（linuxX64 / mingwX64；合成根） |
+| `com.composekn:composekn-catalog` | version catalog |
+| `com.composekn.settings` 等插件 | `com.composekn.host` / `resources` / `settings` |
+| `com.composekn.compose:ui` 等 | 打过 ComposeKN 补丁的 UI **1.12.1**（含合成根） |
 
 **不是** Maven Central 上的 `org.jetbrains.compose.ui:ui:1.11.1`。
 
@@ -144,15 +149,19 @@ gpr.token=ghp_…   # packages:read
 ## 发布（维护者）
 
 ```bash
-# 本地
+# 本地 hosts / BOM
 ./scripts/publish-composekn-packages.sh
-./scripts/publish-composekn-packages.sh --compose-ui --skiko
+
+# 完整：skiko + UI + plugins（UI 依赖已发 skiko）
+./scripts/publish-composekn-packages.sh --skiko --compose-ui --plugins
 
 # GitHub Packages（需 GITHUB_TOKEN）
-GITHUB_TOKEN=… GITHUB_ACTOR=… ./scripts/publish-composekn-packages.sh --github --compose-ui --skiko
+GITHUB_TOKEN=… GITHUB_ACTOR=… \
+  ./scripts/publish-composekn-packages.sh --github --skiko --compose-ui --plugins --release
 ```
 
-CI：推送 tag `v*` → [`.github/workflows/publish-github-packages.yml`](.github/workflows/publish-github-packages.yml)。
+CI：推送 tag `v*` → [`.github/workflows/publish-github-packages.yml`](.github/workflows/publish-github-packages.yml)
+（hosts → skiko → UI → plugins → finalize Release zip）。
 
 ---
 
