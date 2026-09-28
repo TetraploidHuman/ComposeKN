@@ -23,7 +23,7 @@ plugins {
 val publishComposeUi =
     providers.gradleProperty("composekn.publish.composeUi").orNull == "true"
 val composeknVer =
-    providers.gradleProperty("composekn.version").orElse("0.5.57")
+    providers.gradleProperty("composekn.version").orElse("0.5.58")
 val composeUiVer =
     providers.gradleProperty("composekn.compose.ui.version")
         .orElse(composeknVer.map { "1.12.1-ckn.$it" })

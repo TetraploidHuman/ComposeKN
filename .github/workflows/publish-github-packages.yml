@@ -1,6 +1,6 @@
 # Publish ComposeKN Maven packages to GitHub Packages on version tags.
 #
-# Triggers: push tag v0.5.57 / v1.0.0 / …
+# Triggers: push tag v0.5.58 / v1.0.0 / …
 # Artifacts:
 #   com.composekn:compose-kn-bom|linux|windows|resources
 #   com.composekn.compose:ui|foundation|material3|…  (optional compose UI job)
@@ -95,44 +95,7 @@ jobs:
           if [ -d "$SKIA_MINGW_PREBUILT" ]; then
             echo "Using SKIA_MINGW_PREBUILT=$SKIA_MINGW_PREBUILT"
           fi
-          # 勿用 umbrella :publish —— 会拉 skiko/compose-core common metadata（KN 2.4 下炸）
-          # --release：把 maven zip 挂到同 tag（Packages 备选 / 本机也可）
           ./scripts/publish-composekn-packages.sh --github --release
-
-  publish-compose-ui:
-    name: Publish com.composekn.compose:*
-    runs-on: ubuntu-latest
-    needs: publish-hosts
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_compose_ui || github.event_name == 'push' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Publish compose-core UI modules
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          CKN_VER=$(grep '^composekn.version=' gradle.properties | cut -d= -f2)
-          # 禁用 metadata，只发各 native publication
-          ./gradlew -p vendor/compose-core \
-            -Pcomposekn.publish.composeUi=true \
-            -Pcomposekn.version="$CKN_VER" \
-            -Pcomposekn.publish.skipMetadata=true \
-            publishAllPublicationsToComposeKnLocalRepository \
-            publishAllPublicationsToGitHubPackagesRepository \
-            --continue --no-daemon
 
   publish-skiko:
     name: Publish com.composekn:skiko
@@ -151,8 +114,117 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Cache Kotlin/Native toolchain (~/.konan)
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('vendor/skiko/dependencies.toml', 'gradle.properties') }}
+
+      - name: Install Linux native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev libwayland-client0 libwayland-cursor0 libwayland-egl1 \
+            libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libcrypt-dev \
+            zstd
+
+      - name: Fetch mingw Skia prebuilt
+        run: ./scripts/fetch-skia-mingw.sh /tmp/composekn-skia-mingw
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish skiko under com.composekn
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
+          NIXPKGS_URL: ${{ env.NIXPKGS_URL }}
         run: ./scripts/publish-skiko-composekn.sh
+
+  publish-compose-ui:
+    name: Publish com.composekn.compose:*
+    runs-on: ubuntu-latest
+    # UI 经 includeBuild 编 skiko，需与 skiko 相同的 native deps；排在 skiko 后减轻并发压力
+    needs: publish-skiko
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_compose_ui || github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Cache Kotlin/Native toolchain (~/.konan)
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('vendor/skiko/dependencies.toml', 'gradle.properties') }}
+
+      - name: Install Linux native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev libwayland-client0 libwayland-cursor0 libwayland-egl1 \
+            libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libcrypt-dev \
+            zstd
+
+      - name: Fetch mingw Skia prebuilt
+        run: ./scripts/fetch-skia-mingw.sh /tmp/composekn-skia-mingw
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish compose-core UI modules
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SKIA_MINGW_PREBUILT: /tmp/composekn-skia-mingw/skia-mingw-$(cat vendor/skiko/skia-mingw/SKIA_TAG)
+          NIXPKGS_URL: ${{ env.NIXPKGS_URL }}
+        run: |
+          set -euo pipefail
+          CKN_VER=$(grep '^composekn.version=' gradle.properties | cut -d= -f2)
+          PREBUILT="$SKIA_MINGW_PREBUILT"
+          MINGW_PROP=()
+          if [ -f "$PREBUILT/libs/libskia.a" ]; then
+            MINGW_PROP=( -Pskiko.skia.mingw.dir="$PREBUILT/libs" )
+          fi
+          # compose-core/settings 已 includeBuild skiko；mingw bridges 走 nix-shell
+          nix-shell ./shell.nix -I "nixpkgs=$NIXPKGS_URL" --run "
+            ./gradlew -p vendor/compose-core \
+              -Pcomposekn.compose.standalone=true \
+              -Pcomposekn.publish.composeUi=true \
+              -Pcomposekn.version='$CKN_VER' \
+              -Pcomposekn.publish.skipMetadata=true \
+              ${MINGW_PROP[*]} \
+              publishAllPublicationsToComposeKnLocalRepository \
+              publishAllPublicationsToGitHubPackagesRepository \
+              --continue --no-daemon
+          "
