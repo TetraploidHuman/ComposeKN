@@ -34,6 +34,11 @@ class ComposeKnHostPlugin : Plugin<Project> {
     }
 
     private fun configure(project: Project, ext: ComposeKnHostExtension) {
+        // afterEvaluate 偶发重复；同一工程只配置一次
+        val flag = "composekn.host.configured"
+        if (project.extensions.extraProperties.has(flag)) return
+        project.extensions.extraProperties.set(flag, true)
+
         val kotlin = project.extensions.findByType(KotlinMultiplatformExtension::class.java) ?: return
         val hasLinux = kotlin.targets.findByName("linuxX64") != null
         val hasMingw = kotlin.targets.findByName("mingwX64") != null
@@ -47,6 +52,9 @@ class ComposeKnHostPlugin : Plugin<Project> {
 
         val linuxGen = project.layout.buildDirectory.dir("generated/composekn/host/linux")
         val windowsGen = project.layout.buildDirectory.dir("generated/composekn/host/windows")
+
+        // target → 用户 entryPoint（每个平台只记一次，避免 debug/release 双 binary 叠 doLast）
+        val wrapByPlatform = linkedMapOf<String, String>()
 
         val generate = project.tasks.register("generateComposeKnHostBootstrap") {
             outputs.dir(linuxGen)
@@ -75,6 +83,39 @@ class ComposeKnHostPlugin : Plugin<Project> {
                         importInstall = "com.composekn.windows.installComposeKnWindowsAutoRegister",
                         registerCall = "registerComposeKnWindowsBackend()",
                         installCall = "installComposeKnWindowsAutoRegister()",
+                    )
+                }
+                for ((platform, userFq) in wrapByPlatform) {
+                    val isLinux = platform == "linux"
+                    val dir = (if (isLinux) linuxGen else windowsGen).get().asFile
+                    dir.mkdirs()
+                    val fileName =
+                        if (isLinux) "ComposeKnLinuxEntry.kt" else "ComposeKnWindowsEntry.kt"
+                    val funName =
+                        if (isLinux) "composeknLinuxHostMain" else "composeknWindowsHostMain"
+                    val registerImport = if (isLinux) {
+                        "com.composekn.linux.registerComposeKnLinuxBackend"
+                    } else {
+                        "com.composekn.windows.registerComposeKnWindowsBackend"
+                    }
+                    val registerCall = if (isLinux) {
+                        "registerComposeKnLinuxBackend()"
+                    } else {
+                        "registerComposeKnWindowsBackend()"
+                    }
+                    File(dir, fileName).writeText(
+                        """
+                        |package composekn.host.generated
+                        |
+                        |import $registerImport
+                        |
+                        |/** 由 com.composekn.host 生成：先登记后端，再进入用户 entryPoint。 */
+                        |fun $funName(args: Array<String> = emptyArray()) {
+                        |    $registerCall
+                        |    $userFq(args)
+                        |}
+                        |
+                        """.trimMargin(),
                     )
                 }
             }
@@ -117,6 +158,7 @@ class ComposeKnHostPlugin : Plugin<Project> {
             val isLinux = target.name == "linuxX64"
             val isMingw = target.name == "mingwX64"
             if (!isLinux && !isMingw) return@configureEach
+            val platform = if (isLinux) "linux" else "windows"
             binaries.withType(Executable::class.java).configureEach {
                 val userEntry = entryPoint ?: return@configureEach
                 if (userEntry.startsWith("composekn.host.generated.")) return@configureEach
@@ -125,46 +167,12 @@ class ComposeKnHostPlugin : Plugin<Project> {
                 } else {
                     "composekn.host.generated.composeknWindowsHostMain"
                 }
-                val platformGen = if (isLinux) linuxGen else windowsGen
-                generate.configure {
-                    doLast {
-                        val dir = platformGen.get().asFile
-                        dir.mkdirs()
-                        val userFq = userEntry
-                        val fileName =
-                            if (isLinux) "ComposeKnLinuxEntry.kt" else "ComposeKnWindowsEntry.kt"
-                        val funName =
-                            if (isLinux) "composeknLinuxHostMain" else "composeknWindowsHostMain"
-                        val registerImport = if (isLinux) {
-                            "com.composekn.linux.registerComposeKnLinuxBackend"
-                        } else {
-                            "com.composekn.windows.registerComposeKnWindowsBackend"
-                        }
-                        val registerCall = if (isLinux) {
-                            "registerComposeKnLinuxBackend()"
-                        } else {
-                            "registerComposeKnWindowsBackend()"
-                        }
-                        File(dir, fileName).writeText(
-                            """
-                            |package composekn.host.generated
-                            |
-                            |import $registerImport
-                            |
-                            |/** 由 com.composekn.host 生成：先登记后端，再进入用户 entryPoint。 */
-                            |fun $funName(args: Array<String> = emptyArray()) {
-                            |    $registerCall
-                            |    $userFq(args)
-                            |}
-                            |
-                            """.trimMargin(),
-                        )
-                    }
+                if (wrapByPlatform.putIfAbsent(platform, userEntry) == null) {
+                    project.logger.lifecycle(
+                        "ComposeKN host: ${target.name} entryPoint $userEntry → $wrapperName",
+                    )
                 }
                 entryPoint = wrapperName
-                project.logger.lifecycle(
-                    "ComposeKN host: ${target.name} entryPoint $userEntry → $wrapperName",
-                )
             }
         }
     }
@@ -197,7 +205,7 @@ class ComposeKnHostPlugin : Plugin<Project> {
     }
 
     companion object {
-        const val DEFAULT_VERSION = "0.5.65"
+        const val DEFAULT_VERSION = "0.5.66"
     }
 }
 

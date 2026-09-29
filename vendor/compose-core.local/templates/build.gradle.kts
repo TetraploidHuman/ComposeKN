@@ -27,7 +27,7 @@ val skipMetadata =
 val usePublishedSkiko =
     providers.gradleProperty("composekn.usePublishedSkiko").orNull == "true"
 val composeknVer =
-    providers.gradleProperty("composekn.version").orElse("0.5.65")
+    providers.gradleProperty("composekn.version").orElse("0.5.66")
 val composeUiVer =
     providers.gradleProperty("composekn.compose.ui.version")
         .orElse(composeknVer.map { "1.12.1-ckn.$it" })

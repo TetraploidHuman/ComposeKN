@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.composekn"
-version = providers.gradleProperty("composekn.version").orElse("0.5.65").get()
+version = providers.gradleProperty("composekn.version").orElse("0.5.66").get()
 
 dependencies {
     implementation(gradleApi())
